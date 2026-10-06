@@ -380,8 +380,11 @@ impl RealWallet {
         T: Send + 'static,
         F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
     {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || operation(&mut db.blocking_lock()))
+        // Waiting for the lock here, not in the worker, means a caller dropped while
+        // waiting never starts its operation. Once started, the worker owns the
+        // guard and finishes even if the caller is dropped.
+        let mut db = Arc::clone(&self.db).lock_owned().await;
+        tokio::task::spawn_blocking(move || operation(&mut db))
             .await
             .context("wallet worker stopped")?
     }
@@ -691,15 +694,14 @@ impl RealWallet {
     }
 
     fn send_input(
-        &self,
+        account_ids: &[AccountUuid],
         from_account: u8,
         destination: &str,
     ) -> Result<(u8, AccountUuid, LocalNetwork, Address)> {
         let account_index = from_account
             .checked_sub(1)
             .context("invalid source account")?;
-        let account_id = *self
-            .account_ids
+        let account_id = *account_ids
             .get(account_index as usize)
             .context("source account does not exist")?;
         let params = regtest_network();
@@ -760,9 +762,41 @@ impl RealWallet {
         amount: u64,
         memo: Option<MemoBytes>,
     ) -> Result<PreparedPayment> {
-        let mut db = self.db.lock().await;
+        let activity_id = activity_id.map(str::to_owned);
+        let seed_hex = seed_hex.to_owned();
+        let source_pool = source_pool.to_owned();
+        let destination = destination.to_owned();
+        let account_ids = self.account_ids.clone();
+        self.with_db(move |db| {
+            Self::prepare_in(
+                db,
+                &account_ids,
+                activity_id.as_deref(),
+                &seed_hex,
+                from_account,
+                &source_pool,
+                &destination,
+                amount,
+                memo,
+            )
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_in(
+        db: &mut Db,
+        account_ids: &[AccountUuid],
+        activity_id: Option<&str>,
+        seed_hex: &str,
+        from_account: u8,
+        source_pool: &str,
+        destination: &str,
+        amount: u64,
+        memo: Option<MemoBytes>,
+    ) -> Result<PreparedPayment> {
         if let Some(activity_id) = activity_id
-            && let Some(prepared) = prepared_payment(&mut db, activity_id)?
+            && let Some(prepared) = prepared_payment(db, activity_id)?
             && (prepared.expiry_height == 0
                 || db
                     .chain_height()?
@@ -771,7 +805,7 @@ impl RealWallet {
             return Ok(prepared);
         }
         let (account_index, account_id, params, recipient) =
-            self.send_input(from_account, destination)?;
+            Self::send_input(account_ids, from_account, destination)?;
         if memo.is_some() && matches!(recipient, Address::Transparent(_) | Address::Tex(_)) {
             return Err(PaymentError::TransparentMemo.into());
         }
@@ -823,17 +857,20 @@ impl RealWallet {
     }
 
     pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
-        let mut db = self.db.lock().await;
-        Ok(prepared_payment(&mut db, activity_id)?.is_some())
+        let activity_id = activity_id.to_owned();
+        self.with_db(move |db| Ok(prepared_payment(db, &activity_id)?.is_some()))
+            .await
     }
 
     pub async fn recover_prepared(&self, txid: &str) -> Result<Option<PreparedPayment>> {
         let txid = TxId::from_hex(txid).context("invalid wallet transaction id")?;
-        let db = self.db.lock().await;
-        let Some(transaction) = db.get_transaction(txid)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+        self.with_db(move |db| {
+            let Some(transaction) = db.get_transaction(txid)? else {
+                return Ok(None);
+            };
+            Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+        })
+        .await
     }
 
     pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
@@ -862,9 +899,11 @@ impl RealWallet {
         source_pool: &str,
         destination: &str,
     ) -> Result<SendQuote> {
-        let (_, account_id, params, recipient) = self.send_input(from_account, destination)?;
-        let mut db = self.db.lock().await;
-        Self::quote(&mut *db, &params, account_id, source_pool, &recipient)
+        let (_, account_id, params, recipient) =
+            Self::send_input(&self.account_ids, from_account, destination)?;
+        let source_pool = source_pool.to_owned();
+        self.with_db(move |db| Self::quote(db, &params, account_id, &source_pool, &recipient))
+            .await
     }
 
     fn quote<DbT>(
@@ -1624,5 +1663,248 @@ mod tests {
         assert_eq!(recovered.txid, "txid-1");
         assert_eq!(recovered.raw_transaction, b"signed transaction");
         assert_eq!(recovered.expiry_height, 140);
+    }
+
+    struct TestWallet {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        wallet: RealWallet,
+        seed: String,
+        destination: String,
+    }
+
+    fn test_wallet() -> TestWallet {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(dir.path().join("server.db")).unwrap();
+        store.initialize().unwrap();
+        let seed = store.seed().unwrap();
+        TestWallet {
+            path: dir.path().to_owned(),
+            wallet: RealWallet::open(dir.path(), &seed).unwrap(),
+            destination: store.account(2).unwrap().transparent_address,
+            seed,
+            _dir: dir,
+        }
+    }
+
+    /// Holds an exclusive lock on the wallet database from a second connection,
+    /// so the wallet's next query waits in SQLite's busy handler until `hold`
+    /// elapses.
+    fn delay_wallet_queries(path: &std::path::Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let blocker = rusqlite::Connection::open(path.join("wallet.db")).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            blocker.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    async fn assert_runs_off_the_executor<T, F>(call: impl FnOnce(TestWallet) -> F)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let test = test_wallet();
+        let release = delay_wallet_queries(&test.path, Duration::from_millis(500));
+        let work = tokio::spawn(call(test));
+        let started = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        let still_waiting = !work.is_finished();
+        release.join().unwrap();
+        let _ = work.await.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "wallet database work blocked the async executor for {elapsed:?}"
+        );
+        assert!(still_waiting, "the delayed wallet query finished early");
+    }
+
+    #[tokio::test]
+    async fn operation_cancelled_while_waiting_for_the_wallet_never_runs() {
+        let test = test_wallet();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let wallet = test.wallet.clone();
+            let ran = Arc::clone(&ran);
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |_| {
+                        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        test.wallet.with_db(|_| Ok(())).await.unwrap();
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a caller cancelled before it held the wallet still ran its operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_operation_finishes_after_its_caller_is_cancelled() {
+        let test = test_wallet();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |db| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                            ext.execute(
+                                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                                [],
+                            )?;
+                            Ok(())
+                        })
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        started.abort();
+        assert!(started.await.unwrap_err().is_cancelled());
+
+        let check = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move { wallet.has_prepared("activity-1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !check.is_finished(),
+            "another caller used the wallet while a cancelled operation still held it"
+        );
+        release_tx.send(()).unwrap();
+        assert!(check.await.unwrap().unwrap());
+
+        let retried = test
+            .wallet
+            .prepare(
+                Some("activity-1"),
+                "invalid seed",
+                0,
+                "invalid pool",
+                "invalid address",
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.txid, "txid-1");
+    }
+
+    #[tokio::test]
+    async fn payment_errors_stay_typed_through_the_wallet_worker() {
+        let test = test_wallet();
+        let memo_to_transparent = test
+            .wallet
+            .prepare(
+                None,
+                &test.seed,
+                1,
+                "ironwood",
+                &test.destination,
+                10_000,
+                Some(MemoBytes::empty()),
+            )
+            .await
+            .err()
+            .expect("a memo to a transparent address must be rejected");
+        assert!(matches!(
+            memo_to_transparent.downcast_ref(),
+            Some(PaymentError::TransparentMemo)
+        ));
+        let unscanned = test
+            .wallet
+            .prepare(
+                None,
+                &test.seed,
+                1,
+                "ironwood",
+                &test.destination,
+                10_000,
+                None,
+            )
+            .await
+            .err()
+            .expect("an unscanned wallet must not build a payment");
+        assert!(matches!(
+            unscanned.downcast_ref(),
+            Some(PaymentError::ScanRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_prepare_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .prepare(
+                    Some("activity-1"),
+                    &test.seed,
+                    1,
+                    "ironwood",
+                    &test.destination,
+                    10_000,
+                    None,
+                )
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_send_quote_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .send_quote(1, "ironwood", &test.destination)
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_has_prepared_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet.has_prepared("activity-1").await.map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_recover_prepared_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .recover_prepared(&"00".repeat(32))
+                .await
+                .map(|_| ())
+        })
+        .await;
     }
 }
