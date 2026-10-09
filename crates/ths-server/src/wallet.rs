@@ -380,9 +380,6 @@ impl RealWallet {
         T: Send + 'static,
         F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
     {
-        // Waiting for the lock here, not in the worker, means a caller dropped while
-        // waiting never starts its operation. Once started, the worker owns the
-        // guard and finishes even if the caller is dropped.
         let mut db = Arc::clone(&self.db).lock_owned().await;
         tokio::task::spawn_blocking(move || operation(&mut db))
             .await
@@ -752,7 +749,7 @@ impl RealWallet {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare(
+    pub async fn prepare<T, F>(
         &self,
         activity_id: Option<&str>,
         seed_hex: &str,
@@ -761,14 +758,19 @@ impl RealWallet {
         destination: &str,
         amount: u64,
         memo: Option<MemoBytes>,
-    ) -> Result<PreparedPayment> {
+        record: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(PreparedPayment) -> Result<T> + Send + 'static,
+    {
         let activity_id = activity_id.map(str::to_owned);
         let seed_hex = seed_hex.to_owned();
         let source_pool = source_pool.to_owned();
         let destination = destination.to_owned();
         let account_ids = self.account_ids.clone();
         self.with_db(move |db| {
-            Self::prepare_in(
+            let prepared = Self::prepare_in(
                 db,
                 &account_ids,
                 activity_id.as_deref(),
@@ -778,7 +780,8 @@ impl RealWallet {
                 &destination,
                 amount,
                 memo,
-            )
+            )?;
+            record(prepared)
         })
         .await
     }
@@ -1657,6 +1660,7 @@ mod tests {
                 "invalid address",
                 0,
                 None,
+                Ok,
             )
             .await
             .unwrap();
@@ -1687,9 +1691,6 @@ mod tests {
         }
     }
 
-    /// Holds an exclusive lock on the wallet database from a second connection,
-    /// so the wallet's next query waits in SQLite's busy handler until `hold`
-    /// elapses.
     fn delay_wallet_queries(path: &std::path::Path, hold: Duration) -> std::thread::JoinHandle<()> {
         let blocker = rusqlite::Connection::open(path.join("wallet.db")).unwrap();
         blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
@@ -1812,10 +1813,56 @@ mod tests {
                 "invalid address",
                 0,
                 None,
+                Ok,
             )
             .await
             .unwrap();
         assert_eq!(retried.txid, "txid-1");
+    }
+
+    #[tokio::test]
+    async fn prepared_payment_is_recorded_after_its_caller_is_dropped() {
+        let test = test_wallet();
+        rusqlite::Connection::open(test.path.join("wallet.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                [],
+            )
+            .unwrap();
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let release = delay_wallet_queries(&test.path, Duration::from_millis(300));
+        let caller = {
+            let wallet = test.wallet.clone();
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                wallet
+                    .prepare(
+                        Some("activity-1"),
+                        "invalid seed",
+                        0,
+                        "invalid pool",
+                        "invalid address",
+                        0,
+                        None,
+                        move |prepared| {
+                            *recorded.lock().unwrap() = Some(prepared.txid);
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.join().unwrap();
+        test.wallet.with_db(|_| Ok(())).await.unwrap();
+        assert_eq!(
+            recorded.lock().unwrap().as_deref(),
+            Some("txid-1"),
+            "a journaled payment was not recorded after its caller was dropped"
+        );
     }
 
     #[tokio::test]
@@ -1831,6 +1878,7 @@ mod tests {
                 &test.destination,
                 10_000,
                 Some(MemoBytes::empty()),
+                Ok,
             )
             .await
             .err()
@@ -1849,6 +1897,7 @@ mod tests {
                 &test.destination,
                 10_000,
                 None,
+                Ok,
             )
             .await
             .err()
@@ -1871,6 +1920,7 @@ mod tests {
                     &test.destination,
                     10_000,
                     None,
+                    Ok,
                 )
                 .await
                 .map(|_| ())
