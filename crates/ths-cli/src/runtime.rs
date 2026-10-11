@@ -3057,6 +3057,41 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn dropping_faucet_journal_releases_lock_with_a_duplicated_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = FaucetJournal::open(dir.path()).unwrap();
+        let key = journal.key_for("address:recipient:100").unwrap();
+        // A concurrent process spawn can temporarily inherit the same open file
+        // description. Keep a duplicate alive to reproduce that lifetime without timing.
+        let duplicate = journal.lock.try_clone().unwrap();
+        let contender = OpenOptions::new()
+            .write(true)
+            .open(dir.path().join("faucet-intents.lock"))
+            .unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        drop(journal);
+        let retry = FaucetJournal::open(dir.path()).unwrap();
+        assert_eq!(retry.key_for("address:recipient:100").unwrap(), key);
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+
+        drop(duplicate);
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        drop(retry);
+        contender.try_lock().unwrap();
+    }
+
+    #[test]
     fn overlapping_faucet_process_rejects_the_locked_journal() {
         let dir = tempfile::tempdir().unwrap();
         let journal = FaucetJournal::open(dir.path()).unwrap();
