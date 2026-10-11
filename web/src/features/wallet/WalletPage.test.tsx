@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { renderWithProviders, requestUrl } from '@/test/utils';
 import { WalletActionsProvider } from './WalletActions';
@@ -80,6 +81,16 @@ describe('WalletPage', () => {
 
     expect(container.firstElementChild).toHaveClass('grid', 'gap-4');
     expect(screen.getByRole('button', { name: 'Send ZEC' }).parentElement).toHaveClass('flex-wrap');
+  });
+
+  it('opens a payment request dialog beside the send action', async () => {
+    renderWallet();
+    const send = await screen.findByRole('button', { name: 'Send ZEC' });
+    const request = screen.getByRole('button', { name: 'Request' });
+    expect(request.parentElement).toBe(send.parentElement);
+
+    await userEvent.click(request);
+    expect(screen.getByRole('dialog', { name: 'Request ZEC' })).toBeInTheDocument();
   });
 
   it('does not dump a full transaction id into the activity table', async () => {

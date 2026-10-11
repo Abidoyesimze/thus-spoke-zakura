@@ -30,6 +30,9 @@ export const accountSchema = z.object({
 });
 export type Account = z.infer<typeof accountSchema>;
 
+export const paymentRequestSchema = z.object({ uri: z.string().startsWith('zcash:') });
+export type PaymentRequest = z.infer<typeof paymentRequestSchema>;
+
 export const activitySchema = z.object({
   id: z.string(),
   kind: z.enum(['send', 'faucet']).catch('send'),

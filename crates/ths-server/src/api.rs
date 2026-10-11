@@ -28,9 +28,9 @@ use zcash_keys::{address::Address, encoding::AddressCodec};
 use zcash_protocol::{
     consensus::COINBASE_MATURITY_BLOCKS,
     memo::{Memo, MemoBytes},
-    value::MAX_MONEY,
+    value::{MAX_MONEY, Zatoshis},
 };
-use zip321::TransactionRequest;
+use zip321::{Payment, TransactionRequest};
 
 use crate::{
     db::{
@@ -401,6 +401,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/send", post(send))
         .route("/api/v1/send/quote", post(send_quote))
         .route("/api/v1/zip321/parse", post(parse_payment_uri))
+        .route("/api/v1/zip321/request", post(payment_request))
         .route("/api/v1/faucet", post(faucet))
         .route("/api/v1/faucet/address", post(faucet_address))
         .route("/api/v1/mine", post(mine))
@@ -653,6 +654,54 @@ fn development_account_for(store: &Store, address: &str) -> anyhow::Result<Optio
         }
     }
     Ok(None)
+}
+
+#[derive(Deserialize)]
+struct PaymentRequest {
+    account_id: u8,
+    amount_zatoshi: Option<u64>,
+    #[serde(default)]
+    memo: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PaymentRequestResponse {
+    uri: String,
+}
+
+async fn payment_request(
+    State(state): State<AppState>,
+    Json(req): Json<PaymentRequest>,
+) -> ApiResult<Json<PaymentRequestResponse>> {
+    require_user_account(req.account_id)?;
+    let amount = req
+        .amount_zatoshi
+        .map(|amount| {
+            if amount == 0 {
+                return Err(ApiError::bad_request("amount must be greater than zero"));
+            }
+            Zatoshis::from_u64(amount).map_err(|_| {
+                ApiError::bad_request(format!("amount_zatoshi must not exceed {MAX_MONEY}"))
+            })
+        })
+        .transpose()?;
+    let memo = parse_memo(req.memo.as_deref(), "ironwood")?;
+    let account = state.0.store.account(req.account_id)?;
+    let address = Address::decode(&regtest_network(), &account.unified_address)
+        .context("stored account has an invalid unified address")?;
+    let payment = Payment::new(
+        address.to_zcash_address(&regtest_network()),
+        amount,
+        memo,
+        None,
+        None,
+        vec![],
+    )
+    .context("constructing payment request")?;
+    let uri = TransactionRequest::new(vec![payment])
+        .context("constructing payment request")?
+        .to_uri();
+    Ok(Json(PaymentRequestResponse { uri }))
 }
 
 #[derive(Deserialize)]
@@ -4721,6 +4770,99 @@ mod tests {
         assert!(is_bad_request(parse_memo(Some("hi\0"), "ironwood")));
         assert!(is_bad_request(parse_memo(Some("\0"), "ironwood")));
         assert!(parse_memo(Some("a\0b"), "ironwood").is_ok());
+    }
+
+    #[tokio::test]
+    async fn payment_request_endpoint_round_trips_an_exact_amount_and_memo() {
+        let (state, _dir) = state_with_local_wallet();
+        let account = state.0.store.account(3).unwrap();
+        let memo = "rent for October 🌸";
+        let response = router(state)
+            .oneshot(
+                Request::post("/api/v1/zip321/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "account_id": account.id,
+                            "amount_zatoshi": 123_456_789,
+                            "memo": memo,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let uri = body["uri"].as_str().unwrap();
+        assert!(uri.starts_with("zcash:uregtest1"));
+        let parsed = zip321::TransactionRequest::from_uri(uri).unwrap();
+        let payment = parsed.payments().values().next().unwrap();
+        assert_eq!(parsed.payments().len(), 1);
+        assert_eq!(
+            payment.recipient_address().encode(),
+            account.unified_address
+        );
+        assert_eq!(payment.amount().map(u64::from), Some(123_456_789));
+        let encoded_memo = payment.memo().unwrap().as_slice();
+        assert_eq!(&encoded_memo[..memo.len()], memo.as_bytes());
+        assert!(encoded_memo[memo.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[tokio::test]
+    async fn payment_request_endpoint_omits_an_optional_amount_and_memo() {
+        let (state, _dir) = state_with_local_wallet();
+        let account = state.0.store.account(5).unwrap();
+        let response = router(state)
+            .oneshot(
+                Request::post("/api/v1/zip321/request")
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"account_id": account.id}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            body["uri"].as_str(),
+            Some(format!("zcash:{}", account.unified_address).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_request_endpoint_rejects_invalid_accounts_amounts_and_memos() {
+        let (state, _dir) = state_with_local_wallet();
+        let cases = [
+            json!({"account_id": 0}),
+            json!({"account_id": TREASURY_ACCOUNT_ID}),
+            json!({"account_id": 1, "amount_zatoshi": 0}),
+            json!({"account_id": 1, "amount_zatoshi": MAX_MONEY + 1}),
+            json!({"account_id": 1, "memo": "a".repeat(513)}),
+            json!({"account_id": 1, "memo": "memo\0"}),
+        ];
+
+        for body in cases {
+            let response = router(state.clone())
+                .oneshot(
+                    Request::post("/api/v1/zip321/request")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
     }
 
     const REPLAY_KEY: &str = "existing-idempotency-key";

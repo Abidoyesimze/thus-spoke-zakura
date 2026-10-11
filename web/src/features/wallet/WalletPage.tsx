@@ -1,5 +1,5 @@
 import { SakuraMark } from '@/components/ui/SakuraMark';
-import { Send } from 'lucide-react';
+import { QrCode, Send } from 'lucide-react';
 import { useAccounts, useActivity } from '@/hooks/queries';
 import { errorMessage } from '@/lib/api';
 import { AccountCard } from './AccountCard';
@@ -15,7 +15,7 @@ import { EmptyState, ErrorState } from '@/components/ui/StateBlock';
 export function WalletPage() {
   const accounts = useAccounts();
   const activity = useActivity();
-  const { openSend } = useWalletActions();
+  const { openRequest, openSend } = useWalletActions();
 
   const total = (accounts.data ?? []).reduce(
     (sum, account) => sum + account.ironwood_zatoshi + account.transparent_zatoshi,
@@ -51,10 +51,16 @@ export function WalletPage() {
             ZIP-32 derived · Regtest only
           </p>
         </div>
-        <Button variant="ghost" size="sm" onClick={() => openSend()}>
-          <Send />
-          Send ZEC
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="ghost" size="sm" onClick={openRequest}>
+            <QrCode />
+            Request
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => openSend()}>
+            <Send />
+            Send ZEC
+          </Button>
+        </div>
       </div>
 
       {accounts.isPending && (
