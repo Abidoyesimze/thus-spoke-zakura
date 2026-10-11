@@ -1172,6 +1172,642 @@ fn missing_image_advice_requires_a_completed_listing() {
     let _ = context.finish_helpers(Deadline::after(policy.startup_docker));
 }
 
+fn failed_start_fixture(outcome: MutationOutcome) -> (Runtime, StatefulDocker, ResourceRef) {
+    let (runtime, docker, _) = owned_cleanup_fixture();
+    let instance = name("alpha");
+    let mut journal = RecoveryJournal::create(runtime.recovery_path(&instance), &instance).unwrap();
+    let dependencies = vec![
+        ResourceRef {
+            kind: ResourceKind::Network,
+            name: "ths-alpha".into(),
+            identity: Some("net-id".into()),
+        },
+        ResourceRef {
+            kind: ResourceKind::Volume,
+            name: "ths-alpha-wallet".into(),
+            identity: Some("ths-alpha-wallet".into()),
+        },
+    ];
+    for resource in &dependencies {
+        let index = journal
+            .begin(resource.clone(), Vec::new(), MutationOperation::Create)
+            .unwrap();
+        journal
+            .finish(
+                index,
+                MutationOutcome::Acknowledged,
+                resource.identity.clone(),
+            )
+            .unwrap();
+    }
+    let container = ResourceRef {
+        kind: ResourceKind::Container,
+        name: "ths-alpha-app".into(),
+        identity: Some("app-id".into()),
+    };
+    let index = journal
+        .begin(
+            container.clone(),
+            dependencies.clone(),
+            MutationOperation::Create,
+        )
+        .unwrap();
+    journal
+        .finish(
+            index,
+            MutationOutcome::Acknowledged,
+            container.identity.clone(),
+        )
+        .unwrap();
+    if outcome == MutationOutcome::Pending {
+        journal
+            .begin(container.clone(), dependencies, MutationOperation::Start)
+            .unwrap();
+    } else {
+        let error = start_container(
+            "app-id",
+            &container.name,
+            &docker,
+            &mut journal,
+            Deadline::after(Duration::from_secs(1)),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("unexpected docker run"),
+            "{error:#}"
+        );
+    }
+    drop(journal);
+    (runtime, docker, container)
+}
+
+fn assert_start_dependencies_kept(runtime: &Runtime, docker: &StatefulDocker) {
+    assert!(docker.contains_id("net-id"));
+    assert!(docker.contains_id("ths-alpha-wallet"));
+    assert!(runtime.recovery_path(&name("alpha")).exists());
+    assert!(!docker.removal_calls().iter().any(|call| {
+        matches!(call.as_slice(), [kind, operation, target] if operation == "rm"
+            && ((kind == "volume" && target == "ths-alpha-wallet") || (kind == "network" && target == "net-id")))
+    }));
+}
+
+#[test]
+fn failed_start_recovery_can_be_retried() {
+    for partial in [true, false] {
+        let (runtime, docker, _) =
+            failed_start_fixture(MutationOutcome::Uncertain("start failed".into()));
+        let instance = name("alpha");
+        let report = runtime
+            .cleanup_with(&instance, &docker, partial, &cleanup_policy())
+            .unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert!(docker.resources.lock().unwrap().is_empty());
+        assert!(!runtime.instance_dir(&instance).exists());
+        let mut journal =
+            RecoveryJournal::create(runtime.recovery_path(&instance), &instance).unwrap();
+        for (kind, target, id) in [
+            ("container", "ths-alpha-app", "fresh-app-id"),
+            ("volume", "ths-alpha-wallet", "ths-alpha-wallet"),
+            ("network", "ths-alpha", "fresh-net-id"),
+        ] {
+            docker.insert_owned(kind, target, id, "alpha");
+            let index = journal
+                .begin(
+                    ResourceRef {
+                        kind: resource_kind(kind),
+                        name: target.into(),
+                        identity: Some(id.into()),
+                    },
+                    Vec::new(),
+                    MutationOperation::Create,
+                )
+                .unwrap();
+            journal
+                .finish(index, MutationOutcome::Acknowledged, Some(id.into()))
+                .unwrap();
+        }
+        drop(journal);
+        let report = runtime
+            .cleanup_with(&instance, &docker, partial, &cleanup_policy())
+            .unwrap();
+        assert!(report.verified(), "{report:?}");
+        assert!(docker.resources.lock().unwrap().is_empty());
+        assert!(!runtime.instance_dir(&instance).exists());
+    }
+}
+
+#[test]
+fn pending_known_start_is_reconciled_after_reload() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+    assert!(!runtime.instance_dir(&name("alpha")).exists());
+    let calls = docker.calls();
+    let removal = calls
+        .iter()
+        .position(|call| call == &["rm", "-f", "app-id"])
+        .unwrap();
+    let listing = calls
+        .iter()
+        .enumerate()
+        .find(|(index, call)| {
+            *index > removal
+                && *call == &["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"]
+        })
+        .unwrap()
+        .0;
+    for target in ["ths-alpha-wallet", "net-id"] {
+        let dependency = calls
+            .iter()
+            .position(|call| call.len() == 3 && call[1] == "rm" && call[2] == target)
+            .unwrap();
+        assert!(dependency > listing, "{calls:?}");
+    }
+}
+
+#[test]
+fn missing_failed_start_identity_releases_dependencies() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    docker.drop_resource("app-id");
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+    assert!(!runtime.instance_dir(&name("alpha")).exists());
+    assert!(
+        docker
+            .calls()
+            .iter()
+            .any(|call| call == &["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"])
+    );
+    assert!(!docker.removal_calls().iter().any(|call| {
+        call.iter()
+            .any(|arg| arg == "app-id" || arg == "ths-alpha-app")
+    }));
+}
+
+#[test]
+fn failed_start_keeps_dependencies_until_absence_is_verified() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    docker.acknowledge_without_removing("app-id");
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, true, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(docker.contains_id("app-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    docker.retain.lock().unwrap().clear();
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failed_start_inspection_error_keeps_dependencies() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    docker.fail_inspect("app-id");
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(docker.contains_id("app-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    assert!(
+        !docker
+            .removal_calls()
+            .iter()
+            .any(|call| call == &["rm", "-f", "app-id"])
+    );
+}
+
+#[test]
+fn unidentified_start_keeps_dependencies() {
+    for identity in [None, Some(String::new())] {
+        for outcome in [
+            MutationOutcome::Pending,
+            MutationOutcome::Uncertain("lost reply".into()),
+        ] {
+            let (runtime, docker, mut container) = failed_start_fixture(MutationOutcome::Pending);
+            let instance = name("alpha");
+            let previous = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+                .unwrap()
+                .unwrap();
+            let dependencies = previous
+                .record()
+                .mutations
+                .last()
+                .unwrap()
+                .dependencies
+                .clone();
+            drop(previous);
+            let mut journal =
+                RecoveryJournal::create(runtime.recovery_path(&instance), &instance).unwrap();
+            let create = journal
+                .begin(
+                    container.clone(),
+                    dependencies.clone(),
+                    MutationOperation::Create,
+                )
+                .unwrap();
+            journal
+                .finish(
+                    create,
+                    MutationOutcome::Acknowledged,
+                    container.identity.clone(),
+                )
+                .unwrap();
+            container.identity = identity.clone();
+            let index = journal
+                .begin(container.clone(), dependencies, MutationOperation::Start)
+                .unwrap();
+            journal.finish(index, outcome, identity.clone()).unwrap();
+            drop(journal);
+            let report = runtime
+                .cleanup_with(&instance, &docker, true, &cleanup_policy())
+                .unwrap();
+            assert!(!report.verified(), "{report:?}");
+            assert!(docker.contains_id("app-id"));
+            assert_start_dependencies_kept(&runtime, &docker);
+        }
+    }
+}
+
+#[test]
+fn resolved_start_does_not_release_shared_unresolved_create_dependencies() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let mut journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    journal
+        .begin(
+            ResourceRef {
+                kind: ResourceKind::Container,
+                name: "ths-alpha-init".into(),
+                identity: None,
+            },
+            journal
+                .record()
+                .mutations
+                .last()
+                .unwrap()
+                .dependencies
+                .clone(),
+            MutationOperation::Create,
+        )
+        .unwrap();
+    drop(journal);
+    let report = runtime
+        .cleanup_with(&instance, &docker, true, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(!docker.contains_id("app-id"));
+    assert!(docker.contains_id("init-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    let journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    assert!(
+        journal
+            .record()
+            .mutations
+            .iter()
+            .any(|mutation| mutation.operation == MutationOperation::Start
+                && mutation.outcome == MutationOutcome::ReconciledAbsent)
+    );
+}
+
+#[test]
+fn failed_start_reconciliation_survives_an_interrupted_cleanup() {
+    let (runtime, docker, container) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let mut journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    let index = journal
+        .begin(container, Vec::new(), MutationOperation::Remove)
+        .unwrap();
+    journal
+        .finish(
+            index,
+            MutationOutcome::ReconciledAbsent,
+            Some("app-id".into()),
+        )
+        .unwrap();
+    drop(journal);
+    docker.drop_resource("app-id");
+    let report = runtime
+        .cleanup_with(&instance, &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+    assert!(!runtime.instance_dir(&instance).exists());
+}
+
+#[test]
+fn failed_start_never_adopts_a_replacement() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    docker.drop_resource("app-id");
+    docker.insert_owned("container", "ths-alpha-app", "replacement-id", "alpha");
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, true, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(docker.contains_id("replacement-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    assert!(!docker.removal_calls().iter().any(|call| {
+        call.iter()
+            .any(|arg| arg == "replacement-id" || arg == "ths-alpha-app")
+    }));
+}
+
+#[test]
+fn unresolved_create_does_not_match_a_start() {
+    let (runtime, _docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let mut journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    assert!(
+        recovery::unresolved_create(journal.record(), &ResourceKind::Container, "ths-alpha-app")
+            .is_none()
+    );
+    let resource = journal.record().mutations.last().unwrap().resource.clone();
+    journal
+        .begin(resource, Vec::new(), MutationOperation::Create)
+        .unwrap();
+    assert!(
+        recovery::unresolved_create(journal.record(), &ResourceKind::Container, "ths-alpha-app")
+            .is_some()
+    );
+}
+
+#[test]
+fn failed_start_reconciliation_write_failure_keeps_the_valid_record() {
+    let (runtime, _docker, container) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let path = runtime.recovery_path(&instance);
+    let mut journal = RecoveryJournal::load(path.clone(), &instance)
+        .unwrap()
+        .unwrap();
+    let previous = journal.record().clone();
+    journal.fail_next_write();
+    assert!(journal.reconcile_absent_starts(&container).is_err());
+    assert_eq!(journal.record(), &previous);
+    assert_eq!(
+        RecoveryJournal::load(path, &instance)
+            .unwrap()
+            .unwrap()
+            .record(),
+        &previous
+    );
+    journal.reconcile_absent_starts(&container).unwrap();
+    assert_eq!(
+        journal.record().mutations.last().unwrap().outcome,
+        MutationOutcome::ReconciledAbsent
+    );
+    assert_eq!(
+        journal.record().mutations[2].outcome,
+        MutationOutcome::Acknowledged
+    );
+    let mut invalid = container;
+    invalid.identity = None;
+    assert!(journal.reconcile_absent_starts(&invalid).is_err());
+    invalid.identity = Some(String::new());
+    assert!(journal.reconcile_absent_starts(&invalid).is_err());
+    invalid.kind = ResourceKind::Volume;
+    invalid.identity = Some("app-id".into());
+    assert!(journal.reconcile_absent_starts(&invalid).is_err());
+}
+
+#[test]
+fn failed_start_cleanup_gates_dependencies_on_reconciliation_write() {
+    struct FailReconciliation<'a> {
+        docker: &'a StatefulDocker,
+        temporary: std::path::PathBuf,
+    }
+    impl DockerResourceCommands for FailReconciliation<'_> {
+        fn output(&self, args: &[&str]) -> Result<String> {
+            let output = self.docker.output(args)?;
+            if args == ["container", "ls", "-a", "--format", "{{.Names}}"]
+                && !self.docker.contains_id("app-id")
+                && !self.temporary.exists()
+            {
+                fs::create_dir(&self.temporary)?;
+            }
+            Ok(output)
+        }
+        fn run(&self, args: &[&str]) -> Result<()> {
+            self.docker.run(args)
+        }
+    }
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let temporary = runtime.recovery_path(&instance).with_extension("json.tmp");
+    let failed = FailReconciliation {
+        docker: &docker,
+        temporary: temporary.clone(),
+    };
+    let report = runtime
+        .cleanup_with(&instance, &failed, true, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(!docker.contains_id("app-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("reconciling absent") && failure.contains("writing")),
+        "{report:?}"
+    );
+    let journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    assert!(journal.record().mutations.iter().any(unresolved_start));
+    drop(journal);
+    fs::remove_dir(temporary).unwrap();
+    let report = runtime
+        .cleanup_with(&instance, &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+}
+
+#[test]
+fn lost_failed_start_removal_reply_preserves_diagnostics_and_releases_dependencies() {
+    struct LostRemoval<'a>(&'a StatefulDocker);
+    impl DockerResourceCommands for LostRemoval<'_> {
+        fn output(&self, args: &[&str]) -> Result<String> {
+            self.0.output(args)
+        }
+        fn run(&self, args: &[&str]) -> Result<()> {
+            if args == ["volume", "rm", "ths-alpha-chain"] {
+                anyhow::bail!("independent volume failure");
+            }
+            self.0.run(args)?;
+            if args == ["rm", "-f", "app-id"] {
+                anyhow::bail!("lost app removal reply");
+            }
+            Ok(())
+        }
+    }
+    let (runtime, docker, _) =
+        failed_start_fixture(MutationOutcome::Uncertain("start failed".into()));
+    let instance = name("alpha");
+    let report = runtime
+        .cleanup_with(&instance, &LostRemoval(&docker), true, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(!docker.contains_id("app-id"));
+    assert!(!docker.contains_id("net-id"));
+    assert!(!docker.contains_id("ths-alpha-wallet"));
+    assert!(docker.contains_id("ths-alpha-chain"));
+    let journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    assert!(!journal.record().mutations.iter().any(unresolved_start));
+    assert!(
+        journal
+            .record()
+            .failures
+            .iter()
+            .any(|failure| failure.contains("lost app removal reply"))
+    );
+    assert!(
+        journal
+            .record()
+            .failures
+            .iter()
+            .any(|failure| failure.contains("unexpected docker run"))
+    );
+}
+
+#[test]
+fn failed_start_identity_listing_failure_keeps_dependencies() {
+    struct FailedListing<'a>(&'a StatefulDocker);
+    impl DockerResourceCommands for FailedListing<'_> {
+        fn output(&self, args: &[&str]) -> Result<String> {
+            if args == ["container", "ls", "-a", "--no-trunc", "--format", "{{.ID}}"] {
+                anyhow::bail!("identity listing failed");
+            }
+            self.0.output(args)
+        }
+        fn run(&self, args: &[&str]) -> Result<()> {
+            self.0.run(args)
+        }
+    }
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    let report = runtime
+        .cleanup_with(
+            &name("alpha"),
+            &FailedListing(&docker),
+            true,
+            &cleanup_policy(),
+        )
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(!docker.contains_id("app-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+}
+
+#[test]
+fn failed_start_foreign_ownership_and_identity_conflicts_keep_dependencies() {
+    for foreign in [true, false] {
+        let (runtime, docker, container) = failed_start_fixture(MutationOutcome::Pending);
+        let instance = name("alpha");
+        if foreign {
+            docker.drop_resource("app-id");
+            docker.insert_owned("container", "ths-alpha-app", "app-id", "other");
+        } else {
+            let mut journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+                .unwrap()
+                .unwrap();
+            let mut conflicting = container;
+            conflicting.identity = Some("other-id".into());
+            journal
+                .begin(
+                    conflicting,
+                    journal
+                        .record()
+                        .mutations
+                        .last()
+                        .unwrap()
+                        .dependencies
+                        .clone(),
+                    MutationOperation::Start,
+                )
+                .unwrap();
+        }
+        let report = runtime
+            .cleanup_with(&instance, &docker, true, &cleanup_policy())
+            .unwrap();
+        assert!(!report.verified(), "{report:?}");
+        assert!(docker.contains_id("app-id"));
+        assert_start_dependencies_kept(&runtime, &docker);
+        assert!(
+            !docker
+                .removal_calls()
+                .iter()
+                .any(|call| call == &["rm", "-f", "app-id"])
+        );
+    }
+}
+
+#[test]
+fn failed_start_preserves_full_ownership_preflight() {
+    let (runtime, docker, _) = failed_start_fixture(MutationOutcome::Pending);
+    docker.drop_resource("ths-alpha-chain");
+    docker.insert_owned("volume", "ths-alpha-chain", "ths-alpha-chain", "other");
+    let report = runtime
+        .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(!report.verified(), "{report:?}");
+    assert!(docker.contains_id("app-id"));
+    assert_start_dependencies_kept(&runtime, &docker);
+    assert!(docker.removal_calls().is_empty());
+}
+
+#[test]
+fn pending_start_identity_can_be_loaded_without_a_resource_summary() {
+    let (runtime, docker, container) = failed_start_fixture(MutationOutcome::Pending);
+    let instance = name("alpha");
+    let previous = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
+        .unwrap();
+    let dependencies = previous
+        .record()
+        .mutations
+        .last()
+        .unwrap()
+        .dependencies
+        .clone();
+    drop(previous);
+    let mut journal = RecoveryJournal::create(runtime.recovery_path(&instance), &instance).unwrap();
+    journal
+        .begin(container, dependencies, MutationOperation::Start)
+        .unwrap();
+    assert!(journal.record().resources.is_empty());
+    drop(journal);
+    let report = runtime
+        .cleanup_with(&instance, &docker, false, &cleanup_policy())
+        .unwrap();
+    assert!(report.verified(), "{report:?}");
+    assert!(docker.resources.lock().unwrap().is_empty());
+    assert!(!runtime.instance_dir(&instance).exists());
+}
+
 struct RunningDocker;
 
 #[test]
@@ -1241,48 +1877,16 @@ fn same_name_container_and_volume_are_both_removed() {
 }
 
 #[test]
-fn uncertain_start_preserves_the_creation_dependencies() {
-    let (runtime, docker, _) = owned_cleanup_fixture();
+fn failed_start_is_cleaned_up_by_recorded_identity() {
+    let (runtime, docker, _) =
+        failed_start_fixture(MutationOutcome::Uncertain("start failed".into()));
     let instance = name("alpha");
-    let mut journal = RecoveryJournal::create(runtime.recovery_path(&instance), &instance).unwrap();
-    let dependencies = vec![
-        ResourceRef {
-            kind: ResourceKind::Network,
-            name: "ths-alpha".into(),
-            identity: Some("net-id".into()),
-        },
-        ResourceRef {
-            kind: ResourceKind::Volume,
-            name: "ths-alpha-wallet".into(),
-            identity: Some("ths-alpha-wallet".into()),
-        },
-    ];
-    let index = journal
-        .begin(
-            ResourceRef {
-                kind: ResourceKind::Container,
-                name: "ths-alpha-app".into(),
-                identity: None,
-            },
-            dependencies,
-            MutationOperation::Create,
-        )
+    let journal = RecoveryJournal::load(runtime.recovery_path(&instance), &instance)
+        .unwrap()
         .unwrap();
-    journal
-        .finish(index, MutationOutcome::Acknowledged, Some("app-id".into()))
-        .unwrap();
-    assert!(
-        start_container(
-            "app-id",
-            "ths-alpha-app",
-            &docker,
-            &mut journal,
-            Deadline::after(Duration::from_secs(1))
-        )
-        .is_err()
-    );
     let mutation = journal.record().mutations.last().unwrap();
     assert_eq!(mutation.operation, MutationOperation::Start);
+    assert_eq!(mutation.resource.identity.as_deref(), Some("app-id"));
     let names: Vec<_> = mutation
         .dependencies
         .iter()
@@ -1293,10 +1897,17 @@ fn uncertain_start_preserves_the_creation_dependencies() {
     let report = runtime
         .cleanup_with(&instance, &docker, true, &cleanup_policy())
         .unwrap();
-    assert!(!report.verified());
-    assert!(docker.contains_id("app-id"));
-    assert!(docker.contains_id("net-id"));
-    assert!(docker.contains_id("ths-alpha-wallet"));
+    assert!(report.verified(), "{report:?}");
+    assert!(!docker.contains_id("app-id"));
+    assert!(!docker.contains_id("net-id"));
+    assert!(!docker.contains_id("ths-alpha-wallet"));
+    assert!(!runtime.instance_dir(&instance).exists());
+    assert!(!runtime.recovery_path(&instance).exists());
+    assert!(docker.removal_calls().contains(&vec![
+        "rm".to_owned(),
+        "-f".to_owned(),
+        "app-id".to_owned(),
+    ]));
 }
 
 #[test]

@@ -28,6 +28,15 @@ remaining `instance.json` so the instance can be identified. Do not delete
 those files by hand, retry a create whose result is unknown, or prune shared
 Docker state.
 
+A failed `docker start` with a known original container ID can be recovered:
+cleanup validates ownership, removes that ID, proves its absence, and persists
+the start's resolution before deleting its wallet volumes and network. A later
+start can allocate fresh resources under the same instance name. Cleanup does
+not retry the failed start or turn the original launch error into success.
+An unacknowledged create, or a start without a trustworthy original ID, remains
+uncertain and keeps its dependencies and recovery state. Same-name replacements
+are not adopted; shared unresolved dependencies remain protected.
+
 The recovery journal records resources by kind and name and retains their
 allocation identities. It does not lock an instance name or coordinate separate
 launcher sessions. Exclusive ownership and coordinated stop/reset remain tracked
@@ -307,10 +316,11 @@ npm run build --prefix web
 ```
 
 Docker-free tests do not start a daemon. These ignored launcher regressions
-need a disposable Docker daemon and, for the lost-create case, the prepared
+need a disposable Docker daemon and, for the lost-create and lost-start cases, the prepared
 runtime images. Run one at a time:
 
 ```console
+cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_start_reply_is_cleaned_up_and_can_be_retried -- --ignored --exact
 cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_create_reply_retains_uncertainty_and_recovery -- --ignored --exact
 cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_remove_reply_is_verified_against_daemon_state -- --ignored --exact
 cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::partial_cleanup_preserves_foreign_resources_and_other_instances -- --ignored --exact

@@ -189,6 +189,35 @@ impl RecoveryJournal {
         &self.record
     }
 
+    pub(super) fn reconcile_absent_starts(&mut self, container: &ResourceRef) -> Result<()> {
+        if container.kind != ResourceKind::Container
+            || container.identity.as_deref().is_none_or(str::is_empty)
+        {
+            bail!("start reconciliation requires an original container identity");
+        }
+        let mut updated = self.record.clone();
+        let mut changed = false;
+        for mutation in &mut updated.mutations {
+            if mutation.operation == MutationOperation::Start
+                && mutation.resource == *container
+                && matches!(
+                    mutation.outcome,
+                    MutationOutcome::Pending | MutationOutcome::Uncertain(_)
+                )
+            {
+                if let MutationOutcome::Uncertain(reason) = &mutation.outcome {
+                    updated.failures.push(reason.clone());
+                }
+                mutation.outcome = MutationOutcome::ReconciledAbsent;
+                changed = true;
+            }
+        }
+        if changed {
+            self.persist(updated)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn retain_failures(
         &mut self,
         failures: Vec<String>,
@@ -272,16 +301,6 @@ fn remember_resource(
     resources.push(stored);
 }
 
-/// A pending record reloaded after a crash is uncertainty, not an acknowledgement.
-pub(super) fn loaded_outcome(outcome: &MutationOutcome) -> MutationOutcome {
-    match outcome {
-        MutationOutcome::Pending => MutationOutcome::Uncertain(
-            "pending mutation was not acknowledged before the launcher exited".into(),
-        ),
-        other => other.clone(),
-    }
-}
-
 pub(super) fn unresolved_create<'a>(
     record: &'a RecoveryRecord,
     kind: &ResourceKind,
@@ -290,10 +309,7 @@ pub(super) fn unresolved_create<'a>(
     record.mutations.iter().rev().find(|mutation| {
         mutation.resource.kind == *kind
             && mutation.resource.name == resource_name
-            && matches!(
-                mutation.operation,
-                MutationOperation::Create | MutationOperation::Start
-            )
+            && mutation.operation == MutationOperation::Create
             && matches!(
                 mutation.outcome,
                 MutationOutcome::Pending | MutationOutcome::Uncertain(_)
