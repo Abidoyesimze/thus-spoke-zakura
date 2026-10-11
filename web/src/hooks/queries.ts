@@ -6,6 +6,9 @@ import {
   type AddressInfo,
   type Block,
   type BlockPage,
+  type MiningJob,
+  type SendQuote,
+  type SendQuoteInput,
   type Status,
   type Transaction,
 } from '@/lib/api';
@@ -16,13 +19,14 @@ import {
  */
 export const queryKeys = {
   status: ['status'] as const,
+  mining: ['mining'] as const,
   accounts: ['accounts'] as const,
   activity: (limit: number) => ['activity', limit] as const,
   blocks: (before?: number) => ['blocks', before ?? 'tip'] as const,
   block: (id: string) => ['block', id] as const,
   transaction: (txid: string) => ['transaction', txid] as const,
-  mempool: ['mempool'] as const,
   address: (address: string) => ['address', address] as const,
+  sendQuote: (params: SendQuoteInput) => ['send-quote', params] as const,
 };
 
 export function useStatus(): UseQueryResult<Status> {
@@ -60,10 +64,32 @@ export function useTransaction(txid: string): UseQueryResult<Transaction> {
   });
 }
 
+/** The fee depends on the source and the destination pool, not the destination account. */
+export function useSendQuote(params: SendQuoteInput): UseQueryResult<SendQuote> {
+  return useQuery({
+    queryKey: queryKeys.sendQuote(params),
+    queryFn: () => api.sendQuote(params),
+  });
+}
+
 export function useAddress(address: string): UseQueryResult<AddressInfo> {
   return useQuery({
     queryKey: queryKeys.address(address),
     queryFn: () => api.address(address),
     enabled: address.length > 0,
+  });
+}
+
+export function useMiningJob(): UseQueryResult<{ job: MiningJob | null }> {
+  return useQuery({
+    queryKey: queryKeys.mining,
+    queryFn: api.miningJob,
+    staleTime: 0,
+    refetchOnMount: true,
+    refetchOnReconnect: true,
+    refetchInterval: (query) => {
+      const state = query.state.data?.job?.state;
+      return state === 'mining' || state === 'syncing' ? 1_000 : 5_000;
+    },
   });
 }

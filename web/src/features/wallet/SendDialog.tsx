@@ -1,4 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
+import { useEffect } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { ArrowRight } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
@@ -6,10 +7,18 @@ import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
 import { useToast } from '@/components/ui/toast-context';
 import { errorMessage, type Account } from '@/lib/api';
-import { formatZecAmount } from '@/lib/money';
+import { formatZec, formatZecAmount } from '@/lib/money';
 import { useSend } from '@/hooks/mutations';
-import { sendSchema, type SendInput, type SendValues } from './schemas';
+import { useSendQuote } from '@/hooks/queries';
+import {
+  MEMO_MAX_BYTES,
+  memoByteLength,
+  sendSchema,
+  type SendInput,
+  type SendValues,
+} from './schemas';
 import { controlStyles } from '@/components/ui/control-styles';
+import { cn } from '@/lib/cn';
 import { SelectField } from './fields';
 import { POOL_OPTIONS, accountOptions } from './field-options';
 
@@ -33,26 +42,54 @@ export function SendDialog({
     defaultValues: {
       from_account: String(fromAccountId),
       to_account: String(accounts.find((account) => account.id !== fromAccountId)?.id ?? 1),
-      source_pool: 'orchard',
-      destination_pool: 'orchard',
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
       amount: '1',
+      memo: '',
     },
   });
 
   const fromAccount = useWatch({ control: form.control, name: 'from_account' });
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
+  const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
+  const memo = useWatch({ control: form.control, name: 'memo' }) ?? '';
+  const memoEnabled = destinationPool === 'ironwood';
+
+  // A memo typed for an ironwood output must not linger (hidden) once the
+  // destination switches to transparent, where it can never be sent.
+  useEffect(() => {
+    if (!memoEnabled) {
+      form.setValue('memo', '');
+      form.clearErrors('memo');
+    }
+  }, [memoEnabled, form]);
+
   const source = accounts.find((account) => account.id === Number(fromAccount));
   const available =
     source === undefined
       ? 0n
-      : sourcePool === 'orchard'
-        ? source.orchard_zatoshi
+      : sourcePool === 'ironwood'
+        ? source.ironwood_zatoshi
         : source.transparent_zatoshi;
 
-  const submit = form.handleSubmit((values) => {
+  // The quote is a dry-run proposal, so its fee reflects real input selection.
+  const quote = useSendQuote({
+    from_account: Number(fromAccount),
+    source_pool: sourcePool,
+    destination_pool: destinationPool,
+  });
+
+  const submit = form.handleSubmit(async (values) => {
     if (values.amount > available) {
       form.setError('amount', {
         message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
+      });
+      return;
+    }
+    const quoted = quote.data ?? (await quote.refetch()).data;
+    if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
+      form.setError('amount', {
+        message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
       });
       return;
     }
@@ -64,6 +101,7 @@ export function SendDialog({
         source_pool: values.source_pool,
         destination_pool: values.destination_pool,
         amount_zatoshi: values.amount,
+        ...(values.memo === '' ? {} : { memo: values.memo }),
       },
       {
         onSuccess: (activity) => {
@@ -87,7 +125,7 @@ export function SendDialog({
       onOpenChange={onOpenChange}
       eyebrow="NEW TRANSACTION"
       title="Send ZEC"
-      description="Moves existing funds between development accounts. One block is mined to confirm."
+      description="Moves existing funds between development accounts or pools. One block is mined to confirm."
     >
       <form onSubmit={(event) => void submit(event)} noValidate>
         <div className="grid gap-x-3 sm:grid-cols-2">
@@ -123,16 +161,61 @@ export function SendDialog({
 
         <Field
           label="Amount (ZEC)"
-          hint={`${formatZecAmount(available)} available in the ${sourcePool} pool.`}
+          hint={
+            quote.data !== undefined
+              ? `${formatZecAmount(quote.data.max_zatoshi)} spendable after a ${formatZecAmount(quote.data.fee_zatoshi)} network fee.`
+              : `${formatZecAmount(available)} available in the ${sourcePool} pool.`
+          }
           error={form.formState.errors.amount?.message}
         >
           {(aria) => (
-            <input
+            <div className="flex items-stretch gap-2">
+              <input
+                {...aria}
+                {...form.register('amount')}
+                inputMode="decimal"
+                autoComplete="off"
+                className={controlStyles}
+              />
+              <Button
+                type="button"
+                variant="subtle"
+                size="sm"
+                disabled={quote.data === undefined || quote.data.max_zatoshi === 0n}
+                onClick={() => {
+                  const max = quote.data?.max_zatoshi;
+                  if (max === undefined) return;
+                  form.setValue('amount', formatZec(max, { grouping: false }), {
+                    shouldDirty: true,
+                    shouldValidate: true,
+                  });
+                  form.clearErrors('amount');
+                }}
+              >
+                Max
+              </Button>
+            </div>
+          )}
+        </Field>
+
+        <Field
+          label="Memo (optional)"
+          hint={
+            memoEnabled
+              ? `${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes, encrypted to the recipient.`
+              : 'Memos are only available for ironwood destinations.'
+          }
+          error={form.formState.errors.memo?.message}
+        >
+          {(aria) => (
+            <textarea
               {...aria}
-              {...form.register('amount')}
-              inputMode="decimal"
+              {...form.register('memo')}
+              disabled={!memoEnabled}
+              placeholder={memoEnabled ? 'Add a private note for the recipient' : undefined}
+              rows={2}
               autoComplete="off"
-              className={controlStyles}
+              className={cn(controlStyles, 'disabled:cursor-not-allowed disabled:opacity-50')}
             />
           )}
         </Field>

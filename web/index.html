@@ -11,7 +11,7 @@
       // Applied before first paint so a dark-theme reload never flashes white.
       // Mirrors readStoredTheme()/applyTheme() in src/lib/theme.ts.
       try {
-        var t = localStorage.getItem('tsz-theme');
+        var t = localStorage.getItem('ths-theme');
         if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
       } catch (e) {}
     </script>

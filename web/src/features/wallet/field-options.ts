@@ -1,8 +1,8 @@
 import type { SelectOption } from '@/components/ui/Select';
 import type { Account } from '@/lib/api';
 
-export const POOL_OPTIONS: ReadonlyArray<SelectOption<'orchard' | 'transparent'>> = [
-  { value: 'orchard', label: 'Orchard (shielded)' },
+export const POOL_OPTIONS: ReadonlyArray<SelectOption<'ironwood' | 'transparent'>> = [
+  { value: 'ironwood', label: 'Ironwood (shielded)' },
   { value: 'transparent', label: 'Transparent (public)' },
 ];
 

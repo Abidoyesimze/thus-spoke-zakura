@@ -74,7 +74,7 @@ pub fn startup_notice() -> Option<String> {
     }
 
     let current = parse_version(env!("CARGO_PKG_VERSION")).ok()?;
-    let endpoint = env::var("TSZ_RELEASE_API_URL").unwrap_or_else(|_| RELEASE_API.to_owned());
+    let endpoint = env::var("THS_RELEASE_API_URL").unwrap_or_else(|_| RELEASE_API.to_owned());
     startup_notice_from(&endpoint, &current)
 }
 
@@ -115,7 +115,7 @@ fn ensure_release_distribution() -> Result<()> {
 }
 
 fn latest_version() -> Result<Version> {
-    let endpoint = env::var("TSZ_RELEASE_API_URL").unwrap_or_else(|_| RELEASE_API.to_owned());
+    let endpoint = env::var("THS_RELEASE_API_URL").unwrap_or_else(|_| RELEASE_API.to_owned());
     latest_version_from(&endpoint)
 }
 
@@ -196,8 +196,8 @@ fn print_report(current: &Version, available: &Version, status: Status, json: bo
 fn run_installer(script: &str, version: &Version, install_dir: &Path) -> Result<()> {
     let mut child = Command::new("sh")
         .arg("-s")
-        .env("TSZ_VERSION", version.to_string())
-        .env("TSZ_INSTALL_DIR", install_dir)
+        .env("THS_VERSION", version.to_string())
+        .env("THS_INSTALL_DIR", install_dir)
         .stdin(Stdio::piped())
         .spawn()
         .context("starting the embedded installer")?;
@@ -284,12 +284,12 @@ mod tests {
     fn embedded_installer_receives_exact_version_and_destination() {
         let version = Version::new(4, 5, 6);
         run_installer(
-            "test \"$TSZ_VERSION\" = 4.5.6 && test \"$TSZ_INSTALL_DIR\" = /tmp/tsz\n",
+            "test \"$THS_VERSION\" = 4.5.6 && test \"$THS_INSTALL_DIR\" = /tmp/ths\n",
             &version,
-            Path::new("/tmp/tsz"),
+            Path::new("/tmp/ths"),
         )
         .unwrap();
-        assert!(run_installer("exit 7\n", &version, Path::new("/tmp/tsz")).is_err());
+        assert!(run_installer("exit 7\n", &version, Path::new("/tmp/ths")).is_err());
     }
 
     #[test]

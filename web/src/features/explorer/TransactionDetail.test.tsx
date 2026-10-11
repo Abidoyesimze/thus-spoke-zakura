@@ -75,6 +75,45 @@ describe('TransactionDetail', () => {
     expect(screen.getByText('1 ZEC')).toBeInTheDocument();
   });
 
+  it('renders two inputs spending different outputs of the same previous transaction', async () => {
+    // Both rows render their content regardless of key collisions, so only a
+    // console warning actually catches a regression back to keying on txid
+    // alone, which is the key that collided for these two inputs.
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const otherAddress = 'tmBnC1iW276Njs86Lfp7y7qwUit55wG5bDm';
+    renderTx({
+      txid: TXID,
+      vin: [
+        {
+          txid: PREV_TXID,
+          vout: 0,
+          valueZat: 100_000_000,
+          scriptPubKey: { addresses: [INPUT_ADDRESS] },
+        },
+        {
+          txid: PREV_TXID,
+          vout: 2,
+          valueZat: 25_000_000,
+          scriptPubKey: { addresses: [otherAddress] },
+        },
+      ],
+      vout: [{ n: 0, valueZat: 120_000_000, scriptPubKey: { addresses: [] } }],
+      vShieldedSpend: [],
+      vShieldedOutput: [],
+    });
+
+    await waitFor(() => expect(screen.getByText('2 transparent inputs')).toBeInTheDocument());
+    expect(screen.getByText(INPUT_ADDRESS)).toBeInTheDocument();
+    expect(screen.getByText('1 ZEC')).toBeInTheDocument();
+    expect(screen.getByText(otherAddress)).toBeInTheDocument();
+    expect(screen.getByText('0.25 ZEC')).toBeInTheDocument();
+
+    const duplicateKeyWarning = consoleError.mock.calls.some(([message]) =>
+      String(message).includes('two children with the same key'),
+    );
+    expect(duplicateKeyWarning).toBe(false);
+  });
+
   it('labels a coinbase input instead of inventing an address', async () => {
     renderTx({
       txid: TXID,
@@ -135,5 +174,44 @@ describe('TransactionDetail', () => {
 
     expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
     expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
+  });
+
+  it('shows an Ironwood transfer as shielded, not fully transparent', async () => {
+    // After NU6.3 every shielded send is an Ironwood bundle with an empty
+    // Orchard bundle; counting only Orchard labelled it fully transparent.
+    renderTx({
+      txid: TXID,
+      version: 6,
+      vin: [],
+      vout: [],
+      vShieldedSpend: [],
+      vShieldedOutput: [],
+      orchard: { actions: [], valueBalanceZat: 0 },
+      ironwood: { actions: [{}, {}], valueBalanceZat: 10_000 },
+    });
+
+    expect(await screen.findByText('Only the fee is public')).toBeInTheDocument();
+    expect(screen.getByText(/stay inside 2 Ironwood actions/)).toBeInTheDocument();
+    expect(screen.queryByText(/Fully transparent/i)).not.toBeInTheDocument();
+    // Pools the transaction doesn't use aren't listed.
+    expect(screen.getByText('Ironwood actions')).toBeInTheDocument();
+    expect(screen.queryByText('Orchard actions')).not.toBeInTheDocument();
+    expect(screen.queryByText(/^Sapling/)).not.toBeInTheDocument();
+  });
+
+  it('lists Orchard and Sapling only when the transaction uses them', async () => {
+    // External regtest clients can still make Sapling transactions after NU6.3.
+    renderTx({
+      txid: TXID,
+      vin: [],
+      vout: [],
+      vShieldedSpend: [{}],
+      vShieldedOutput: [{}, {}],
+      orchard: { actions: [{}], valueBalanceZat: 0 },
+    });
+
+    expect(await screen.findByText('Orchard actions')).toBeInTheDocument();
+    expect(screen.getByText('Sapling spends')).toBeInTheDocument();
+    expect(screen.getByText('Sapling outputs')).toBeInTheDocument();
   });
 });

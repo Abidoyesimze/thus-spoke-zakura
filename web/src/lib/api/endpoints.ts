@@ -6,11 +6,13 @@ import {
   addressSchema,
   blockPageSchema,
   blockSchema,
-  mempoolSchema,
-  seedSchema,
+  miningJobSchema,
+  miningJobResponseSchema,
+  sendQuoteSchema,
   statusSchema,
   transactionSchema,
   type Pool,
+  type SendQuoteInput,
 } from './schemas';
 
 export const api = {
@@ -31,8 +33,6 @@ export const api = {
 
   transaction: (txid: string) => request(`/transactions/${txid}`, transactionSchema),
 
-  mempool: () => request('/mempool', mempoolSchema),
-
   address: (address: string) => request(`/addresses/${address}`, addressSchema),
 
   /** Resolves a 64-hex string the client cannot tell apart on shape alone. */
@@ -49,11 +49,15 @@ export const api = {
     destination_pool: Pool;
     amount_zatoshi: bigint;
     idempotency_key: string;
+    memo?: string;
   }) =>
     post('/send', activitySchema, {
       ...input,
       amount_zatoshi: Number(input.amount_zatoshi),
     }),
+
+  /** Dry-run proposal: exact fee and max spendable; nothing is broadcast. */
+  sendQuote: (input: SendQuoteInput) => post('/send/quote', sendQuoteSchema, input),
 
   faucet: (input: {
     account_id: number;
@@ -66,11 +70,8 @@ export const api = {
       amount_zatoshi: Number(input.amount_zatoshi),
     }),
 
-  mine: (blocks: number) =>
-    post('/mine', z.object({ blocks: z.number(), hashes: z.array(z.string()) }), { blocks }),
+  startMining: (blocks: number, idempotency_key: string) =>
+    post('/mining/jobs', miningJobSchema, { blocks, idempotency_key }),
 
-  seed: () =>
-    post('/dev/seed', seedSchema, {
-      confirmation: 'I understand this seed is for regtest only',
-    }),
+  miningJob: () => request('/mining/jobs', miningJobResponseSchema),
 };

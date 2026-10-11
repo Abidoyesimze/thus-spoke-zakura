@@ -8,9 +8,10 @@ import { queryKeys } from './queries';
  * it affects; React Query then refetches just what is actually mounted.
  */
 const TOPICS: Record<string, readonly unknown[][]> = {
-  wallet: [[...queryKeys.accounts], ['activity']],
-  chain: [[...queryKeys.status], ['blocks'], [...queryKeys.mempool]],
+  wallet: [[...queryKeys.accounts], ['activity'], ['send-quote']],
+  chain: [[...queryKeys.status], ['blocks'], ['block'], ['transaction'], ['address']],
   sync: [[...queryKeys.status]],
+  mining: [[...queryKeys.mining]],
 };
 
 export function useServerEvents(): void {

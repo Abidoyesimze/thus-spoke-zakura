@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { summariseShielding } from './shielding';
+import { actionSummary, summariseShielding } from './shielding';
 import type { Transaction, TxOutput } from '@/lib/api';
 
 const output = (valueZat = 0): TxOutput => ({ n: 0, valueZat });
@@ -69,5 +69,63 @@ describe('summariseShielding', () => {
     });
 
     expect(summary.fullyShielded).toBe(true);
+  });
+
+  it('counts Ironwood actions as shielded once NU6.3 is active', () => {
+    // Shape of a v6 send on a live NU6.3 regtest: two Ironwood actions, an
+    // empty Orchard bundle, and the fee as the Ironwood value balance.
+    const summary = summariseShielding({
+      ...base,
+      orchard: { actions: [], valueBalanceZat: 0 },
+      ironwood: { actions: [{}, {}], valueBalanceZat: 10_000 },
+    });
+
+    expect(summary.ironwoodActions).toBe(2);
+    expect(summary.orchardActions).toBe(0);
+    expect(summary.shieldedActions).toBe(2);
+    expect(summary.shieldedOnly).toBe(true);
+    expect(summary.fullyShielded).toBe(false);
+    expect(summary.valueBalanceZat).toBe(10_000);
+  });
+
+  it('sums the Ironwood, Orchard and Sapling value balances', () => {
+    const summary = summariseShielding({
+      ...base,
+      orchard: { actions: [{}], valueBalanceZat: -5_000 },
+      ironwood: { actions: [{}], valueBalanceZat: 5_000 },
+    });
+
+    expect(summary.valueBalanceZat).toBe(0);
+    expect(summary.fullyShielded).toBe(true);
+  });
+});
+
+describe('actionSummary', () => {
+  it('names actions by pool', () => {
+    const summarise = (ironwood: number, orchard: number) =>
+      actionSummary(
+        summariseShielding({
+          ...base,
+          ironwood: { actions: Array.from({ length: ironwood }, () => ({})) },
+          orchard: { actions: Array.from({ length: orchard }, () => ({})) },
+        }),
+      );
+
+    expect(summarise(2, 0)).toBe('2 Ironwood actions');
+    expect(summarise(0, 1)).toBe('1 Orchard action');
+    expect(summarise(1, 2)).toBe('1 Ironwood action and 2 Orchard actions');
+    expect(summarise(0, 0)).toBe('0 shielded actions');
+  });
+
+  it('names Sapling spends and outputs, which external clients can still create', () => {
+    const summary = summariseShielding({
+      ...base,
+      vShieldedSpend: [{}],
+      vShieldedOutput: [{}, {}],
+      ironwood: { actions: [{}, {}] },
+    });
+    expect(actionSummary(summary)).toBe(
+      '2 Ironwood actions, 1 Sapling spend and 2 Sapling outputs',
+    );
   });
 });

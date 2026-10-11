@@ -18,7 +18,7 @@ export function WalletPage() {
   const { openSend } = useWalletActions();
 
   const total = (accounts.data ?? []).reduce(
-    (sum, account) => sum + account.orchard_zatoshi + account.transparent_zatoshi,
+    (sum, account) => sum + account.ironwood_zatoshi + account.transparent_zatoshi,
     0n,
   );
 

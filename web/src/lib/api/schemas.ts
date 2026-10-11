@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Runtime contracts for the tsz-server API. These are validated rather than
+ * Runtime contracts for the ths-server API. These are validated rather than
  * merely declared: if the Rust structs change shape, the UI fails loudly at
  * the boundary instead of rendering `undefined` somewhere deep in a tree.
  *
@@ -16,7 +16,7 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
-export const poolSchema = z.enum(['transparent', 'orchard']);
+export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
 export const accountSchema = z.object({
@@ -24,8 +24,9 @@ export const accountSchema = z.object({
   name: z.string(),
   unified_address: z.string(),
   transparent_address: z.string(),
+  unified_full_viewing_key: z.string().optional(),
   transparent_zatoshi: zatoshi,
-  orchard_zatoshi: zatoshi,
+  ironwood_zatoshi: zatoshi,
 });
 export type Account = z.infer<typeof accountSchema>;
 
@@ -104,7 +105,17 @@ export const blockSchema = z.looseObject({
   tx: z.array(z.unknown()).default([]),
   difficulty: z.number().optional(),
   merkleroot: z.string().optional(),
+  finalsaplingroot: z.string().optional(),
   finalorchardroot: z.string().optional(),
+  // Note commitment tree sizes; the node leaves out pools whose tree is empty.
+  trees: z
+    .looseObject({
+      sapling: z.looseObject({ size: z.number() }).optional(),
+      orchard: z.looseObject({ size: z.number() }).optional(),
+    })
+    .optional(),
+  // Added by the server from `z_gettreestate`; absent for the genesis block.
+  finalironwoodroot: z.string().optional(),
   blockcommitments: z.string().optional(),
   version: z.number().optional(),
   chainSupply: z.looseObject({ chainValueZat: z.number().int().default(0) }).optional(),
@@ -167,6 +178,17 @@ export const transactionSchema = z.looseObject({
       valueBalanceZat: z.number().optional(),
     })
     .optional(),
+  /**
+   * The Ironwood bundle (NU6.3). Once NU6.3 is active every new shielded
+   * output is an Ironwood action, and its value balance is public like
+   * Orchard's.
+   */
+  ironwood: z
+    .looseObject({
+      actions: z.array(z.unknown()).default([]),
+      valueBalanceZat: z.number().optional(),
+    })
+    .optional(),
   valueBalanceZat: z.number().optional(),
   version: z.number().optional(),
   versiongroupid: z.string().optional(),
@@ -174,8 +196,6 @@ export const transactionSchema = z.looseObject({
   locktime: z.number().int().optional(),
 });
 export type Transaction = z.infer<typeof transactionSchema>;
-
-export const mempoolSchema = z.object({ transactions: z.array(z.string()) });
 
 export const addressSchema = z.object({
   address: z.string(),
@@ -186,8 +206,32 @@ export const addressSchema = z.object({
 });
 export type AddressInfo = z.infer<typeof addressSchema>;
 
-export const seedSchema = z.object({ seed_hex: z.string(), warning: z.string() });
+/** Fee and maximum spendable amount from a server-side dry-run proposal. */
+export const sendQuoteSchema = z.object({
+  available_zatoshi: zatoshi,
+  fee_zatoshi: zatoshi,
+  max_zatoshi: zatoshi,
+});
+export type SendQuote = z.infer<typeof sendQuoteSchema>;
+export interface SendQuoteInput {
+  from_account: number;
+  source_pool: Pool;
+  destination_pool: Pool;
+}
 
 export const apiErrorSchema = z.object({
   error: z.object({ message: z.string(), status: z.number().int() }),
 });
+
+export const miningJobSchema = z
+  .object({
+    id: z.string().uuid(),
+    requested_blocks: z.number().int().min(1).max(10_000),
+    completed_blocks: z.number().int().nonnegative(),
+    state: z.enum(['mining', 'syncing', 'completed', 'failed']),
+    error: z.string().nullable(),
+    progress_uncertain: z.boolean(),
+  })
+  .refine((job) => job.completed_blocks <= job.requested_blocks);
+export type MiningJob = z.infer<typeof miningJobSchema>;
+export const miningJobResponseSchema = z.object({ job: miningJobSchema.nullable() });

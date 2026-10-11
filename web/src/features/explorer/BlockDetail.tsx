@@ -19,6 +19,7 @@ const NAV_LINK =
 interface BlockTx {
   txid?: unknown;
   size?: unknown;
+  ironwood?: { actions?: unknown[] } | undefined;
   orchard?: { actions?: unknown[] } | undefined;
   vin?: unknown[];
   vout?: unknown[];
@@ -27,7 +28,7 @@ interface BlockTx {
 const TX_COLUMNS: Column[] = [
   { key: 'n', header: '#', width: '92px' },
   { key: 'txid', header: 'Transaction ID' },
-  { key: 'shielded', header: 'Orchard', align: 'right', width: '104px', collapse: true },
+  { key: 'shielded', header: 'Shielded', align: 'right', width: '104px', collapse: true },
   { key: 'size', header: 'Size', align: 'right', width: '104px', collapse: true },
 ];
 
@@ -99,7 +100,8 @@ export function BlockDetail() {
         <DataTable columns={TX_COLUMNS}>
           {txs.map((tx, index) => {
             const txid = typeof tx.txid === 'string' ? tx.txid : '';
-            const actions = tx.orchard?.actions?.length ?? 0;
+            const actions =
+              (tx.ironwood?.actions?.length ?? 0) + (tx.orchard?.actions?.length ?? 0);
             return (
               <Row key={txid || index} index={index} to={`/explorer/tx/${txid}`}>
                 <td className="text-ink text-[11px] font-bold tracking-[0.12em] uppercase">
@@ -156,9 +158,21 @@ export function BlockDetail() {
               <code className="font-mono">{data.merkleroot}</code>
             </DataRow>
           )}
-          {data.finalorchardroot && (
+          {data.finalironwoodroot && (
+            <DataRow label="Ironwood root">
+              <code className="font-mono">{data.finalironwoodroot}</code>
+            </DataRow>
+          )}
+          {/* An empty tree still has a root; show Orchard and Sapling roots only once
+              their tree holds notes (`trees` leaves out empty pools). */}
+          {data.finalorchardroot && (data.trees?.orchard?.size ?? 0) > 0 && (
             <DataRow label="Orchard root">
               <code className="font-mono">{data.finalorchardroot}</code>
+            </DataRow>
+          )}
+          {data.finalsaplingroot && (data.trees?.sapling?.size ?? 0) > 0 && (
+            <DataRow label="Sapling root">
+              <code className="font-mono">{data.finalsaplingroot}</code>
             </DataRow>
           )}
           {data.blockcommitments && (
