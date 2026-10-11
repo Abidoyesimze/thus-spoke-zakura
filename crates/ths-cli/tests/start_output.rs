@@ -32,7 +32,7 @@ impl Fixture {
         }
     }
 
-    fn start(&self, json: bool, fail_init: bool) -> Child {
+    fn start(&self, json: bool, fail_init: bool, deleted_elsewhere: bool) -> Child {
         let mut command = self.command();
         if json {
             command.arg("--json");
@@ -49,6 +49,10 @@ impl Fixture {
                 "20000",
             ])
             .env("THS_TEST_FAIL_INIT", if fail_init { "1" } else { "0" })
+            .env(
+                "THS_TEST_DELETE_ELSEWHERE",
+                if deleted_elsewhere { "1" } else { "0" },
+            )
             .spawn()
             .unwrap()
     }
@@ -87,9 +91,13 @@ fn finish(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
-fn output_after_shutdown(json: bool, fail_init: bool) -> (bool, String, String, String) {
+fn output_after_shutdown(
+    json: bool,
+    fail_init: bool,
+    deleted_elsewhere: bool,
+) -> (bool, String, String, String) {
     let fixture = Fixture::new();
-    let mut child = fixture.start(json, fail_init);
+    let mut child = fixture.start(json, fail_init, deleted_elsewhere);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
     let (ready_sender, ready_receiver) = mpsc::channel();
@@ -119,13 +127,24 @@ fn output_after_shutdown(json: bool, fail_init: bool) -> (bool, String, String, 
                 stderr_thread.join().unwrap()
             );
         }
-        assert!(
-            Command::new("/bin/kill")
-                .args(["-INT", &child.id().to_string()])
-                .status()
-                .unwrap()
-                .success()
-        );
+        if deleted_elsewhere {
+            // Simulate another command deleting only this fixture's fake resources.
+            for kind in ["container", "volume", "network"] {
+                let resources = fixture.directory.path().join("state").join(kind);
+                for resource in fs::read_dir(resources).unwrap() {
+                    fs::remove_file(resource.unwrap().path()).unwrap();
+                }
+            }
+            fs::write(fixture.directory.path().join("state/deleted"), "").unwrap();
+        } else {
+            assert!(
+                Command::new("/bin/kill")
+                    .args(["-INT", &child.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
     }
     let success = finish(&mut child).success();
     for kind in ["container", "volume", "network"] {
@@ -145,7 +164,7 @@ fn output_after_shutdown(json: bool, fail_init: bool) -> (bool, String, String, 
 
 #[test]
 fn json_start_stdout_is_one_document_after_interrupt_and_cleanup() {
-    let (success, stdout, stderr, commands) = output_after_shutdown(true, false);
+    let (success, stdout, stderr, commands) = output_after_shutdown(true, false, false);
     assert!(success, "{stderr}");
     let endpoints: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(endpoints["network"], "regtest");
@@ -172,7 +191,7 @@ fn json_start_stdout_is_one_document_after_interrupt_and_cleanup() {
 
 #[test]
 fn json_start_failure_keeps_stdout_empty_through_partial_cleanup() {
-    let (success, stdout, stderr, commands) = output_after_shutdown(true, true);
+    let (success, stdout, stderr, commands) = output_after_shutdown(true, true, false);
     assert!(!success);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("disposable test mnemonic"));
@@ -184,7 +203,7 @@ fn json_start_failure_keeps_stdout_empty_through_partial_cleanup() {
 
 #[test]
 fn human_start_keeps_lifecycle_and_docker_output_on_stdout() {
-    let (success, stdout, stderr, _) = output_after_shutdown(false, false);
+    let (success, stdout, stderr, _) = output_after_shutdown(false, false, false);
     assert!(success, "{stderr}");
     for diagnostic in [
         "Docker test-docker",
@@ -202,6 +221,20 @@ fn human_start_keeps_lifecycle_and_docker_output_on_stdout() {
     }
     assert!(stderr.contains("init diagnostic"));
     assert!(!stderr.contains("Preparing a fresh"));
+}
+
+#[test]
+fn json_start_stdout_is_one_document_after_external_deletion() {
+    let (success, stdout, stderr, commands) = output_after_shutdown(true, false, true);
+    assert!(success, "{stderr}");
+    let endpoints: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(endpoints["network"], "regtest");
+    assert!(stderr.contains("was stopped and deleted by another command"));
+    assert!(!stderr.contains("Stopping and deleting"));
+    assert!(commands.contains("events --since"));
+    assert!(!commands.contains("rm -f"));
+    assert!(!commands.contains("volume rm"));
+    assert!(!commands.contains("network rm"));
 }
 
 #[test]

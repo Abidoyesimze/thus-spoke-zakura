@@ -23,6 +23,7 @@ case "$1 $2" in
             case "$2" in
                 *HostPort*) printf '%s\n' "$THS_TEST_PORT" ;;
                 *Running*) printf 'true\n' ;;
+                *Created*) printf '2026-10-11T00:00:00Z\n' ;;
                 *) exit 1 ;;
             esac
         else
@@ -45,6 +46,14 @@ case "$1 $2" in
         printf 'disposable test mnemonic\n'
         printf 'init diagnostic\n' >&2
         if [ "${THS_TEST_FAIL_INIT:-0}" = 1 ]; then exit 1; fi
+        ;;
+    'events --since')
+        if [ "${THS_TEST_DELETE_ELSEWHERE:-0}" = 1 ]; then
+            while [ ! -f "$THS_TEST_STATE/deleted" ]; do sleep 0.01; done
+            printf 'destroy\n'
+        else
+            exec sleep 60
+        fi
         ;;
     'rm -f')
         shift 2
