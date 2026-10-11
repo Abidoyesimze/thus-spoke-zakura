@@ -87,14 +87,13 @@ fn shutdown_during_an_active_http_attempt_is_observed() {
     ] {
         let mut fixture = HttpFixture::new(mode);
         let policy = short_policy();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let shutdown = Shutdown::from_receiver(receiver);
+        let (sender, shutdown) = Shutdown::channel();
         let requested = || shutdown.try_interrupted();
         let started = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 fixture.wait_active(Duration::from_secs(2));
-                sender.send(()).unwrap();
+                sender.send(Ended::Interrupted).unwrap();
             });
             assert!(
                 probe_once(
@@ -188,8 +187,7 @@ fn cancellation_before_send_does_not_open_a_probe() {
 fn shutdown_during_retry_uses_the_original_readiness_deadline() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     let url = fixture.url();
     let started = Instant::now();
     let sender = sender;
@@ -198,7 +196,7 @@ fn shutdown_during_retry_uses_the_original_readiness_deadline() {
         while waiting.elapsed() < Duration::from_secs(2) && fixture.request_count() == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
         fixture.finish();
     });
     let docker = RunningDocker;
@@ -224,8 +222,7 @@ fn repeated_probes_share_one_phase_deadline() {
     let mut policy = short_policy();
     policy.readiness = Duration::from_millis(900);
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = RunningDocker;
     let started = Instant::now();
     let failure = wait_ready(
@@ -345,8 +342,7 @@ fn success_after_the_phase_deadline_is_still_a_timeout() {
 fn failed_or_malformed_inspection_is_not_reported_as_stopped() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = ScriptedDocker {
         running: Err("inspect boom".into()),
         logs: Ok("unused".into()),
@@ -390,8 +386,7 @@ fn failed_or_malformed_inspection_is_not_reported_as_stopped() {
 fn stopped_container_keeps_log_failures_with_the_readiness_error() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Rpc(r#"{"result":1}"#.into()));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = ScriptedDocker {
         running: Ok("false".into()),
         logs: Err("logs unavailable".into()),
@@ -416,8 +411,7 @@ fn stopped_container_keeps_log_failures_with_the_readiness_error() {
 fn hanging_diagnostic_logs_expire_on_the_readiness_budget() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let context = LifecycleContext::new(policy);
     let script = hanging_log_script();
     let docker = LifecycleDocker {
@@ -484,7 +478,10 @@ fn unidentified_create_stays_uncertain_for_either_snapshot() {
             tls: false,
         },
         resources: vec![recorded],
-        app_container_id: "original-id".into(),
+        app_container: WatchedContainer {
+            id: "original-id".into(),
+            created: "2026-01-01T00:00:00Z".into(),
+        },
         zakura_container_id: "zakura-id".into(),
     };
     assert_eq!(
@@ -742,7 +739,8 @@ fn uncertain_service_creates_record_every_mounted_dependency() {
                 &mut journal,
                 deadline,
                 dependencies,
-            ),
+            )
+            .map(|app| app.id),
         };
         assert!(result.is_err());
         let mutation = recovery::unresolved_create(
@@ -1028,9 +1026,8 @@ fn acknowledged_removal_without_verified_absence_is_incomplete() {
 #[test]
 fn fresh_cleanup_budget_ignores_a_latched_shutdown() {
     let (runtime, docker, _) = owned_cleanup_fixture();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    sender.send(()).unwrap();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
     assert!(shutdown.try_interrupted());
     let context = LifecycleContext::new(short_policy());
     let expired = runtime
@@ -1113,8 +1110,7 @@ fn unresolved_create_keeps_its_dependencies() {
 fn cancelled_image_check_is_not_classified_as_a_missing_image() {
     let policy = short_policy();
     let context = LifecycleContext::new(policy);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     let requested = || shutdown.try_interrupted();
     let script = sleep_script();
     let docker = LifecycleDocker {
@@ -1128,7 +1124,7 @@ fn cancelled_image_check_is_not_classified_as_a_missing_image() {
     };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(30));
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
     });
     let started = Instant::now();
     let error = startup_require_image(&docker, "example/image:missing").unwrap_err();
