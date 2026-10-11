@@ -223,14 +223,26 @@ and Send dialogs, from a script or terminal:
 
 | Subcommand | What it does |
 | --- | --- |
+| `ths wallet balances` | Print each account's balances and addresses |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield` | Spend Ironwood funds into the same or another account's transparent balance |
 
-Every subcommand mines the confirming block automatically and prints the
-resulting transaction ID (and, for `send`, `shield`, and `unshield`, the
-confirming block hash). Pass `--json` for machine-readable output.
+Every subcommand except `balances` mines the confirming block automatically
+and prints the resulting transaction ID (and, for `send`, `shield`, and
+`unshield`, the confirming block hash). Pass `--json` for machine-readable
+output.
+
+### `ths wallet balances`
+
+Prints accounts 1-5 with their transparent and Ironwood balances in ZEC and the
+addresses that receive them. With `--json`, balances are in zatoshi.
+
+```console
+ths wallet balances
+ths wallet balances --json
+```
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -404,6 +416,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
+| `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
 | `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
 | `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |

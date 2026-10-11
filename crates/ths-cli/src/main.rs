@@ -111,6 +111,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WalletCommand {
+    /// Print each account's transparent and Ironwood balances and addresses.
+    Balances,
     /// Send faucet funds from the treasury to one or more accounts.
     Faucet {
         /// Account indices to fund (1-5), e.g. --accounts 1,2,3,5.
@@ -231,6 +233,7 @@ fn main() -> Result<ExitCode> {
             runtime.faucet(&cli.name, &address, amount.zatoshi(), cli.json)
         }
         Command::Wallet { action } => match action {
+            WalletCommand::Balances => runtime.wallet_balances(&cli.name, cli.json),
             WalletCommand::Faucet {
                 accounts,
                 amount,
@@ -627,6 +630,18 @@ mod tests {
             Cli::try_parse_from(["ths", "wallet", "shield", "--from", "1", "--amount", "1"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn parses_wallet_balances_with_global_json_after_subcommand() {
+        let cli = Cli::try_parse_from(["ths", "wallet", "balances", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wallet {
+                action: WalletCommand::Balances
+            })
+        ));
     }
 
     fn send_args(from: u8, to: u8, destination_pool: Pool, memo: Option<&str>) -> SendArgs {
