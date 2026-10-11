@@ -1,7 +1,10 @@
 use std::{
     future::Future,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -58,6 +61,7 @@ struct Inner {
     wallet_sync: Mutex<()>,
     treasury_replenishment: Mutex<()>,
     wallet_snapshot: RwLock<WalletSnapshot>,
+    started: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -105,7 +109,16 @@ impl AppState {
                     error: None,
                 },
             }),
+            started: AtomicBool::new(false),
         }))
+    }
+
+    pub fn mark_started(&self) {
+        self.0.started.store(true, Ordering::Release);
+    }
+
+    fn started(&self) -> bool {
+        self.0.started.load(Ordering::Acquire)
     }
 
     async fn accounts(&self) -> Vec<Account> {
@@ -349,7 +362,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/send", post(send))
         .route("/api/v1/send/quote", post(send_quote))
         .route("/api/v1/faucet", post(faucet))
-        .route("/api/v1/faucet/address", post(faucet_address))
+        .route(
+            "/api/v1/faucet/address",
+            get(faucet_address_status).post(faucet_address),
+        )
         .route("/api/v1/mine", post(mine))
         .route(
             "/api/v1/mining/jobs",
@@ -378,14 +394,15 @@ pub async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
 async fn health(State(state): State<AppState>) -> Response {
     let node = state.0.rpc.chain_info().await.ok();
     let wallet = state.wallet_sync_status().await;
-    let status = if node.is_some() && wallet.last_success_at.is_some() {
+    let ok = state.started() && node.is_some() && wallet.last_success_at.is_some();
+    let status = if ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (
         status,
-        Json(json!({"ok": node.is_some() && wallet.last_success_at.is_some(), "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
+        Json(json!({"ok": ok, "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
     )
         .into_response()
 }
@@ -440,11 +457,18 @@ async fn accounts(State(state): State<AppState>) -> ApiResult<Json<Vec<Account>>
 #[derive(Deserialize)]
 struct Page {
     limit: Option<u32>,
+    idempotency_key: Option<String>,
 }
 async fn activity(
     State(state): State<AppState>,
     Query(page): Query<Page>,
 ) -> ApiResult<Json<Vec<Activity>>> {
+    if let Some(key) = page.idempotency_key {
+        require_key(&key)?;
+        return Ok(Json(
+            state.0.store.activity_for_key(&key)?.into_iter().collect(),
+        ));
+    }
     Ok(Json(state.0.store.activities(page.limit.unwrap_or(30))?))
 }
 
@@ -463,6 +487,7 @@ async fn send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
 ) -> ApiResult<Json<Activity>> {
+    require_started(&state)?;
     let memo = validate_send(&req)?;
     let _payment = state.0.payments.lock().await;
     let pending = state.0.store.claim_transfer(
@@ -547,6 +572,7 @@ async fn faucet(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
 ) -> ApiResult<Json<Activity>> {
+    require_started(&state)?;
     require_key(&req.idempotency_key)?;
     require_user_account(req.account_id)?;
     if req.amount_zatoshi > 5 * ZATOSHIS_PER_ZEC {
@@ -585,6 +611,7 @@ struct FaucetAddressResponse {
     txid: String,
     block_hash: Option<String>,
     status: String,
+    last_error: Option<String>,
 }
 
 fn internal_faucet_destination(
@@ -606,7 +633,7 @@ fn internal_faucet_destination(
 }
 
 fn faucet_address_response(
-    req: FaucetAddressRequest,
+    address: String,
     activity: Activity,
 ) -> anyhow::Result<FaucetAddressResponse> {
     let block_hash = activity.block_hash.filter(|hash| !hash.is_empty());
@@ -617,12 +644,46 @@ fn faucet_address_response(
         );
     }
     Ok(FaucetAddressResponse {
-        address: req.address,
-        amount_zatoshi: req.amount_zatoshi,
+        address,
+        amount_zatoshi: activity.amount_zatoshi,
         txid: activity.txid,
         block_hash,
         status: activity.status,
+        last_error: activity.last_error,
     })
+}
+
+fn external_faucet_response(payment: AddressFaucet) -> FaucetAddressResponse {
+    FaucetAddressResponse {
+        address: payment.address,
+        amount_zatoshi: payment.amount_zatoshi,
+        txid: payment.txid,
+        block_hash: payment.block_hash,
+        status: payment.status,
+        last_error: payment.last_error,
+    }
+}
+
+fn stored_address_faucet(
+    store: &Store,
+    key: &str,
+) -> anyhow::Result<Option<FaucetAddressResponse>> {
+    if let Some(payment) = store.address_faucet_for_key(key)? {
+        return Ok(Some(external_faucet_response(payment)));
+    }
+    let Some(activity) = store
+        .activity_for_key(key)?
+        .filter(|activity| activity.kind == "faucet")
+    else {
+        return Ok(None);
+    };
+    let account = store.account(activity.to_account)?;
+    let address = match activity.destination_pool.as_str() {
+        "transparent" => account.transparent_address,
+        "ironwood" => account.unified_address,
+        pool => anyhow::bail!("faucet has unsupported destination pool {pool}"),
+    };
+    faucet_address_response(address, activity).map(Some)
 }
 
 #[async_trait::async_trait]
@@ -663,13 +724,7 @@ impl AddressFaucetRuntime for AppState {
             &req.idempotency_key,
         )
         .await?;
-        Ok(FaucetAddressResponse {
-            address: payment.address,
-            amount_zatoshi: payment.amount_zatoshi,
-            txid: payment.txid,
-            block_hash: payment.block_hash,
-            status: payment.status,
-        })
+        Ok(external_faucet_response(payment))
     }
 }
 
@@ -695,7 +750,7 @@ async fn execute_address_faucet<R: AddressFaucetRuntime>(
         let activity = runtime
             .fund_internal(account_id, pool, req.amount_zatoshi, &req.idempotency_key)
             .await?;
-        Ok(Json(faucet_address_response(req, activity)?))
+        Ok(Json(faucet_address_response(req.address, activity)?))
     } else {
         Ok(Json(runtime.fund_external(req).await?))
     }
@@ -705,7 +760,25 @@ async fn faucet_address(
     State(state): State<AppState>,
     Json(req): Json<FaucetAddressRequest>,
 ) -> ApiResult<Json<FaucetAddressResponse>> {
+    require_started(&state)?;
     execute_address_faucet(&state.0.store, &state, req).await
+}
+
+#[derive(Deserialize)]
+struct FaucetAddressQuery {
+    idempotency_key: String,
+}
+async fn faucet_address_status(
+    State(state): State<AppState>,
+    Query(query): Query<FaucetAddressQuery>,
+) -> ApiResult<Json<FaucetAddressResponse>> {
+    require_key(&query.idempotency_key)?;
+    stored_address_faucet(&state.0.store, &query.idempotency_key)?
+        .map(Json)
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: "no address faucet uses that idempotency key".into(),
+        })
 }
 
 async fn fund_address_from_treasury(
@@ -1552,6 +1625,7 @@ async fn start_mining_job(
     State(state): State<AppState>,
     Json(req): Json<StartMiningRequest>,
 ) -> ApiResult<(StatusCode, Json<MiningJob>)> {
+    require_started(&state)?;
     require_key(&req.idempotency_key)?;
     let admission = state.start_mining(req.blocks, req.idempotency_key).await?;
     Ok((StatusCode::ACCEPTED, Json(admission.job)))
@@ -1585,6 +1659,7 @@ async fn mine(
     State(state): State<AppState>,
     Json(req): Json<MineRequest>,
 ) -> ApiResult<Json<Value>> {
+    require_started(&state)?;
     if !(1..=10_000).contains(&req.blocks) {
         return Err(ApiError::bad_request("blocks must be between 1 and 10,000"));
     }
@@ -1957,6 +2032,16 @@ async fn confirm_after_mining(state: &AppState, pending: Activity) -> anyhow::Re
 fn notify(state: &AppState, topic: &str) {
     let _ = state.0.events.send(topic.to_owned());
 }
+fn require_started(state: &AppState) -> ApiResult<()> {
+    if state.started() {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "the environment is still starting".into(),
+        })
+    }
+}
 fn require_key(key: &str) -> ApiResult<()> {
     validate_idempotency_key(key).map_err(ApiError::bad_request)
 }
@@ -2289,13 +2374,8 @@ mod tests {
     fn address_faucet_response_preserves_pending_and_confirmed_status() {
         let (state, _dir) = state_with_local_wallet();
         let address = state.0.store.account(2).unwrap().transparent_address;
-        let request = || FaucetAddressRequest {
-            idempotency_key: "address-test-key".into(),
-            address: address.clone(),
-            amount_zatoshi: 100_000_000,
-        };
         let row = address_faucet_activity(&state.0.store);
-        let pending = faucet_address_response(request(), row.clone()).unwrap();
+        let pending = faucet_address_response(address.clone(), row.clone()).unwrap();
         assert_eq!(pending.status, "broadcast");
         assert_eq!(pending.block_hash, None);
         let row = state
@@ -2304,15 +2384,16 @@ mod tests {
             .confirm(&row.id, &row.txid, "inclusion-hash")
             .unwrap();
         let value =
-            serde_json::to_value(faucet_address_response(request(), row.clone()).unwrap()).unwrap();
+            serde_json::to_value(faucet_address_response(address.clone(), row.clone()).unwrap())
+                .unwrap();
         assert_eq!(
             value,
-            json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "faucet-txid", "block_hash": "inclusion-hash", "status": "confirmed"})
+            json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "faucet-txid", "block_hash": "inclusion-hash", "status": "confirmed", "last_error": null})
         );
         for block_hash in [None, Some(String::new())] {
             let mut invalid = row.clone();
             invalid.block_hash = block_hash;
-            assert!(faucet_address_response(request(), invalid).is_err());
+            assert!(faucet_address_response(address.clone(), invalid).is_err());
         }
     }
 
@@ -2369,6 +2450,7 @@ mod tests {
                 txid: "external-txid".into(),
                 block_hash: Some("external-block".into()),
                 status: "confirmed".into(),
+                last_error: None,
             })
         }
     }
@@ -2395,7 +2477,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}", error.message));
             assert_eq!(
                 serde_json::to_value(response).unwrap(),
-                json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "faucet-txid", "block_hash": "inclusion-hash", "status": "confirmed"})
+                json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "faucet-txid", "block_hash": "inclusion-hash", "status": "confirmed", "last_error": null})
             );
             let calls = runtime.internal_calls.lock().unwrap();
             let call = calls.last().unwrap();
@@ -2492,7 +2574,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("{}", error.message));
             assert_eq!(
                 serde_json::to_value(response).unwrap(),
-                json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "external-txid", "block_hash": "external-block", "status": "confirmed"})
+                json!({"address": address, "amount_zatoshi": 100_000_000, "txid": "external-txid", "block_hash": "external-block", "status": "confirmed", "last_error": null})
             );
             assert_eq!(
                 runtime.external_calls.lock().unwrap().last().unwrap(),
@@ -3037,10 +3119,9 @@ mod tests {
         store.initialize().expect("initialize store");
         let wallet =
             RealWallet::open(dir.path(), &store.seed().expect("wallet seed")).expect("open wallet");
-        (
-            AppState::new(store, wallet, "http://127.0.0.1:1".into(), "test".into()),
-            dir,
-        )
+        let state = AppState::new(store, wallet, "http://127.0.0.1:1".into(), "test".into());
+        state.mark_started();
+        (state, dir)
     }
 
     #[tokio::test]
@@ -4162,6 +4243,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
         let state = AppState::new(store, wallet, "http://127.0.0.1:1".into(), "test".into());
+        state.mark_started();
         (state, dir)
     }
 
@@ -4489,6 +4571,7 @@ mod tests {
             store.initialize().unwrap();
             let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
             let state = AppState::new(store, wallet, "http://127.0.0.1:1".into(), "test".into());
+            state.mark_started();
             let body = json!({"address": address, "amount_zatoshi": 123, "idempotency_key": "internal-replay"});
             for _ in 0..2 {
                 let response = router(state.clone())
@@ -5271,5 +5354,471 @@ mod tests {
             .unwrap();
         let prepared = store.activity_for_key("same").unwrap().unwrap();
         (store, prepared)
+    }
+
+    async fn api_request(
+        state: &AppState,
+        method: &str,
+        uri: &str,
+        body: Value,
+    ) -> (StatusCode, Value) {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(if method == "GET" {
+                        Body::empty()
+                    } else {
+                        Body::from(body.to_string())
+                    })
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    async fn api_get(state: &AppState, uri: &str) -> (StatusCode, Value) {
+        api_request(state, "GET", uri, Value::Null).await
+    }
+
+    async fn counting_rpc(chain_info: bool) -> (String, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rpc_calls = calls.clone();
+        let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
+            let calls = rpc_calls.clone();
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Json(if chain_info && request["method"] == "getblockchaininfo" {
+                    json!({"result": {"chain": "regtest", "blocks": 101, "bestblockhash": "a".repeat(64)}, "error": null, "id": request["id"]})
+                } else {
+                    json!({"result": null, "error": {"code": -1, "message": "unavailable"}, "id": request["id"]})
+                })
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
+        (url, calls)
+    }
+
+    #[tokio::test]
+    async fn activity_lookup_by_key_returns_every_state_regardless_of_list_limits() {
+        let (state, _dir) = state_with_local_wallet();
+        let store = &state.0.store;
+        let preparing = store
+            .claim_transfer(
+                1,
+                2,
+                "ironwood",
+                "ironwood",
+                1_000,
+                "lookup-preparing",
+                Some(""),
+            )
+            .unwrap();
+        let pending = store
+            .claim_transfer(
+                1,
+                2,
+                "ironwood",
+                "transparent",
+                2_000,
+                "lookup-pending",
+                None,
+            )
+            .unwrap();
+        store
+            .record_prepared(&pending.id, "pending-txid", b"raw", 140)
+            .unwrap();
+        store.mark_broadcast(&pending.id, "pending-txid").unwrap();
+        let failed = store
+            .claim_transfer(2, 1, "ironwood", "ironwood", 3_000, "lookup-failed", None)
+            .unwrap();
+        store.fail(&failed.id, "insufficient funds").unwrap();
+        let confirmed = store
+            .claim_faucet(3, "ironwood", 4_000, "lookup-confirmed")
+            .unwrap();
+        store
+            .record_prepared(&confirmed.id, "confirmed-txid", b"raw", 140)
+            .unwrap();
+        store
+            .confirm(&confirmed.id, "confirmed-txid", "block")
+            .unwrap();
+        store
+            .claim_address_faucet("tm-external", 5, "lookup-external")
+            .unwrap();
+
+        let (status, listed) = api_get(&state, "/api/v1/activity?limit=10").await;
+        assert_eq!(status, StatusCode::OK);
+        let listed: Vec<_> = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["id"].clone(),
+                    row["status"].clone(),
+                    row["txid"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (
+                    json!(confirmed.id),
+                    json!("confirmed"),
+                    json!("confirmed-txid")
+                ),
+                (json!(failed.id), json!("failed"), json!("")),
+                (json!(pending.id), json!("broadcast"), json!("pending-txid")),
+                (json!(preparing.id), json!("preparing"), json!("")),
+            ]
+        );
+
+        for index in 0..101 {
+            store
+                .claim_transfer(
+                    1,
+                    3,
+                    "ironwood",
+                    "ironwood",
+                    1,
+                    &format!("filler-{index:03}"),
+                    None,
+                )
+                .unwrap();
+        }
+        let (_, listed) = api_get(&state, "/api/v1/activity?limit=100").await;
+        assert_eq!(listed.as_array().unwrap().len(), 100);
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != json!(preparing.id))
+        );
+
+        for (key, id, status, txid, last_error) in [
+            (
+                "lookup-preparing",
+                &preparing.id,
+                "preparing",
+                "",
+                Value::Null,
+            ),
+            (
+                "lookup-pending",
+                &pending.id,
+                "broadcast",
+                "pending-txid",
+                Value::Null,
+            ),
+            (
+                "lookup-failed",
+                &failed.id,
+                "failed",
+                "",
+                json!("insufficient funds"),
+            ),
+            (
+                "lookup-confirmed",
+                &confirmed.id,
+                "confirmed",
+                "confirmed-txid",
+                Value::Null,
+            ),
+        ] {
+            let (code, found) = api_get(
+                &state,
+                &format!("/api/v1/activity?limit=1&idempotency_key={key}"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK, "{key}");
+            let found = found.as_array().unwrap();
+            assert_eq!(found.len(), 1, "{key}");
+            assert_eq!(found[0]["id"], json!(id), "{key}");
+            assert_eq!(found[0]["status"], status, "{key}");
+            assert_eq!(found[0]["txid"], txid, "{key}");
+            assert_eq!(found[0]["last_error"], last_error, "{key}");
+        }
+        for key in ["lookup-missing", "lookup-external"] {
+            assert_eq!(
+                api_get(&state, &format!("/api/v1/activity?idempotency_key={key}")).await,
+                (StatusCode::OK, json!([]))
+            );
+        }
+        let (code, _) = api_get(&state, "/api/v1/activity?idempotency_key=").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn address_faucet_status_reads_internal_and_external_records() {
+        let (state, _dir) = state_with_local_wallet();
+        let store = &state.0.store;
+        let external = store
+            .claim_address_faucet("tm-external", 50, "status-external")
+            .unwrap();
+        store
+            .record_address_error(&external.id, "preparing", "", "treasury is syncing")
+            .unwrap();
+        let transparent = store
+            .claim_faucet(2, "transparent", 60, "status-transparent")
+            .unwrap();
+        store
+            .record_prepared(&transparent.id, "transparent-txid", b"raw", 140)
+            .unwrap();
+        store
+            .mark_broadcast(&transparent.id, "transparent-txid")
+            .unwrap();
+        let ironwood = store
+            .claim_faucet(3, "ironwood", 70, "status-ironwood")
+            .unwrap();
+        store
+            .record_prepared(&ironwood.id, "ironwood-txid", b"raw", 140)
+            .unwrap();
+        store
+            .confirm(&ironwood.id, "ironwood-txid", "ironwood-block")
+            .unwrap();
+        let external_address = store
+            .account(TREASURY_ACCOUNT_ID)
+            .unwrap()
+            .transparent_address;
+        let confirmed_external = store
+            .claim_address_faucet(&external_address, 80, "status-confirmed-external")
+            .unwrap();
+        store
+            .record_address_prepared(&confirmed_external.id, "external-txid", b"raw", 140)
+            .unwrap();
+        store
+            .confirm_address(&confirmed_external.id, "external-txid", "external-block")
+            .unwrap();
+        store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 90, "status-send", None)
+            .unwrap();
+
+        let transparent_address = store.account(2).unwrap().transparent_address;
+        let unified_address = store.account(3).unwrap().unified_address;
+        for (key, expected) in [
+            (
+                "status-external",
+                json!({"address": "tm-external", "amount_zatoshi": 50, "txid": "", "block_hash": null, "status": "preparing", "last_error": "treasury is syncing"}),
+            ),
+            (
+                "status-transparent",
+                json!({"address": transparent_address, "amount_zatoshi": 60, "txid": "transparent-txid", "block_hash": null, "status": "broadcast", "last_error": null}),
+            ),
+            (
+                "status-ironwood",
+                json!({"address": unified_address, "amount_zatoshi": 70, "txid": "ironwood-txid", "block_hash": "ironwood-block", "status": "confirmed", "last_error": null}),
+            ),
+            (
+                "status-confirmed-external",
+                json!({"address": external_address, "amount_zatoshi": 80, "txid": "external-txid", "block_hash": "external-block", "status": "confirmed", "last_error": null}),
+            ),
+        ] {
+            assert_eq!(
+                api_get(
+                    &state,
+                    &format!("/api/v1/faucet/address?idempotency_key={key}")
+                )
+                .await,
+                (StatusCode::OK, expected),
+                "{key}"
+            );
+        }
+
+        for (key, address, amount) in [
+            ("status-ironwood", unified_address.as_str(), 70),
+            ("status-confirmed-external", external_address.as_str(), 80),
+        ] {
+            let (_, read) = api_get(
+                &state,
+                &format!("/api/v1/faucet/address?idempotency_key={key}"),
+            )
+            .await;
+            let (code, replay) = api_request(
+                &state,
+                "POST",
+                "/api/v1/faucet/address",
+                json!({"address": address, "amount_zatoshi": amount, "idempotency_key": key}),
+            )
+            .await;
+            assert_eq!((code, replay), (StatusCode::OK, read), "{key}");
+        }
+
+        for key in ["status-send", "status-missing"] {
+            let (code, body) = api_get(
+                &state,
+                &format!("/api/v1/faucet/address?idempotency_key={key}"),
+            )
+            .await;
+            assert_eq!(code, StatusCode::NOT_FOUND, "{key}");
+            assert_eq!(body["error"]["status"], 404, "{key}");
+        }
+        assert_eq!(
+            api_get(&state, "/api/v1/faucet/address?idempotency_key=")
+                .await
+                .0,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            api_get(&state, "/api/v1/faucet/address").await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_status_reads_have_no_wallet_or_node_side_effects() {
+        let (state, dir) = state_with_local_wallet();
+        let (rpc_url, calls) = counting_rpc(true).await;
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            rpc_url,
+            "test".into(),
+        );
+        let store = &state.0.store;
+        let send = store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 1_000, "read-send", None)
+            .unwrap();
+        store
+            .claim_faucet(2, "transparent", 2_000, "read-internal")
+            .unwrap();
+        let external = store
+            .claim_address_faucet("tm-external", 3_000, "read-external")
+            .unwrap();
+        let activities = store.unresolved_activities().unwrap();
+        let faucets = store.unresolved_address_faucets().unwrap();
+
+        for uri in [
+            "/api/v1/activity",
+            "/api/v1/activity?idempotency_key=read-send",
+            "/api/v1/faucet/address?idempotency_key=read-internal",
+            "/api/v1/faucet/address?idempotency_key=read-external",
+            "/api/v1/faucet/address?idempotency_key=read-missing",
+        ] {
+            api_get(&state, uri).await;
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.unresolved_activities().unwrap(), activities);
+        assert_eq!(store.unresolved_address_faucets().unwrap(), faucets);
+        for id in [&send.id, &external.id] {
+            assert!(store.prepared_transaction(id).is_err());
+            assert!(state.0.wallet.prepared(id).await.unwrap().is_none());
+        }
+        drop(dir);
+    }
+
+    #[tokio::test]
+    async fn health_and_chain_effects_wait_until_startup_finishes() {
+        let (state, _dir) = state_with_local_wallet();
+        let (rpc_url, calls) = counting_rpc(true).await;
+        let state = AppState::new(
+            state.0.store.clone(),
+            state.0.wallet.clone(),
+            rpc_url,
+            "test".into(),
+        );
+        state.0.wallet_snapshot.write().await.status.last_success_at = Some(1);
+        let account = state.0.store.account(2).unwrap();
+
+        let (code, health) = api_get(&state, "/api/v1/health").await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(health["ok"], false);
+        assert_eq!(health["node"]["blocks"], 101);
+        let health_calls = calls.load(Ordering::SeqCst);
+
+        for (uri, body) in [
+            ("/api/v1/send", valid_send()),
+            (
+                "/api/v1/faucet",
+                json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 1_000, "idempotency_key": "startup-faucet"}),
+            ),
+            (
+                "/api/v1/faucet/address",
+                json!({"address": account.transparent_address, "amount_zatoshi": 1_000, "idempotency_key": "startup-address"}),
+            ),
+            ("/api/v1/mine", json!({"blocks": 1})),
+            (
+                "/api/v1/mining/jobs",
+                json!({"blocks": 1, "idempotency_key": "startup-mining"}),
+            ),
+        ] {
+            let (code, body) = api_request(&state, "POST", uri, body).await;
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(
+                body["error"]["message"],
+                "the environment is still starting"
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), health_calls);
+        assert!(state.0.store.activities(100).unwrap().is_empty());
+        assert!(
+            state
+                .0
+                .store
+                .unresolved_address_faucets()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.0.mining.latest().await.is_none());
+
+        state.mark_started();
+        let (code, health) = api_get(&state, "/api/v1/health").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(health["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn server_store_repairs_preparation_from_the_wallet_journal() {
+        let (state, dir) = state_with_local_wallet();
+        let claim = state
+            .0
+            .store
+            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "journal-repair", None)
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("wallet.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![claim.id, "journal-txid", b"journaled signed bytes", 150_u64],
+            )
+            .unwrap();
+
+        let journaled = state.0.wallet.prepared(&claim.id).await.unwrap().unwrap();
+        let repaired = state
+            .0
+            .store
+            .record_prepared(
+                &claim.id,
+                &journaled.txid,
+                &journaled.raw_transaction,
+                journaled.expiry_height,
+            )
+            .unwrap();
+
+        assert_eq!(
+            (repaired.status.as_str(), repaired.txid.as_str()),
+            ("prepared", "journal-txid")
+        );
+        assert_eq!(
+            state.0.store.prepared_transaction(&claim.id).unwrap(),
+            PreparedTransaction {
+                raw_transaction: b"journaled signed bytes".to_vec(),
+                expiry_height: 150
+            }
+        );
     }
 }

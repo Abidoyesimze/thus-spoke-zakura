@@ -505,12 +505,13 @@ async fn address_faucet_request(
     client: &Client,
     fixture: &RegtestStack,
     address: &str,
+    key: &str,
 ) -> Result<serde_json::Value> {
     request_json(
         client,
         fixture.api_url(),
         "/api/v1/faucet/address",
-        Some(&json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": uuid::Uuid::new_v4().to_string()})),
+        Some(&json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": key})),
         SEND_TIMEOUT,
     )
     .await
@@ -521,16 +522,30 @@ async fn assert_address_faucet_inclusion(
     fixture: &RegtestStack,
     response: &serde_json::Value,
     address: &str,
+    key: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        response.as_object().is_some_and(|fields| fields.len() == 5),
+        response.as_object().is_some_and(|fields| fields.len() == 6),
         "address faucet response fields changed"
     );
     anyhow::ensure!(
         response["address"] == address
             && response["amount_zatoshi"] == 100_000_000
-            && response["status"] == "confirmed",
+            && response["status"] == "confirmed"
+            && response["last_error"].is_null(),
         "address faucet destination, amount, or confirmation status changed"
+    );
+    let stored: serde_json::Value = request_json(
+        client,
+        fixture.api_url(),
+        &format!("/api/v1/faucet/address?idempotency_key={key}"),
+        None,
+        API_READ_TIMEOUT,
+    )
+    .await?;
+    anyhow::ensure!(
+        &stored == response,
+        "stored address faucet status differs from the response"
     );
     let evidence: TransactionEvidence = rpc(
         client,
@@ -567,7 +582,8 @@ async fn internal_address_faucets_record_confirmed_activity() -> Result<()> {
             (&account.transparent_address, "transparent"),
         ] {
             let before = faucet_activities(&client, &fixture).await?;
-            let response = address_faucet_request(&client, &fixture, address).await?;
+            let key = uuid::Uuid::new_v4().to_string();
+            let response = address_faucet_request(&client, &fixture, address, &key).await?;
             let after = faucet_activities(&client, &fixture).await?;
             let row = new_faucet_activity(&before, &after)?;
             assert_eq!(row.kind, "faucet");
@@ -579,7 +595,7 @@ async fn internal_address_faucets_record_confirmed_activity() -> Result<()> {
             assert_eq!(row.status, "confirmed");
             assert_eq!(Some(row.txid.as_str()), response["txid"].as_str());
             assert_eq!(row.block_hash.as_deref(), response["block_hash"].as_str());
-            assert_address_faucet_inclusion(&client, &fixture, &response, address).await?;
+            assert_address_faucet_inclusion(&client, &fixture, &response, address, &key).await?;
             payments.push((row.id.clone(), row.txid.clone()));
         }
         assert_ne!(payments[0].0, payments[2].0);
@@ -748,8 +764,9 @@ async fn external_address_faucet_behavior_is_unchanged() -> Result<()> {
                     && account.unified_address != address)
         );
         let before = faucet_activities(&client, &fixture).await?;
-        let response = address_faucet_request(&client, &fixture, &address).await?;
-        assert_address_faucet_inclusion(&client, &fixture, &response, &address).await?;
+        let key = uuid::Uuid::new_v4().to_string();
+        let response = address_faucet_request(&client, &fixture, &address, &key).await?;
+        assert_address_faucet_inclusion(&client, &fixture, &response, &address, &key).await?;
         let after = faucet_activities(&client, &fixture).await?;
         assert_eq!(
             before.iter().map(|row| &row.id).collect::<Vec<_>>(),

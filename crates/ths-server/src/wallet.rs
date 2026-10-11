@@ -791,6 +791,19 @@ impl RealWallet {
         Ok(prepared_payment(&mut db, activity_id)?.is_some())
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) repairs from this"
+        )
+    )]
+    pub async fn prepared(&self, activity_id: &str) -> Result<Option<PreparedPayment>> {
+        let activity_id = activity_id.to_owned();
+        self.with_db(move |db| prepared_payment(db, &activity_id))
+            .await
+    }
+
     pub async fn recover_prepared(&self, txid: &str) -> Result<Option<PreparedPayment>> {
         let txid = TxId::from_hex(txid).context("invalid wallet transaction id")?;
         let db = self.db.lock().await;
@@ -1446,6 +1459,11 @@ mod tests {
         let wallet = RealWallet::open(dir.path(), &seed).unwrap();
         assert!(wallet.has_prepared("activity-1").await.unwrap());
         assert!(!wallet.has_prepared("missing").await.unwrap());
+        let journaled = wallet.prepared("activity-1").await.unwrap().unwrap();
+        assert_eq!(journaled.txid, "txid-1");
+        assert_eq!(journaled.raw_transaction, b"signed transaction");
+        assert_eq!(journaled.expiry_height, 140);
+        assert!(wallet.prepared("missing").await.unwrap().is_none());
         let recovered = wallet
             .prepare(
                 Some("activity-1"),
