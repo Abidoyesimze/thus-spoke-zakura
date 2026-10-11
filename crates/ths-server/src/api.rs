@@ -3459,6 +3459,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payment_confirmation_loop_survives_request_confirmation_cancellation() {
+        let (state, dir) = state_with_local_wallet();
+        let claim = confirmation_claim(&state.0.store, "cancelled-request-txid");
+        let store = state.0.store.clone();
+        drop(state);
+        let (entered, lookup_started) = tokio::sync::oneshot::channel();
+        let entered = Arc::new(Mutex::new(Some(entered)));
+        let (release_lookup, released) = tokio::sync::oneshot::channel();
+        let released = Arc::new(Mutex::new(Some(released)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rpc_calls = calls.clone();
+        let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
+            let entered = entered.clone();
+            let released = released.clone();
+            let calls = rpc_calls.clone();
+            async move {
+                assert_eq!(request["method"], "getrawtransaction");
+                assert_eq!(request["params"][0], "cancelled-request-txid");
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let released = released.lock().unwrap().take().unwrap();
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    // Cancellation happens after the request-side lookup starts,
+                    // before it can confirm, auto-mine, or notify subscribers.
+                    tokio::time::timeout(Duration::from_secs(10), released)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                Json(json!({
+                    "result": {"txid": "cancelled-request-txid", "confirmations": 1, "blockhash": "recovered-block"},
+                    "error": null,
+                    "id": request["id"]
+                }))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rpc_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
+        let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+        let state = AppState::new(store, wallet, rpc_url, "test".into());
+        let mut updates = state.0.events.subscribe();
+        let request_state = state.clone();
+        let request_claim = claim.clone();
+        let request =
+            tokio::spawn(async move { confirm_after_mining(&request_state, request_claim).await });
+        let lookup_started = tokio::time::timeout(Duration::from_secs(5), lookup_started).await;
+        request.abort();
+        let request_result = request.await;
+        let lookup_released = release_lookup.send(());
+        let pending = state.0.store.activity_for_key("cancelled-request-txid");
+        let signed = state.0.store.prepared_transaction(&claim.id);
+        let no_request_update = updates.try_recv();
+        // Request cancellation must not cancel server-owned work. Holding the
+        // sync guard also proves recovery does not depend on wallet scanning.
+        let _sync = state.0.wallet_sync.lock().await;
+        let worker = tokio::spawn(payment_confirmation_loop(state.clone()));
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv()).await;
+        worker.abort();
+        let worker_result = worker.await;
+        server.abort();
+        let server_result = server.await;
+
+        lookup_started.unwrap().unwrap();
+        lookup_released.unwrap();
+        assert!(request_result.unwrap_err().is_cancelled());
+        let pending = pending.unwrap().unwrap();
+        assert_eq!(pending.id, claim.id);
+        assert_eq!(pending.txid, claim.txid);
+        assert_eq!(pending.status, "broadcast");
+        assert!(pending.block_hash.is_none());
+        assert_eq!(signed.unwrap().raw_transaction, b"signed");
+        assert!(matches!(
+            no_request_update,
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert_eq!(update.unwrap().unwrap(), "wallet");
+        let confirmed = state
+            .0
+            .store
+            .activity_for_key("cancelled-request-txid")
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed.id, claim.id);
+        assert_eq!(confirmed.txid, claim.txid);
+        assert_eq!(confirmed.status, "confirmed");
+        assert_eq!(confirmed.block_hash.as_deref(), Some("recovered-block"));
+        assert_eq!(
+            state
+                .0
+                .store
+                .prepared_transaction(&claim.id)
+                .unwrap()
+                .raw_transaction,
+            b"signed"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(worker_result.unwrap_err().is_cancelled());
+        assert!(server_result.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn payment_confirmation_pass_continues_after_unknown_or_unavailable_transactions() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
