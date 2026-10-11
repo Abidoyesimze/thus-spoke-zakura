@@ -48,6 +48,12 @@ npm test --prefix web
 npm run build --prefix web
 ```
 
+Rust tests are grouped in `crates/ths-cli/tests/` and `crates/ths-server/tests/`.
+Unit tests under `unit/` mirror production owners and remain their child modules
+through gated `#[path]` declarations. Fixtures live under `support/`, and server
+activity scenarios under `scenarios/activity_recovery/`. The existing integration
+roots and Cargo commands above still apply.
+
 ## Pull requests
 
 - Branch from `main` and keep each pull request focused on one change.

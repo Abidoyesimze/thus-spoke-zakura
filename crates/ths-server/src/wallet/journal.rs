@@ -1,0 +1,82 @@
+use super::*;
+
+const PREPARED_PAYMENTS_MIGRATION_ID: Uuid =
+    Uuid::from_u128(0x695f93ac_6935_47e8_8f06_017b1d7ec3aa);
+
+// Keep the ext_tsz_* schema names and migration UUIDs stable: existing wallets
+// have already applied these migrations, so changing their definitions would
+// produce a different schema only for newly initialized wallets.
+pub(super) struct PreparedPaymentsMigration;
+
+impl schemerz::Migration<Uuid> for PreparedPaymentsMigration {
+    fn id(&self) -> Uuid {
+        PREPARED_PAYMENTS_MIGRATION_ID
+    }
+
+    fn dependencies(&self) -> HashSet<Uuid> {
+        migrations::V_0_22_0_RC2.iter().copied().collect()
+    }
+
+    fn description(&self) -> &'static str {
+        "Stores prepared payments for durable application retries."
+    }
+}
+
+impl RusqliteMigration for PreparedPaymentsMigration {
+    type Error = WalletMigrationError;
+
+    fn up(&self, db: &rusqlite::Transaction<'_>) -> Result<(), Self::Error> {
+        db.execute_batch(
+            "CREATE TABLE ext_tsz_prepared_payments (
+                activity_id TEXT PRIMARY KEY,
+                txid TEXT NOT NULL,
+                raw_transaction BLOB NOT NULL,
+                expiry_height INTEGER NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+}
+
+pub(super) fn prepared_payment(db: &mut Db, activity_id: &str) -> Result<Option<PreparedPayment>> {
+    db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+        Ok(ext
+            .query_row(
+                "SELECT txid,raw_transaction,expiry_height FROM ext_tsz_prepared_payments WHERE activity_id=?1",
+                [activity_id],
+                |row| {
+                    Ok(PreparedPayment {
+                        txid: row.get(0)?,
+                        raw_transaction: row.get(1)?,
+                        expiry_height: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    })
+}
+pub struct PreparedPayment {
+    pub txid: String,
+    pub raw_transaction: Vec<u8>,
+    pub expiry_height: u64,
+}
+
+impl RealWallet {
+    pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
+        let mut db = self.db.lock().await;
+        Ok(prepared_payment(&mut db, activity_id)?.is_some())
+    }
+
+    pub async fn recover_prepared(&self, txid: &str) -> Result<Option<PreparedPayment>> {
+        let txid = TxId::from_hex(txid).context("invalid wallet transaction id")?;
+        let db = self.db.lock().await;
+        let Some(transaction) = db.get_transaction(txid)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+    }
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/wallet/journal/tests.rs"]
+mod tests;

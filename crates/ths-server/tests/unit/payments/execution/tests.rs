@@ -1,0 +1,277 @@
+use super::*;
+use crate::state::tests::state_with_local_wallet;
+use crate::{
+    db::{Activity, Store},
+    wallet::PreparedPayment,
+};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+struct RecordingPaymentLifecycle {
+    store: Store,
+    submissions: Mutex<VecDeque<LifecycleSubmission>>,
+    discarded: Mutex<Vec<String>>,
+    record_fails: AtomicBool,
+    confirm: bool,
+}
+
+impl RecordingPaymentLifecycle {
+    fn new(store: Store, submissions: impl IntoIterator<Item = LifecycleSubmission>) -> Self {
+        Self {
+            store,
+            submissions: Mutex::new(submissions.into_iter().collect()),
+            discarded: Mutex::new(Vec::new()),
+            record_fails: AtomicBool::new(false),
+            confirm: true,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycle for RecordingPaymentLifecycle {
+    async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission> {
+        match self
+            .submissions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected submission")
+        {
+            LifecycleSubmission::Broadcast => Ok(PreparedSubmission::Broadcast(
+                self.store.mark_broadcast(&activity.id, &activity.txid)?,
+            )),
+            LifecycleSubmission::Expired => Ok(PreparedSubmission::Expired(
+                self.store.reset_for_retry(&activity.id, &activity.txid)?,
+            )),
+        }
+    }
+
+    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
+        self.discarded.lock().unwrap().push(id.to_owned());
+        self.store.discard_preparing(id)
+    }
+
+    fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
+        if self.record_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("recording failed");
+        }
+        self.store.record_prepared(
+            id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )
+    }
+
+    async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
+        if self.confirm {
+            self.store
+                .confirm(&activity.id, &activity.txid, "confirmed-block")
+        } else {
+            Ok(activity)
+        }
+    }
+}
+
+fn lifecycle_claim(store: &Store, key: &str) -> Activity {
+    store
+        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, key, None)
+        .unwrap()
+}
+
+fn prepared_payment_result(txid: &str, expiry_height: u64) -> PreparedPayment {
+    PreparedPayment {
+        txid: txid.into(),
+        raw_transaction: format!("signed {txid}").into_bytes(),
+        expiry_height,
+    }
+}
+
+#[tokio::test]
+async fn payment_lifecycle_returns_confirmed_replays_without_preparation() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "confirmed-replay");
+    let prepared = store
+        .record_prepared(&claim.id, "confirmed-txid", b"signed", 140)
+        .unwrap();
+    store.mark_broadcast(&prepared.id, &prepared.txid).unwrap();
+    let confirmed = store
+        .confirm(&prepared.id, &prepared.txid, "confirmed-block")
+        .unwrap();
+    let runtime = RecordingPaymentLifecycle::new(store, []);
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+    let result = execute_payment(&runtime, confirmed.clone(), {
+        let prepare_calls = prepare_calls.clone();
+        move |_| {
+            prepare_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(prepared_payment_result("unused", 180)))
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.id, confirmed.id);
+    assert_eq!(result.status, "confirmed");
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn payment_lifecycle_submits_prepared_replays_without_preparation() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "prepared-replay");
+    let prepared = store
+        .record_prepared(&claim.id, "prepared-txid", b"signed", 140)
+        .unwrap();
+    let runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+    let result = execute_payment(&runtime, prepared, {
+        let prepare_calls = prepare_calls.clone();
+        move |_| {
+            prepare_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(prepared_payment_result("unused", 180)))
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, "confirmed");
+    assert_eq!(result.txid, "prepared-txid");
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn payment_lifecycle_prepares_again_after_expiry() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "expired-replay");
+    let prepared = store
+        .record_prepared(&claim.id, "expired-txid", b"expired", 140)
+        .unwrap();
+    let runtime = RecordingPaymentLifecycle::new(
+        store,
+        [LifecycleSubmission::Expired, LifecycleSubmission::Broadcast],
+    );
+    let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+    let result = execute_payment(&runtime, prepared, {
+        let prepare_calls = prepare_calls.clone();
+        move |_| {
+            prepare_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(prepared_payment_result("replacement-txid", 180)))
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, "confirmed");
+    assert_eq!(result.txid, "replacement-txid");
+    assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn payment_lifecycle_does_not_discard_after_recording_failure() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "recording-failure");
+    let runtime = RecordingPaymentLifecycle::new(store.clone(), []);
+    runtime.record_fails.store(true, Ordering::SeqCst);
+
+    let result = execute_payment(&runtime, claim.clone(), |_| {
+        std::future::ready(Ok(prepared_payment_result("durable-txid", 180)))
+    })
+    .await;
+
+    assert!(result.is_err());
+    assert!(runtime.discarded.lock().unwrap().is_empty());
+    assert_eq!(
+        store
+            .activity_for_key("recording-failure")
+            .unwrap()
+            .unwrap()
+            .status,
+        "preparing"
+    );
+}
+
+#[tokio::test]
+async fn payment_lifecycle_returns_pending_after_confirmation_failure() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "mining-failure");
+    let prepared = store
+        .record_prepared(&claim.id, "pending-txid", b"signed", 140)
+        .unwrap();
+    let mut runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
+    runtime.confirm = false;
+
+    let result = execute_payment(&runtime, prepared, |_| {
+        std::future::ready(Ok(prepared_payment_result("unused", 180)))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, "broadcast");
+    assert_eq!(result.txid, "pending-txid");
+}
+
+#[tokio::test]
+async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
+    let (state, dir) = state_with_local_wallet();
+    let claim = state
+        .0
+        .store
+        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .unwrap();
+    rusqlite::Connection::open(dir.path().join("wallet.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
+            rusqlite::params![claim.id, "txid", b"signed transaction", 140_u64],
+        )
+        .unwrap();
+
+    assert!(
+        execute_payment(&state, claim.clone(), |_| {
+            std::future::ready(Err(anyhow::anyhow!("preparation failed")))
+        })
+        .await
+        .is_err()
+    );
+
+    assert_eq!(
+        state.0.store.activity_for_key("same").unwrap().unwrap().id,
+        claim.id
+    );
+}
+
+#[tokio::test]
+async fn failed_preparation_discards_a_claim_without_a_wallet_journal() {
+    let (state, _dir) = state_with_local_wallet();
+    let claim = state
+        .0
+        .store
+        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .unwrap();
+
+    assert!(
+        execute_payment(&state, claim, |_| {
+            std::future::ready(Err(anyhow::anyhow!("preparation failed")))
+        })
+        .await
+        .is_err()
+    );
+    assert!(state.0.store.activity_for_key("same").unwrap().is_none());
+}
+
+enum LifecycleSubmission {
+    Broadcast,
+    Expired,
+}

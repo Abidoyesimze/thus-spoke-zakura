@@ -1,0 +1,194 @@
+use crate::state::{AppState, notify};
+use crate::{
+    payments::confirmation::reconcile_unconfirmed,
+    rpc::ChainCheckpoint,
+    state::{WalletSyncStatus, now_unix},
+    wallet::WALLET_BIRTHDAY_HEIGHT,
+};
+use anyhow::Context;
+use serde_json::Value;
+use std::time::Duration;
+use tokio::time::Instant;
+impl AppState {
+    pub(crate) async fn synchronize_wallet(
+        &self,
+        target_height: Option<u64>,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let _guard = tokio::time::timeout_at(deadline, self.0.wallet_sync.lock()).await?;
+
+        {
+            let mut snapshot = self.0.wallet_snapshot.write().await;
+            snapshot.status.state = "syncing";
+            snapshot.status.error = None;
+        }
+        notify(self, "sync");
+
+        let result = async {
+            if let Some(target) = target_height {
+                self.0
+                    .wallet
+                    .wait_for_height(target, deadline.saturating_duration_since(Instant::now()))
+                    .await?;
+            }
+            let target = crate::reconcile::within_deadline(
+                deadline,
+                "reading the reconciliation target",
+                self.0.rpc.checkpoint(),
+            )
+            .await?;
+            if let Some(height) = target_height {
+                anyhow::ensure!(
+                    target.height >= height,
+                    "mined height is no longer canonical"
+                );
+            }
+            crate::reconcile::sync_wallet(&self.0.wallet, &self.0.rpc, &target, deadline).await?;
+            self.refresh_wallet_snapshot(&target).await
+        }
+        .await;
+
+        if let Err(error) = &result {
+            let mut snapshot = self.0.wallet_snapshot.write().await;
+            snapshot.status.state = "error";
+            snapshot.status.error = Some(error.to_string());
+            notify(self, "sync");
+        }
+        result
+    }
+
+    pub(crate) async fn synchronize_latest(&self) -> anyhow::Result<()> {
+        self.synchronize_wallet(None).await
+    }
+
+    pub(crate) async fn refresh_wallet_snapshot(
+        &self,
+        target: &ChainCheckpoint,
+    ) -> anyhow::Result<()> {
+        let mut accounts = self.0.store.accounts()?;
+        self.0.wallet.apply_balances(&mut accounts).await?;
+        let scanned = self.0.wallet.scanned_checkpoint().await?;
+        let rpc = &self.0.rpc;
+        let observed = rpc.checkpoint().await?;
+        let publishable = scan_is_publishable(scanned.as_ref(), target, &observed, |height| {
+            rpc.block_hash(height)
+        })
+        .await?;
+        anyhow::ensure!(
+            publishable,
+            "chain checkpoint changed before wallet publication"
+        );
+        let changed = self.0.wallet_snapshot.read().await.accounts != accounts;
+        {
+            let mut snapshot = self.0.wallet_snapshot.write().await;
+            snapshot.accounts = accounts;
+            snapshot.status = WalletSyncStatus {
+                state: "ready",
+                fully_scanned_height: scanned.as_ref().map(|checkpoint| checkpoint.height),
+                fully_scanned_hash: scanned.as_ref().map(|checkpoint| checkpoint.hash.clone()),
+                observed_height: Some(observed.height),
+                observed_hash: Some(observed.hash),
+                last_success_at: Some(now_unix()),
+                error: None,
+            };
+        }
+        notify(self, "sync");
+        if changed {
+            notify(self, "wallet");
+        }
+        reconcile_unconfirmed(self).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
+        let observed = self.0.rpc.checkpoint().await?;
+        let status = self.0.wallet_snapshot.read().await.status.clone();
+        let settled = status.state == "ready"
+            && ((status.fully_scanned_height == Some(observed.height)
+                && status.fully_scanned_hash.as_deref() == Some(&observed.hash))
+                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
+                    && status.fully_scanned_height.is_none()
+                    && status.observed_height == Some(observed.height)
+                    && status.observed_hash.as_deref() == Some(&observed.hash)));
+        {
+            let mut snapshot = self.0.wallet_snapshot.write().await;
+            snapshot.status.observed_height = Some(observed.height);
+            snapshot.status.observed_hash = Some(observed.hash.clone());
+        }
+        if !settled {
+            self.synchronize_wallet(Some(observed.height)).await?;
+            notify(self, "chain");
+        }
+        Ok(())
+    }
+}
+
+/// a scan that reached its target stays publishable after other requests mine past it, as long as
+/// the node still has the scanned block.
+async fn scan_is_publishable<F, Fut>(
+    scanned: Option<&ChainCheckpoint>,
+    target: &ChainCheckpoint,
+    observed: &ChainCheckpoint,
+    canonical_hash: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(u32) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<String>>,
+{
+    Ok(match scanned {
+        Some(scanned) if scanned == observed => scanned.height >= target.height,
+        Some(scanned) if (target.height..observed.height).contains(&scanned.height) => {
+            canonical_hash(u32::try_from(scanned.height)?).await? == scanned.hash
+        }
+        Some(_) => false,
+        None => observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT),
+    })
+}
+pub(crate) async fn wallet_sync_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if let Err(error) = state.sync_if_chain_advanced().await {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background wallet synchronization failed"
+            );
+            let mut snapshot = state.0.wallet_snapshot.write().await;
+            snapshot.status.state = "error";
+            snapshot.status.error = Some(error.to_string());
+            drop(snapshot);
+            notify(&state, "sync");
+        }
+    }
+}
+pub(crate) async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
+    state.0.rpc.chain_info().await?;
+    state.synchronize_latest().await?;
+    Ok(())
+}
+
+pub(crate) async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
+    let hashes = state.0.rpc.generate(blocks).await?;
+    let tip_hash = hashes
+        .last()
+        .context("Zakura did not return the mined block hash")?;
+    let tip_height = state
+        .0
+        .rpc
+        .block(tip_hash)
+        .await?
+        .pointer("/height")
+        .and_then(Value::as_u64)
+        .context("Zakura mined block omitted its height")?;
+    state.synchronize_wallet(Some(tip_height)).await?;
+    // Every caller here produces blocks, so the chain moved for everyone, not
+    // just the tab that asked. Without this, other dashboards keep the old
+    // height and tip until something else happens to mine.
+    notify(state, "chain");
+    Ok(hashes)
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/sync/tests.rs"]
+pub(crate) mod tests;
