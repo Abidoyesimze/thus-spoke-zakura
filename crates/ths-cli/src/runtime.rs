@@ -1001,15 +1001,26 @@ fn ensure_lightwalletd(prefix: &str, name: &InstanceName, ports: &HostPorts) -> 
     }
     Ok(())
 }
-fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()> {
+fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<WatchedContainer> {
+    ensure_app_with(prefix, name, ports, &DockerCli)
+}
+
+fn ensure_app_with(
+    prefix: &str,
+    name: &InstanceName,
+    ports: &HostPorts,
+    docker: &impl DockerResourceCommands,
+) -> Result<WatchedContainer> {
     let target = format!("{prefix}-app");
-    if owned_resource(&DockerCli, "container", &target, name)?.is_none() {
+    let id = if let Some(id) = owned_resource(docker, "container", &target, name)? {
+        id
+    } else {
         let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
         let public_lightwalletd = format!("http://127.0.0.1:{}", ports.lightwalletd);
         let public_p2p = format!("127.0.0.1:{}", ports.p2p);
         let dashboard_bind = loopback_publish(ports.dashboard, 8080);
         let image = app_image();
-        docker([
+        docker.output(&[
             "create",
             "--name",
             &target,
@@ -1039,9 +1050,18 @@ fn ensure_app(prefix: &str, name: &InstanceName, ports: &HostPorts) -> Result<()
             "serve",
             "--data-dir",
             "/data",
-        ])?;
+        ])?
+    };
+    if id.is_empty() {
+        bail!("Docker returned no ID for app container {target}");
     }
-    Ok(())
+    // Capture Docker's creation time by the allocated ID, so a name replacement cannot
+    // change either the startup target or the event replay cursor.
+    let created = docker.output(&["container", "inspect", "--format", "{{.Created}}", &id])?;
+    if created.is_empty() {
+        bail!("Docker returned no creation time for app container {id}");
+    }
+    Ok(WatchedContainer { id, created })
 }
 
 fn endpoints_for(ports: &HostPorts) -> Endpoints {
@@ -1086,16 +1106,6 @@ fn published_port(container: &str, port: &str) -> Result<u16> {
     ])?
     .parse()
     .context("Docker returned an invalid published port")
-}
-fn container_exists(name: &str) -> Result<bool> {
-    docker_listed([
-        "container",
-        "ls",
-        "--all",
-        "--quiet",
-        "--filter",
-        &format!("name=^{name}$"),
-    ])
 }
 /// `docker inspect` fails the same way for a missing object and an unreachable daemon, so
 /// existence comes from a filtered listing: empty means absent, failure stays an error.
@@ -1273,8 +1283,6 @@ struct WatchedContainer {
 
 /// The Docker operations behind deletion monitoring, and its test seam.
 trait ContainerEvents: Send + Sync {
-    /// Identifies the container named `name`, or returns `None` once it no longer exists.
-    fn identify(&self, name: &str) -> Result<Option<WatchedContainer>>;
     /// Whether the container with this ID still exists.
     fn exists(&self, id: &str) -> Result<bool>;
     /// Blocks until Docker reports that the container was destroyed (`Ok(true)`), or until the
@@ -1307,26 +1315,6 @@ impl DockerEvents {
 }
 
 impl ContainerEvents for DockerEvents {
-    fn identify(&self, name: &str) -> Result<Option<WatchedContainer>> {
-        if !container_exists(name)? {
-            return Ok(None);
-        }
-        let details = docker_output([
-            "container",
-            "inspect",
-            "--format",
-            "{{.Id}} {{.Created}}",
-            name,
-        ])?;
-        let (id, created) = details
-            .split_once(' ')
-            .ok_or_else(|| anyhow!("Docker returned invalid container details: {details}"))?;
-        Ok(Some(WatchedContainer {
-            id: id.to_owned(),
-            created: created.to_owned(),
-        }))
-    }
-
     fn exists(&self, id: &str) -> Result<bool> {
         docker_listed([
             "container",
@@ -1383,25 +1371,17 @@ impl ContainerEvents for DockerEvents {
     }
 }
 
-/// Returns whether the container named `name` was deleted, or `false` once `stop` disconnects.
+/// Returns whether the allocated container was deleted, or `false` once `stop` disconnects.
 /// A Docker error never counts as deletion: the state is unknown, so it retries after `retry`.
 fn watch_deletion(
     events: &dyn ContainerEvents,
-    name: &str,
+    container: &WatchedContainer,
     retry: Duration,
     stop: &mpsc::Receiver<()>,
 ) -> bool {
     let stopped = || !matches!(stop.recv_timeout(retry), Err(RecvTimeoutError::Timeout));
-    let container = loop {
-        match events.identify(name) {
-            Ok(Some(container)) => break container,
-            Ok(None) => return true,
-            Err(_) if stopped() => return false,
-            Err(_) => {}
-        }
-    };
     loop {
-        if matches!(events.wait_destroyed(&container), Ok(true)) {
+        if matches!(events.wait_destroyed(container), Ok(true)) {
             return true;
         }
         if !matches!(stop.try_recv(), Err(TryRecvError::Empty)) {
@@ -1428,16 +1408,16 @@ struct DeletionMonitor {
 impl DeletionMonitor {
     fn spawn(
         events: Arc<dyn ContainerEvents>,
-        app_container: &str,
+        app_container: &WatchedContainer,
         retry: Duration,
         shutdown: &Shutdown,
     ) -> Self {
         let (stop, stopped) = mpsc::channel();
         let watcher = events.clone();
-        let name = app_container.to_owned();
+        let container = app_container.clone();
         let notify = shutdown.sender.clone();
         let thread = thread::spawn(move || {
-            if watch_deletion(watcher.as_ref(), &name, retry, &stopped) {
+            if watch_deletion(watcher.as_ref(), &container, retry, &stopped) {
                 // Fails only once `start` has stopped listening, when the notice no longer matters.
                 let _ = notify.send(Ended::DeletedElsewhere);
             }
@@ -1462,6 +1442,11 @@ impl Drop for DeletionMonitor {
     }
 }
 
+struct AllocatedEnvironment {
+    endpoints: Endpoints,
+    app_container: WatchedContainer,
+}
+
 trait StartHost {
     fn delete(&self, runtime: &Runtime, name: &InstanceName) -> Result<()>;
     fn delete_partial(&self, runtime: &Runtime, name: &InstanceName) -> Result<()> {
@@ -1473,7 +1458,7 @@ trait StartHost {
         name: &InstanceName,
         shutdown: &Shutdown,
         port_offset: u16,
-    ) -> Result<Endpoints>;
+    ) -> Result<AllocatedEnvironment>;
     fn wait_ready(
         &self,
         endpoints: &Endpoints,
@@ -1482,7 +1467,11 @@ trait StartHost {
         shutdown: &Shutdown,
     ) -> Result<()>;
     fn open_url(&self, url: &str) -> Result<()>;
-    fn wait_for_shutdown(&self, app_container: &str, shutdown: &Shutdown) -> Result<Ended>;
+    fn wait_for_shutdown(
+        &self,
+        app_container: &WatchedContainer,
+        shutdown: &Shutdown,
+    ) -> Result<Ended>;
 }
 
 struct DockerHost;
@@ -1502,7 +1491,7 @@ impl StartHost for DockerHost {
         name: &InstanceName,
         shutdown: &Shutdown,
         port_offset: u16,
-    ) -> Result<Endpoints> {
+    ) -> Result<AllocatedEnvironment> {
         fs::create_dir_all(runtime.instance_dir(name))?;
         let prefix = prefix(name);
         let ports = host_ports(port_offset)?;
@@ -1559,13 +1548,16 @@ impl StartHost for DockerHost {
         )?;
         docker(["start", &format!("{prefix}-lightwalletd")])?;
         shutdown.check()?;
-        ensure_app(&prefix, name, &ports)?;
+        let app_container = ensure_app(&prefix, name, &ports)?;
         shutdown.check()?;
-        docker(["start", &format!("{prefix}-app")])?;
+        docker(["start", &app_container.id])?;
         shutdown.check()?;
         let endpoints = endpoints_for(&ports);
         runtime.write_instance(name, &endpoints)?;
-        Ok(endpoints)
+        Ok(AllocatedEnvironment {
+            endpoints,
+            app_container,
+        })
     }
 
     fn wait_ready(
@@ -1582,7 +1574,11 @@ impl StartHost for DockerHost {
         open_url(url)
     }
 
-    fn wait_for_shutdown(&self, app_container: &str, shutdown: &Shutdown) -> Result<Ended> {
+    fn wait_for_shutdown(
+        &self,
+        app_container: &WatchedContainer,
+        shutdown: &Shutdown,
+    ) -> Result<Ended> {
         let _monitor = DeletionMonitor::spawn(
             Arc::new(DockerEvents::default()),
             app_container,
@@ -1632,12 +1628,14 @@ impl Runtime {
         host.delete(self, name)?;
         cleanup.active = true;
         println!("Starting {name}…");
-        let endpoints = host.allocate(self, name, shutdown, port_offset)?;
+        let AllocatedEnvironment {
+            endpoints,
+            app_container,
+        } = host.allocate(self, name, shutdown, port_offset)?;
         shutdown.check()?;
-        let app_container = format!("{}-app", prefix(name));
         host.wait_ready(
             &endpoints,
-            &app_container,
+            &format!("{}-app", prefix(name)),
             Duration::from_secs(120),
             shutdown,
         )?;
@@ -2076,13 +2074,11 @@ mod tests {
     #[test]
     fn docker_errors_are_not_reported_as_missing_resources() {
         with_unreachable_docker(|| {
-            assert!(container_exists("ths-alpha-app").is_err());
             assert!(container_running("ths-alpha-app").is_err());
             assert!(
                 owned_resource(&DockerCli, "volume", "ths-alpha-chain", &name("alpha")).is_err()
             );
             assert!(owned_resource(&DockerCli, "network", "ths-alpha", &name("alpha")).is_err());
-            assert!(DockerEvents::default().identify("ths-alpha-app").is_err());
             assert!(DockerEvents::default().exists("0123abcd").is_err());
         });
     }
@@ -2199,6 +2195,79 @@ mod tests {
             self.runs.lock().unwrap().push(args.join(" "));
             Ok(())
         }
+    }
+
+    struct ReplacedApp {
+        reuse: bool,
+        inspect_error: bool,
+    }
+
+    impl DockerResourceCommands for ReplacedApp {
+        fn output(&self, args: &[&str]) -> Result<String> {
+            match args {
+                ["container", "ls", "-a", "--format", "{{.Names}}"] => {
+                    Ok(if self.reuse { "ths-alpha-app" } else { "" }.into())
+                }
+                ["container", "inspect", "ths-alpha-app"] => Ok(
+                    r#"[{"Id":"app-1","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#
+                        .into(),
+                ),
+                ["create", ..] => Ok("app-1".into()),
+                ["container", "inspect", "--format", "{{.Created}}", "app-1"] => {
+                    if self.inspect_error {
+                        bail!("Docker is unreachable");
+                    }
+                    Ok("2026-01-01T00:00:00Z".into())
+                }
+                // After creation (or ownership inspection), the name points to a replacement.
+                [
+                    "container",
+                    "inspect",
+                    "--format",
+                    "{{.Created}}",
+                    "ths-alpha-app",
+                ] => Ok("2026-01-02T00:00:00Z".into()),
+                _ => bail!("unexpected Docker read: {}", args.join(" ")),
+            }
+        }
+
+        fn run(&self, args: &[&str]) -> Result<()> {
+            bail!("unexpected Docker mutation: {}", args.join(" "))
+        }
+    }
+
+    #[test]
+    fn app_allocation_captures_identity_before_a_name_replacement() {
+        for reuse in [false, true] {
+            let docker = ReplacedApp {
+                reuse,
+                inspect_error: false,
+            };
+            let app = ensure_app_with(
+                "ths-alpha",
+                &name("alpha"),
+                &host_ports(0).unwrap(),
+                &docker,
+            )
+            .unwrap();
+            assert_eq!(app, watched("app-1"));
+        }
+    }
+
+    #[test]
+    fn app_identity_capture_does_not_fall_back_to_a_replacement_on_docker_errors() {
+        let docker = ReplacedApp {
+            reuse: false,
+            inspect_error: true,
+        };
+        let error = ensure_app_with(
+            "ths-alpha",
+            &name("alpha"),
+            &host_ports(0).unwrap(),
+            &docker,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Docker is unreachable"));
     }
 
     #[test]
@@ -2795,16 +2864,19 @@ mod tests {
             name: &InstanceName,
             shutdown: &Shutdown,
             _port_offset: u16,
-        ) -> Result<Endpoints> {
+        ) -> Result<AllocatedEnvironment> {
             self.push(&format!("allocate:{name}"));
             shutdown.check()?;
-            Ok(Endpoints {
-                dashboard: "http://127.0.0.1:1".into(),
-                rpc: "http://127.0.0.1:2".into(),
-                lightwalletd: "http://127.0.0.1:3".into(),
-                p2p: "127.0.0.1:4".into(),
-                network: default_regtest(),
-                tls: false,
+            Ok(AllocatedEnvironment {
+                app_container: watched("app-1"),
+                endpoints: Endpoints {
+                    dashboard: "http://127.0.0.1:1".into(),
+                    rpc: "http://127.0.0.1:2".into(),
+                    lightwalletd: "http://127.0.0.1:3".into(),
+                    p2p: "127.0.0.1:4".into(),
+                    network: default_regtest(),
+                    tls: false,
+                },
             })
         }
 
@@ -2834,14 +2906,20 @@ mod tests {
                 .map_err(|e| anyhow!("{e}"))
         }
 
-        fn wait_for_shutdown(&self, app_container: &str, shutdown: &Shutdown) -> Result<Ended> {
-            self.push(&format!("wait_for_shutdown:{app_container}"));
+        fn wait_for_shutdown(
+            &self,
+            app_container: &WatchedContainer,
+            shutdown: &Shutdown,
+        ) -> Result<Ended> {
+            self.push(&format!("wait_for_shutdown:{}", app_container.id));
+            assert_eq!(app_container, &watched("app-1"));
             if self.shutdown_collision.is_some() {
                 return Ok(Ended::Interrupted);
             }
             let events = ScriptedEvents::default();
-            let app = (!self.deleted_elsewhere).then(|| watched("app-1"));
-            events.identify.lock().unwrap().push_back(Ok(app));
+            if self.deleted_elsewhere {
+                events.streams.lock().unwrap().push_back(Ok(true));
+            }
             let _monitor = DeletionMonitor::spawn(
                 Arc::new(events),
                 app_container,
@@ -3211,7 +3289,7 @@ mod tests {
         let events = events.lock().unwrap().clone();
         let waited = events
             .iter()
-            .position(|e| e == "wait_for_shutdown:ths-alpha-app")
+            .position(|e| e == "wait_for_shutdown:app-1")
             .expect("waited on the app container");
         assert!(
             !events[waited..].iter().any(|e| e.starts_with("delete:")),
@@ -3347,12 +3425,12 @@ mod tests {
         }
     }
 
-    /// Scripted Docker answers for `DeletionMonitor`. An unscripted `identify` or `exists`
+    /// Scripted Docker answers for `DeletionMonitor`. An unscripted `exists`
     /// fails like an unreachable daemon; an unscripted `wait_destroyed` blocks like a quiet
     /// event stream until cancelled.
     #[derive(Default)]
     struct ScriptedEvents {
-        identify: Mutex<VecDeque<Result<Option<WatchedContainer>, String>>>,
+        destroyed: Option<WatchedContainer>,
         streams: Mutex<VecDeque<Result<bool, String>>>,
         exists: Mutex<VecDeque<Result<bool, String>>>,
         calls: Mutex<Vec<String>>,
@@ -3390,11 +3468,6 @@ mod tests {
     }
 
     impl ContainerEvents for ScriptedEvents {
-        fn identify(&self, name: &str) -> Result<Option<WatchedContainer>> {
-            self.record(format!("identify:{name}"));
-            scripted(&self.identify).unwrap_or_else(|| Err(anyhow!("Docker is unreachable")))
-        }
-
         fn exists(&self, id: &str) -> Result<bool> {
             self.record(format!("exists:{id}"));
             scripted(&self.exists).unwrap_or_else(|| Err(anyhow!("Docker is unreachable")))
@@ -3404,6 +3477,9 @@ mod tests {
             self.record(format!("wait_destroyed:{}", container.id));
             if let Some(answer) = scripted(&self.streams) {
                 return answer;
+            }
+            if self.destroyed.as_ref() == Some(container) {
+                return Ok(true);
             }
             while !self.cancelled.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(1));
@@ -3419,34 +3495,59 @@ mod tests {
     fn monitor(events: &Arc<ScriptedEvents>, shutdown: &Shutdown) -> DeletionMonitor {
         DeletionMonitor::spawn(
             events.clone(),
-            "ths-alpha-app",
+            &watched("app-1"),
             Duration::from_millis(1),
             shutdown,
         )
     }
 
+    fn replacement_before_monitoring(delayed_by_error: bool) {
+        // The original is gone and a replacement has already taken its name. Event replay
+        // must use the allocated ID and creation time, even if Docker initially fails.
+        let events = Arc::new(ScriptedEvents {
+            destroyed: Some(watched("app-1")),
+            ..ScriptedEvents::default()
+        });
+        if delayed_by_error {
+            events
+                .streams
+                .lock()
+                .unwrap()
+                .push_back(Err("Docker is unreachable".into()));
+        }
+        let (_sender, shutdown) = Shutdown::channel();
+        let monitor = monitor(&events, &shutdown);
+        let ended = shutdown.receiver.recv_timeout(Duration::from_secs(5));
+        drop(monitor);
+        assert_eq!(ended.unwrap(), Ended::DeletedElsewhere);
+        assert!(events.calls().iter().all(|call| call.ends_with(":app-1")));
+    }
+
+    #[test]
+    fn deletion_monitor_uses_allocation_identity_when_replaced_before_monitoring() {
+        replacement_before_monitoring(false);
+    }
+
+    #[test]
+    fn deletion_monitor_uses_allocation_identity_after_initial_docker_errors() {
+        replacement_before_monitoring(true);
+    }
+
     #[test]
     fn deletion_monitor_reports_a_destroy_event() {
         let events = Arc::new(ScriptedEvents::default());
-        events
-            .identify
-            .lock()
-            .unwrap()
-            .push_back(Ok(Some(watched("app-1"))));
         events.streams.lock().unwrap().push_back(Ok(true));
         let (_sender, shutdown) = Shutdown::channel();
         let _monitor = monitor(&events, &shutdown);
         assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
-        assert_eq!(
-            events.calls(),
-            ["identify:ths-alpha-app", "wait_destroyed:app-1"]
-        );
+        assert_eq!(events.calls(), ["wait_destroyed:app-1"]);
     }
 
     #[test]
     fn deletion_monitor_reports_a_container_already_gone() {
         let events = Arc::new(ScriptedEvents::default());
-        events.identify.lock().unwrap().push_back(Ok(None));
+        events.streams.lock().unwrap().push_back(Ok(false));
+        events.exists.lock().unwrap().push_back(Ok(false));
         let (_sender, shutdown) = Shutdown::channel();
         let _monitor = monitor(&events, &shutdown);
         assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
@@ -3455,10 +3556,6 @@ mod tests {
     #[test]
     fn deletion_monitor_treats_docker_errors_as_unknown() {
         let events = Arc::new(ScriptedEvents::default());
-        events.identify.lock().unwrap().extend([
-            Err("Docker is unreachable".to_owned()),
-            Ok(Some(watched("app-1"))),
-        ]);
         events
             .streams
             .lock()
@@ -3467,15 +3564,13 @@ mod tests {
         let (sender, shutdown) = Shutdown::channel();
         let monitor = monitor(&events, &shutdown);
         // Both reconciliations fail like an unreachable daemon; the third stream stays open.
-        events.wait_for_calls(7);
+        events.wait_for_calls(5);
         sender.send(Ended::Interrupted).unwrap();
         assert_eq!(shutdown.wait().unwrap(), Ended::Interrupted);
         drop(monitor);
         assert_eq!(
             events.calls(),
             [
-                "identify:ths-alpha-app",
-                "identify:ths-alpha-app",
                 "wait_destroyed:app-1",
                 "exists:app-1",
                 "wait_destroyed:app-1",
@@ -3489,11 +3584,6 @@ mod tests {
     #[test]
     fn deletion_monitor_resubscribes_after_a_disconnect() {
         let events = Arc::new(ScriptedEvents::default());
-        events
-            .identify
-            .lock()
-            .unwrap()
-            .push_back(Ok(Some(watched("app-1"))));
         events.streams.lock().unwrap().extend([Ok(false), Ok(true)]);
         events.exists.lock().unwrap().push_back(Ok(true));
         let (_sender, shutdown) = Shutdown::channel();
@@ -3502,7 +3592,6 @@ mod tests {
         assert_eq!(
             events.calls(),
             [
-                "identify:ths-alpha-app",
                 "wait_destroyed:app-1",
                 "exists:app-1",
                 "wait_destroyed:app-1",
@@ -3514,37 +3603,20 @@ mod tests {
     fn deletion_monitor_follows_the_original_container_not_its_name() {
         // A disconnect hides the destroy event, and a new container already took the name.
         let events = Arc::new(ScriptedEvents::default());
-        events
-            .identify
-            .lock()
-            .unwrap()
-            .extend([Ok(Some(watched("app-1"))), Ok(Some(watched("app-2")))]);
         events.streams.lock().unwrap().push_back(Ok(false));
         events.exists.lock().unwrap().push_back(Ok(false));
         let (_sender, shutdown) = Shutdown::channel();
         let _monitor = monitor(&events, &shutdown);
         assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
-        assert_eq!(
-            events.calls(),
-            [
-                "identify:ths-alpha-app",
-                "wait_destroyed:app-1",
-                "exists:app-1",
-            ]
-        );
+        assert_eq!(events.calls(), ["wait_destroyed:app-1", "exists:app-1",]);
     }
 
     #[test]
     fn dropping_the_deletion_monitor_stops_the_watch() {
         let events = Arc::new(ScriptedEvents::default());
-        events
-            .identify
-            .lock()
-            .unwrap()
-            .push_back(Ok(Some(watched("app-1"))));
         let (_sender, shutdown) = Shutdown::channel();
         let monitor = monitor(&events, &shutdown);
-        events.wait_for_calls(2);
+        events.wait_for_calls(1);
         drop(monitor);
         assert!(events.cancelled.load(Ordering::SeqCst));
         assert!(shutdown.receiver.try_recv().is_err(), "reported a deletion");
