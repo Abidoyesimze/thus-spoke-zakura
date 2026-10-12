@@ -11,7 +11,14 @@ import { useWalletPayments } from './payment-context';
 import { useWalletActions } from './wallet-actions-context';
 import { PaymentStatus, PaymentWarning } from './PaymentStatus';
 
-type PaymentOutcome = 'unresolved' | 'confirmed' | 'failed';
+const FILTERS = ['all', 'unresolved', 'confirmed', 'failed'] as const;
+type PaymentFilter = (typeof FILTERS)[number];
+const LABELS: Record<PaymentFilter, string> = {
+  all: 'All',
+  unresolved: 'Unresolved',
+  confirmed: 'Confirmed',
+  failed: 'Failed',
+};
 
 export function PaymentUpdates() {
   const {
@@ -27,9 +34,19 @@ export function PaymentUpdates() {
   const { openSend, openFaucet } = useWalletActions();
   const identities = [...savedSend.displayed, ...savedFaucet.displayed];
   const open = viewedPayment !== null;
+  // null selects All without announcing results when the panel first opens.
+  const [selection, setSelection] = useState<{
+    view: typeof viewedPayment;
+    filter: PaymentFilter;
+  } | null>(null);
+  // Each open request starts at All, including a link to a previously hidden row.
+  const filter = selection?.view === viewedPayment ? selection.filter : null;
+  const selected = filter ?? 'all';
+  const setFilter = (value: PaymentFilter) => setSelection({ view: viewedPayment, filter: value });
   const [visibleKeys, setVisibleKeys] = useState<string[]>([]);
   const [container, setContainer] = useState<HTMLDivElement | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
+  const activeFilter = useRef<HTMLButtonElement>(null);
   // Observe the same Query snapshots for counts, without starting extra reads.
   const statuses = useQueries({
     queries: identities.map(({ key }) => ({
@@ -43,7 +60,7 @@ export function PaymentUpdates() {
   const ordered = identities
     .map((identity, index) => {
       const status = statuses[index]?.data?.status;
-      const group: PaymentOutcome =
+      const group: Exclude<PaymentFilter, 'all'> =
         status === 'confirmed' || status === 'failed' ? status : 'unresolved';
       return { identity, group };
     })
@@ -54,7 +71,7 @@ export function PaymentUpdates() {
     });
   const counts = { all: identities.length, unresolved: 0, confirmed: 0, failed: 0 };
   for (const { group } of ordered) counts[group]++;
-  const visible = ordered;
+  const visible = ordered.filter(({ group }) => selected === 'all' || group === selected);
   const includedKeys = new Set(visible.map(({ identity }) => identity.key));
   const summary = Object.entries(counts)
     .filter(([state, count]) => state !== 'all' && count > 0)
@@ -83,7 +100,7 @@ export function PaymentUpdates() {
     const next =
       headings.find((heading) => position(heading) > index) ??
       [...headings].reverse().find((heading) => position(heading) < index);
-    (next ?? container)?.focus();
+    (next ?? activeFilter.current ?? container)?.focus();
   };
   const dismiss = (identity: PaymentIdentity) => {
     (identity.kind === 'send' ? savedSend : savedFaucet).dismissKey(identity.key);
@@ -152,6 +169,52 @@ export function PaymentUpdates() {
         bodyClassName="relative flex min-h-0 flex-col [&>p]:shrink-0"
         fallbackFocus={trigger}
       >
+        {identities.length > 0 && (
+          <div
+            role="group"
+            aria-label="Filter payments"
+            className="mb-3 grid shrink-0 grid-cols-2 gap-1.5 sm:grid-cols-4"
+          >
+            {FILTERS.map((value) => (
+              <button
+                key={value}
+                ref={value === selected ? activeFilter : undefined}
+                type="button"
+                aria-pressed={value === selected}
+                onClick={() => {
+                  setFilter(value);
+                  if (container) container.scrollTop = 0;
+                }}
+                className={cn(
+                  'rounded-control flex min-h-9 cursor-pointer items-center justify-between gap-1.5 border px-2.5 py-1.5 text-[12px] whitespace-nowrap',
+                  value === selected
+                    ? 'border-accent-strong bg-accent-soft text-accent-strong font-semibold'
+                    : 'border-line bg-panel text-ink-muted hover:border-line-strong hover:bg-raised hover:text-ink',
+                )}
+              >
+                {LABELS[value]}{' '}
+                <span
+                  className={cn(
+                    'min-w-5 rounded-xs px-1 text-center text-[11px] leading-5 tabular-nums',
+                    value === selected
+                      ? 'bg-accent-strong text-accent-ink'
+                      : 'bg-raised text-ink-muted',
+                  )}
+                >
+                  {counts[value]}
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+        <p role="status" className="sr-only">
+          {filter !== null &&
+            (visible.length
+              ? `Showing ${visible.length} ${selected === 'all' ? '' : `${selected} `}${visible.length === 1 ? 'payment' : 'payments'}.`
+              : selected === 'all'
+                ? 'No payment updates.'
+                : `No ${selected} payments.`)}
+        </p>
         <div
           ref={setContainer}
           role="region"
@@ -170,7 +233,19 @@ export function PaymentUpdates() {
           )}
           {!visible.length && (identities.length > 0 || errors.length === 0) && (
             <div className="text-ink-muted p-4 text-[12px]">
-              <p>No payment updates</p>
+              <p>{selected === 'all' ? 'No payment updates' : `No ${selected} payments.`}</p>
+              {selected !== 'all' && (
+                <Button
+                  size="sm"
+                  className="mt-3"
+                  onClick={() => {
+                    setFilter('all');
+                    requestAnimationFrame(() => activeFilter.current?.focus());
+                  }}
+                >
+                  Show all
+                </Button>
+              )}
             </div>
           )}
         </div>
@@ -183,10 +258,15 @@ export function PaymentUpdates() {
                 for (const { identity } of finished) {
                   (identity.kind === 'send' ? savedSend : savedFaucet).dismissKey(identity.key);
                 }
-                requestAnimationFrame(() => container?.focus());
+                requestAnimationFrame(() =>
+                  (finished.length === visible.length
+                    ? (activeFilter.current ?? container)
+                    : container
+                  )?.focus(),
+                );
               }}
             >
-              Clear finished
+              {selected === 'all' ? 'Clear finished' : `Clear ${selected}`}
             </Button>
           </div>
         )}

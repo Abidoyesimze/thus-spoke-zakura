@@ -600,6 +600,12 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Resume' }));
     expect(await screen.findByText('Insufficient funds')).toBeInTheDocument();
     expect(screen.getByText('1 ZEC to Account 2. Insufficient funds')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Unresolved 0' }));
+    expect(
+      within(screen.getByRole('region', { name: 'Payment updates' })).getByText(
+        'No unresolved payments.',
+      ),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
     await userEvent.click(screen.getByRole('button', { name: 'View payment' }));
     const updates = screen.getByRole('region', { name: 'Payment updates' });
