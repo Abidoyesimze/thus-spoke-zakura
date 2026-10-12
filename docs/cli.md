@@ -95,7 +95,7 @@ ths endpoints --json
 JSON output includes `"network": "regtest"` and `"tls": false`; lightwalletd
 uses plaintext HTTP on loopback.
 
-### `ths logs [app|zakura|lightwalletd] [-f|--follow]`
+### `ths logs [app|zakura|lightwalletd] [-f|--follow] [--tail N | --head N]`
 
 Prints or streams logs for a service in the named environment. Defaults to the
 `app` (dashboard/server) service.
@@ -104,6 +104,8 @@ Prints or streams logs for a service in the named environment. Defaults to the
 ths logs                       # last logs from the app service
 ths logs zakura -f             # follow node logs
 ths logs lightwalletd --follow # follow lightwalletd logs
+ths logs --tail 200 -f         # last 200 app lines, then follow
+ths logs zakura --head 200     # first 200 node lines
 ```
 
 ### `ths stop`
@@ -125,7 +127,12 @@ ths reset --force
 
 ### `ths list [--json]`
 
-Lists every known environment and its dashboard URL.
+Lists known environments in sections by state, with each one's dashboard URL,
+state (running, paused, degraded or stopped), and containers' status and
+creation and start times. `--json` gives the same data with unix-second
+timestamps. An environment whose container names are held by containers it
+doesn't own is listed as a conflict, and if Docker can't be reached,
+environments are still listed with their state as unknown.
 
 ```console
 ths list
@@ -134,7 +141,9 @@ ths list
 ### `ths doctor [--json]`
 
 Checks that Docker is reachable and prints the launcher's configuration
-directory.
+directory. If Docker is unreachable, the command exits nonzero in both output
+modes. With `--json`, stdout still contains one diagnostic JSON object with
+`ok: false` and `docker: null`; the error is written to stderr.
 
 ```console
 ths doctor
@@ -162,6 +171,34 @@ ths mine 1
 ths mine 10 --json
 ```
 
+The command keeps the legacy `POST /api/v1/mine` input `{blocks}` and successful
+output `{blocks, hashes}`. Mining belongs to the server and continues if the
+client disconnects or the command's 300-second HTTP timeout expires. Before
+issuing another mining command after a timeout, inspect the latest job with
+`GET /api/v1/mining/jobs` at the dashboard endpoint shown by `ths endpoints`.
+Each legacy request uses a fresh internal key: repeating a completed command
+mines another set of blocks. A different manual request during mining or wallet
+synchronization is rejected with HTTP 409.
+
+Dashboard jobs use `POST /api/v1/mining/jobs` with `{blocks, idempotency_key}`;
+acceptance returns HTTP 202. Replaying an accepted key with the same count returns
+the same job, including after completion or failure. Reusing that key with a
+different count returns HTTP 409. Read the latest job through
+`GET /api/v1/mining/jobs` or a retained job through `GET /api/v1/mining/jobs/{id}`.
+The dashboard restores progress after refresh, navigation, modal dismissal, or
+closing and reopening a tab.
+
+Progress counts only acknowledged hashes from that job, excluding interleaved
+payment or faucet mining. A failed mining RPC may have committed extra blocks;
+its confirmed count is a lower bound and the server never automatically retries
+the uncertain RPC. A wallet synchronization failure after mining retains the
+full mined count and reports the synchronization error separately.
+
+Job history and keys last only for the server process lifetime, with a limit of
+1,024 jobs and no key eviction. At capacity, new admissions return HTTP 503;
+existing-key replays and reads continue. Stopping the server cancels running work
+and discards this history. Jobs and deduplication do not survive a restart.
+
 ---
 
 ## Funding an address: `ths faucet <ADDRESS> [--amount <ZEC>]`
@@ -186,14 +223,26 @@ and Send dialogs, from a script or terminal:
 
 | Subcommand | What it does |
 | --- | --- |
+| `ths wallet balances` | Print each account's balances and addresses |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
-| `ths wallet send` | Send funds from one account to another, with an optional memo |
-| `ths wallet shield` | Spend one account's transparent funds into another account's Ironwood balance |
-| `ths wallet unshield` | Spend one account's Ironwood funds into another account's transparent balance |
+| `ths wallet send` | Send funds between accounts or pools, with an optional memo |
+| `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield` | Spend Ironwood funds into the same or another account's transparent balance |
 
-Every subcommand mines the confirming block automatically and prints the
-resulting transaction ID (and, for `send`, `shield`, and `unshield`, the
-confirming block hash). Pass `--json` for machine-readable output.
+Every subcommand except `balances` mines the confirming block automatically
+and prints the resulting transaction ID (and, for `send`, `shield`, and
+`unshield`, the confirming block hash). Pass `--json` for machine-readable
+output.
+
+### `ths wallet balances`
+
+Prints accounts 1-5 with their transparent and Ironwood balances in ZEC and the
+addresses that receive them. With `--json`, balances are in zatoshi.
+
+```console
+ths wallet balances
+ths wallet balances --json
+```
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -223,12 +272,13 @@ a non-zero status summarizing how many of the requests failed.
 
 ### `ths wallet send --from <N> --to <N> --amount <ZEC> [--source-pool <POOL>] [--destination-pool <POOL>] [--memo <TEXT>]`
 
-Sends funds from one development account to another. It does the same thing as
+Sends funds between development accounts or pools. It does the same thing as
 the dashboard's **Send ZEC** dialog and uses the same endpoint
 (`POST /api/v1/send`).
 
-- `--from <N>` / `--to <N>` (required): two different account indices,
-  `1`-`5`. The treasury account can't be used.
+- `--from <N>` / `--to <N>` (required): two account indices,
+  1–5. They may match when the source and destination pools differ. The treasury
+  account cannot be used.
 - `--amount <ZEC>` (required): limited only by the sending account's balance.
 - `--source-pool <ironwood|transparent>`: pool to spend from (default
   `ironwood`).
@@ -243,6 +293,10 @@ ths wallet send --from 2 --to 3 --amount 1
 # Spend account 1's transparent balance into account 4's Ironwood balance
 ths wallet send --from 1 --to 4 --amount 0.5 --source-pool transparent
 
+# Move funds between pools within account 1
+ths wallet send --from 1 --to 1 --amount 0.01 --destination-pool transparent
+ths wallet send --from 1 --to 1 --amount 0.005 --source-pool transparent
+
 # Attach a memo for the recipient
 ths wallet send --from 2 --to 3 --amount 1 --memo "rent for October"
 
@@ -250,15 +304,17 @@ ths wallet send --from 2 --to 3 --amount 1 --memo "rent for October"
 ths wallet send --from 2 --to 3 --amount 1 --destination-pool transparent --memo "hi"
 ```
 
+Same-account transfers require sufficient spendable funds for the amount and fee.
+
 ### `ths wallet shield --from <N> --to <N> --amount <ZEC> [--memo <TEXT>]`
 
 Shorthand for `ths wallet send` with `--source-pool transparent
 --destination-pool ironwood`: spends one account's transparent balance into
-another account's Ironwood balance.
+the same or another account's Ironwood balance.
 
 - `--from <N>` (required): account to spend transparent funds from.
-- `--to <N>` (required): a different account to receive them as Ironwood
-  funds. Sends between the same account are rejected.
+- `--to <N>` (required): account to receive them as Ironwood funds; may match
+  `--from`.
 - `--amount <ZEC>` (required).
 - `--memo <TEXT>`: optional memo on the Ironwood output (up to 512 bytes).
 
@@ -266,30 +322,38 @@ another account's Ironwood balance.
 # Shield 0.5 ZEC of account 4's transparent balance into account 2's Ironwood balance
 ths wallet shield --from 4 --to 2 --amount 0.5
 
+# Shield within account 1
+ths wallet shield --from 1 --to 1 --amount 0.005
+
 # The same, with a memo
 ths wallet shield --from 4 --to 2 --amount 0.5 --memo "welcome to the shielded pool"
 ```
 
-> Note: because transparent notes must be fully spent, the wallet may route
-> any leftover change from a transparent source into the shielded pool as
-> well. Shielding "0.5 ZEC" from an account holding 1 transparent ZEC can
-> leave that account with its change in Ironwood rather than transparent.
+These transfers require sufficient spendable funds for the amount and fee.
+
+> Note: wallet input selection may route leftover transparent change into
+> the shielded pool as well. Shielding "0.5 ZEC" from an account holding
+> 1 transparent ZEC can leave that account with its change in Ironwood
+> rather than transparent.
 
 ### `ths wallet unshield --from <N> --to <N> --amount <ZEC>`
 
 Shorthand for `ths wallet send` with `--source-pool ironwood
 --destination-pool transparent`: spends one account's Ironwood balance into
-another account's transparent balance. It takes no memo, because transparent
-outputs cannot carry one.
+the same or another account's transparent balance. It takes no memo, because
+transparent outputs cannot carry one.
 
 - `--from <N>` (required): account to spend Ironwood funds from.
-- `--to <N>` (required): a different account to receive them as transparent
-  funds.
+- `--to <N>` (required): account to receive them as transparent funds; may match
+  `--from`.
 - `--amount <ZEC>` (required).
 
 ```console
 # Unshield 0.2 ZEC from account 1's Ironwood balance into account 3's transparent balance
 ths wallet unshield --from 1 --to 3 --amount 0.2
+
+# Unshield within account 1
+ths wallet unshield --from 1 --to 1 --amount 0.01
 ```
 
 ### Memos
@@ -352,12 +416,13 @@ account 1 to account 3, all without opening the dashboard.
 | `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
+| `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
-| `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts by index, optionally with an Ironwood memo |
-| `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into another account's Ironwood balance |
-| `ths wallet unshield --from --to --amount` | Spend Ironwood funds into another account's transparent balance |
-| `ths logs [service] [-f]` | Stream or print service logs |
-| `ths list` | List known environments |
+| `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
+| `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield --from --to --amount` | Spend Ironwood funds into the same or another account's transparent balance |
+| `ths logs [service] [-f] [--tail N \| --head N]` | Stream or print service logs |
+| `ths list` | List environments and their container status |
 | `ths stop` | Stop and delete the environment |
 | `ths reset --force` | Force-delete one environment and all its data |
 | `ths doctor` | Check Docker and local configuration |

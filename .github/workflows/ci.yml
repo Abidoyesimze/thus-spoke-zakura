@@ -58,14 +58,17 @@ jobs:
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
       - name: Compile Rust recovery target
-        run: cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery --no-run
+        run: cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery --no-run
       - name: Run Docker-free recovery helper tests
-        run: cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery
+        run: cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
       - name: Pull pinned Zakura node image
         run: docker pull zakuracore/zakura:1.6.0
       - name: Build pinned lightwalletd image
-        run: docker build -f docker/lightwalletd.Dockerfile -t tsz-recovery-lightwalletd:local .
+        run: docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
       - name: Run live activity recovery regressions
         run: |
-          cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
-          cargo test --locked --profile dev-runtime -p tsz-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact address_faucet_retry_after_server_restart_pays_each_destination_once
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_send_retry_survives_lost_response_and_restart
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_external_faucet_retry_survives_lost_response_and_restart

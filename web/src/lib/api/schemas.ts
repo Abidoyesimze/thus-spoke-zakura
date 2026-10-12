@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 /**
- * Runtime contracts for the tsz-server API. These are validated rather than
+ * Runtime contracts for the ths-server API. These are validated rather than
  * merely declared: if the Rust structs change shape, the UI fails loudly at
  * the boundary instead of rendering `undefined` somewhere deep in a tree.
  *
@@ -197,8 +197,6 @@ export const transactionSchema = z.looseObject({
 });
 export type Transaction = z.infer<typeof transactionSchema>;
 
-export const mempoolSchema = z.object({ transactions: z.array(z.string()) });
-
 export const addressSchema = z.object({
   address: z.string(),
   balance: z.looseObject({
@@ -221,8 +219,19 @@ export interface SendQuoteInput {
   destination_pool: Pool;
 }
 
-export const seedSchema = z.object({ seed_hex: z.string(), warning: z.string() });
-
 export const apiErrorSchema = z.object({
   error: z.object({ message: z.string(), status: z.number().int() }),
 });
+
+export const miningJobSchema = z
+  .object({
+    id: z.string().uuid(),
+    requested_blocks: z.number().int().min(1).max(10_000),
+    completed_blocks: z.number().int().nonnegative(),
+    state: z.enum(['mining', 'syncing', 'completed', 'failed']),
+    error: z.string().nullable(),
+    progress_uncertain: z.boolean(),
+  })
+  .refine((job) => job.completed_blocks <= job.requested_blocks);
+export type MiningJob = z.infer<typeof miningJobSchema>;
+export const miningJobResponseSchema = z.object({ job: miningJobSchema.nullable() });

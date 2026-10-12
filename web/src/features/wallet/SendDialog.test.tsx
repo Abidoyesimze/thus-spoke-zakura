@@ -10,6 +10,10 @@ import { SendDialog } from './SendDialog';
  * and invalid input must never be submitted at all.
  */
 interface SendBody {
+  from_account: number;
+  to_account: number;
+  source_pool: 'ironwood' | 'transparent';
+  destination_pool: 'ironwood' | 'transparent';
   amount_zatoshi: number;
   idempotency_key: string;
   memo?: string;
@@ -42,10 +46,10 @@ function sendImpl(quote: typeof QUOTE) {
         JSON.stringify({
           id: 'a',
           kind: 'send',
-          from_account: 1,
-          to_account: 2,
-          source_pool: 'ironwood',
-          destination_pool: 'ironwood',
+          from_account: requestBody(init).from_account,
+          to_account: requestBody(init).to_account,
+          source_pool: requestBody(init).source_pool,
+          destination_pool: requestBody(init).destination_pool,
           amount_zatoshi: requestBody(init).amount_zatoshi,
           txid: 'f'.repeat(64),
           block_hash: null,
@@ -69,6 +73,16 @@ const sendCalls = (fetchMock: ReturnType<typeof mockSend>) =>
 const body = (fetchMock: ReturnType<typeof mockSend>): SendBody =>
   requestBody(sendCalls(fetchMock)[0]?.[1]);
 
+async function selectTransferField(label: string, option: string) {
+  Object.assign(Element.prototype, {
+    hasPointerCapture: () => false,
+    releasePointerCapture: () => undefined,
+    scrollIntoView: () => undefined,
+  });
+  await userEvent.click(screen.getByLabelText(label));
+  await userEvent.click(await screen.findByRole('option', { name: option }));
+}
+
 describe('SendDialog', () => {
   let fetchMock: ReturnType<typeof mockSend>;
 
@@ -87,6 +101,43 @@ describe('SendDialog', () => {
     await userEvent.type(field, amount);
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
   }
+
+  it.each([
+    ['ironwood', 'transparent', 'Ironwood (shielded)', 'Transparent (public)'],
+    ['transparent', 'ironwood', 'Transparent (public)', 'Ironwood (shielded)'],
+  ] as const)(
+    'submits same-account %s → %s',
+    async (source, destination, sourceLabel, destLabel) => {
+      const accounts = testAccounts.map((account) => ({
+        ...account,
+        transparent_zatoshi: account.id === 1 ? 500_000_000n : 0n,
+      }));
+      renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={accounts} />);
+      await selectTransferField('Destination account', 'Account 1');
+      if (source === 'transparent') await selectTransferField('Source pool', sourceLabel);
+      if (destination === 'transparent') await selectTransferField('Destination pool', destLabel);
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      expect(body(fetchMock)).toMatchObject({
+        from_account: 1,
+        to_account: 1,
+        source_pool: source,
+        destination_pool: destination,
+        amount_zatoshi: 100_000_000,
+      });
+      expect(body(fetchMock).idempotency_key).toHaveLength(36);
+    },
+  );
+
+  it('rejects the same account and pool before submission', async () => {
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    await selectTransferField('Destination account', 'Account 1');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    expect(
+      await screen.findByText('Choose a different account or a different destination pool.'),
+    ).toBeInTheDocument();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
+  });
 
   it('sends the amount as exact zatoshi', async () => {
     await submitAmount('1.5');
@@ -121,37 +172,49 @@ describe('SendDialog', () => {
     expect(first).not.toBe(requestBody(sendCalls(fetchMock)[1]?.[1]).idempotency_key);
   });
 
-  it('keeps a lost-response key across remounts but changes it for a different memo', async () => {
-    let lostSends = 2;
-    fetchMock.mockImplementation((input, init) => {
-      if (requestUrl(input).endsWith('/send') && lostSends-- > 0) {
-        return Promise.reject(new TypeError('response lost'));
+  it.each([false, true])(
+    'keeps a lost-response key across remounts (same account: %s)',
+    async (sameAccount) => {
+      let lostSends = 2;
+      fetchMock.mockImplementation((input, init) => {
+        if (requestUrl(input).endsWith('/send') && lostSends-- > 0) {
+          return Promise.reject(new TypeError('response lost'));
+        }
+        return sendImpl(QUOTE)(input, init);
+      });
+      const accounts = testAccounts.map((account) => ({
+        ...account,
+        transparent_zatoshi: account.id === 1 ? 500_000_000n : 0n,
+      }));
+      async function chooseRoute() {
+        if (sameAccount) {
+          await selectTransferField('Destination account', 'Account 1');
+          await selectTransferField('Source pool', 'Transparent (public)');
+        }
       }
-      return sendImpl(QUOTE)(input, init);
-    });
-    const first = renderWithProviders(
-      <SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />,
-    );
-    await userEvent.type(screen.getByLabelText('Memo (optional)'), 'rent');
-    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
-    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
-
-    first.unmount();
-    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
-    const memo = screen.getByLabelText('Memo (optional)');
-    await userEvent.type(memo, 'rent');
-    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
-    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(2));
-
-    await userEvent.clear(memo);
-    await userEvent.type(memo, 'gift');
-    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
-    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(3));
-
-    const keys = sendCalls(fetchMock).map(([, init]) => requestBody(init).idempotency_key);
-    expect(keys[0]).toBe(keys[1]);
-    expect(keys[2]).not.toBe(keys[1]);
-  });
+      const first = renderWithProviders(
+        <SendDialog open onOpenChange={vi.fn()} accounts={accounts} />,
+      );
+      await chooseRoute();
+      await userEvent.type(screen.getByLabelText('Memo (optional)'), 'rent');
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      first.unmount();
+      renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={accounts} />);
+      await chooseRoute();
+      const memo = screen.getByLabelText('Memo (optional)');
+      await userEvent.type(memo, 'rent');
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(2));
+      await userEvent.clear(memo);
+      await userEvent.type(memo, 'gift');
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(3));
+      const keys = sendCalls(fetchMock).map(([, init]) => requestBody(init).idempotency_key);
+      expect(keys[0]).toBe(keys[1]);
+      expect(keys[2]).not.toBe(keys[1]);
+    },
+  );
 
   it('posts the memo with the send', async () => {
     renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
@@ -280,6 +343,33 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
     await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
     expect(body(fetchMock).amount_zatoshi).toBe(499_990_000);
+  });
+
+  it('fills a maximum of 1,000 ZEC without separators and sends it exactly', async () => {
+    fetchMock.mockImplementation(
+      sendImpl({
+        available_zatoshi: 100_000_010_000,
+        fee_zatoshi: 10_000,
+        max_zatoshi: 100_000_000_000,
+      }),
+    );
+    const accounts = testAccounts.map((account) => ({
+      ...account,
+      ironwood_zatoshi: account.id === 1 ? 100_000_010_000n : 0n,
+    }));
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={accounts} />);
+
+    const max = await screen.findByRole('button', { name: 'Max' });
+    await waitFor(() => expect(max).toBeEnabled());
+    expect(
+      screen.getByText('1,000 ZEC spendable after a 0.0001 ZEC network fee.'),
+    ).toBeInTheDocument();
+    await userEvent.click(max);
+
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1000');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock).amount_zatoshi).toBe(100_000_000_000);
   });
 
   it('disables Max when nothing is spendable after the fee', async () => {

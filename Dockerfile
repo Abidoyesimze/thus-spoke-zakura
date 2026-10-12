@@ -13,13 +13,13 @@ COPY crates/ crates/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/src/target \
-    cargo build --profile "$RUST_PROFILE" --locked -p tsz-server && \
+    cargo build --profile "$RUST_PROFILE" --locked -p ths-server && \
     if [ "$RUST_PROFILE" = dev ]; then target_dir=debug; else target_dir="$RUST_PROFILE"; fi && \
-    cp "/src/target/$target_dir/tsz-server" /tmp/tsz-server
+    cp "/src/target/$target_dir/ths-server" /tmp/ths-server
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=rust /tmp/tsz-server /usr/local/bin/tsz-server
-COPY --from=web /src/web/dist /opt/tsz/web
-ENV TSZ_WEB_DIR=/opt/tsz/web
-ENTRYPOINT ["tsz-server"]
+COPY --from=rust /tmp/ths-server /usr/local/bin/ths-server
+COPY --from=web /src/web/dist /opt/ths/web
+ENV THS_WEB_DIR=/opt/ths/web
+ENTRYPOINT ["ths-server"]
