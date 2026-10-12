@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -471,7 +472,7 @@ async fn send(
         ));
     }
     let _payment = state.0.payments.lock().await;
-    let mut pending = state.0.store.claim_transfer(
+    let pending = state.0.store.claim_transfer(
         req.from_account,
         recipient,
         &req.source_pool,
@@ -480,54 +481,32 @@ async fn send(
         &req.idempotency_key,
         req.memo.as_deref(),
     )?;
-    loop {
-        match pending.status.as_str() {
-            "confirmed" => return Ok(Json(pending)),
-            "prepared" | "broadcast" => {
-                match submit_prepared(&state.0.store, &state, &pending).await? {
-                    PreparedSubmission::Broadcast(activity) => {
-                        return Ok(Json(confirm_after_mining(&state, activity).await?));
-                    }
-                    PreparedSubmission::Expired(activity) => pending = activity,
-                }
+    Ok(Json(
+        execute_payment(&state, pending, |activity_id| {
+            let state = &state;
+            let memo = memo.clone();
+            let req = &req;
+            let address = &address;
+            async move {
+                state.synchronize_latest().await?;
+                state
+                    .0
+                    .wallet
+                    .prepare(
+                        Some(&activity_id),
+                        &state.0.store.seed()?,
+                        req.from_account,
+                        &req.source_pool,
+                        address,
+                        req.amount_zatoshi,
+                        memo,
+                        record_prepared_payment(&state.0.store, &activity_id),
+                    )
+                    .await
             }
-            "preparing" => {
-                let prepared = async {
-                    state.synchronize_latest().await?;
-                    state
-                        .0
-                        .wallet
-                        .prepare(
-                            Some(&pending.id),
-                            &state.0.store.seed()?,
-                            req.from_account,
-                            &req.source_pool,
-                            &address,
-                            req.amount_zatoshi,
-                            memo.clone(),
-                        )
-                        .await
-                }
-                .await;
-                let prepared = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        discard_unprepared_claim(&state, &pending.id).await?;
-                        return Err(error.into());
-                    }
-                };
-                pending = state.0.store.record_prepared(
-                    &pending.id,
-                    &prepared.txid,
-                    &prepared.raw_transaction,
-                    prepared.expiry_height,
-                )?;
-            }
-            status => {
-                return Err(anyhow::anyhow!("payment has unsupported status {status}").into());
-            }
-        }
-    }
+        })
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -829,6 +808,7 @@ async fn fund_address_from_treasury(
                         &treasury,
                         address,
                         amount_zatoshi,
+                        record_prepared_address_payment(&state.0.store, &pending.id),
                     )
                     .await
                 }
@@ -911,66 +891,101 @@ async fn fund_from_treasury(
     idempotency_key: &str,
 ) -> anyhow::Result<Activity> {
     let _payment = state.0.payments.lock().await;
-    let mut pending =
-        state
-            .0
-            .store
-            .claim_faucet(account_id, pool, amount_zatoshi, idempotency_key)?;
+    let pending = state
+        .0
+        .store
+        .claim_faucet(account_id, pool, amount_zatoshi, idempotency_key)?;
+    execute_payment(state, pending, |activity_id| async move {
+        let destination = state.0.store.account(account_id)?;
+        let address = match pool {
+            "transparent" => destination.transparent_address,
+            "ironwood" => destination.unified_address,
+            _ => unreachable!("claim_faucet validates pool"),
+        };
+        state.synchronize_latest().await?;
+        let seed = state.0.store.seed()?;
+        // SDK proposals check spendability and the actual fee before construction. Total
+        // balances include pending change and cannot decide whether this request is fundable.
+        let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+        let _replenishment = state.0.treasury_replenishment.lock().await;
+        prepare_with_replenishment(
+            state,
+            Some(&activity_id),
+            &seed,
+            &treasury,
+            &address,
+            amount_zatoshi,
+            record_prepared_payment(&state.0.store, &activity_id),
+        )
+        .await
+    })
+    .await
+}
+
+#[async_trait::async_trait]
+trait PaymentLifecycle: Sync {
+    async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission>;
+    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()>;
+    fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity>;
+    async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity>;
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycle for AppState {
+    async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission> {
+        submit_prepared(&self.0.store, self, activity).await
+    }
+
+    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
+        discard_unprepared_claim(self, id).await
+    }
+
+    fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
+        self.0.store.record_prepared(
+            id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )
+    }
+
+    async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
+        confirm_after_mining(self, activity).await
+    }
+}
+
+async fn execute_payment<R, Prepare, PrepareFuture>(
+    runtime: &R,
+    mut pending: Activity,
+    mut prepare: Prepare,
+) -> anyhow::Result<Activity>
+where
+    R: PaymentLifecycle,
+    Prepare: FnMut(String) -> PrepareFuture,
+    PrepareFuture: Future<Output = anyhow::Result<PreparedPayment>>,
+{
     loop {
         match pending.status.as_str() {
             "confirmed" => return Ok(pending),
-            "prepared" | "broadcast" => {
-                match submit_prepared(&state.0.store, state, &pending).await? {
-                    PreparedSubmission::Broadcast(activity) => {
-                        pending = activity;
-                        break;
-                    }
-                    PreparedSubmission::Expired(activity) => pending = activity,
+            "prepared" | "broadcast" => match runtime.submit_prepared(&pending).await? {
+                PreparedSubmission::Broadcast(activity) => {
+                    return runtime.confirm_after_mining(activity).await;
                 }
-            }
+                PreparedSubmission::Expired(activity) => pending = activity,
+            },
             "preparing" => {
-                let prepared = async {
-                    let destination = state.0.store.account(account_id)?;
-                    let address = match pool {
-                        "transparent" => destination.transparent_address,
-                        "ironwood" => destination.unified_address,
-                        _ => unreachable!("claim_faucet validates pool"),
-                    };
-                    state.synchronize_latest().await?;
-                    let seed = state.0.store.seed()?;
-                    // SDK proposals check spendability and the actual fee before construction. Total
-                    // balances include pending change and cannot decide whether this request is fundable.
-                    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-                    let _replenishment = state.0.treasury_replenishment.lock().await;
-                    prepare_with_replenishment(
-                        state,
-                        Some(&pending.id),
-                        &seed,
-                        &treasury,
-                        &address,
-                        amount_zatoshi,
-                    )
-                    .await
-                }
-                .await;
-                let prepared = match prepared {
+                let prepared = match prepare(pending.id.clone()).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        discard_unprepared_claim(state, &pending.id).await?;
+                        runtime.discard_unprepared_claim(&pending.id).await?;
                         return Err(error);
                     }
                 };
-                pending = state.0.store.record_prepared(
-                    &pending.id,
-                    &prepared.txid,
-                    &prepared.raw_transaction,
-                    prepared.expiry_height,
-                )?;
+                pending = runtime.record_prepared(&pending.id, &prepared)?;
             }
             status => anyhow::bail!("payment has unsupported status {status}"),
         }
     }
-    confirm_after_mining(state, pending).await
 }
 
 #[async_trait::async_trait]
@@ -997,6 +1012,40 @@ impl PaymentSubmitter for AppState {
 
     async fn recover_prepared(&self, txid: &str) -> anyhow::Result<Option<PreparedPayment>> {
         self.0.wallet.recover_prepared(txid).await
+    }
+}
+
+fn record_prepared_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
+    }
+}
+
+fn record_prepared_address_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_address_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
     }
 }
 
@@ -1123,13 +1172,16 @@ enum PreparedSubmission {
 
 #[async_trait::async_trait]
 trait FaucetRuntime: Sync {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment>;
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static;
     async fn chain_height(&self) -> anyhow::Result<u64>;
     async fn block_hash(&self, height: u32) -> anyhow::Result<String>;
     async fn synchronize_latest(&self) -> anyhow::Result<()>;
@@ -1167,13 +1219,17 @@ trait FaucetRuntime: Sync {
 
 #[async_trait::async_trait]
 impl FaucetRuntime for AppState {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment> {
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+    {
         self.0
             .wallet
             .prepare(
@@ -1184,6 +1240,7 @@ impl FaucetRuntime for AppState {
                 destination,
                 amount_zatoshi,
                 None,
+                record,
             )
             .await
     }
@@ -1332,18 +1389,29 @@ async fn discover_reward(
     Ok(next)
 }
 
-async fn prepare_with_replenishment<R: FaucetRuntime>(
+async fn prepare_with_replenishment<R, F>(
     runtime: &R,
     activity_id: Option<&str>,
     seed: &str,
     treasury: &Account,
     destination: &str,
     amount_zatoshi: u64,
-) -> anyhow::Result<PreparedPayment> {
+    record: F,
+) -> anyhow::Result<PreparedPayment>
+where
+    R: FaucetRuntime,
+    F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static,
+{
     let mut reconciled_after_scan_required = false;
     loop {
         match runtime
-            .prepare_payment(activity_id, seed, destination, amount_zatoshi)
+            .prepare_payment(
+                activity_id,
+                seed,
+                destination,
+                amount_zatoshi,
+                record.clone(),
+            )
             .await
         {
             Ok(prepared) => return Ok(prepared),
@@ -3352,6 +3420,234 @@ mod tests {
         }
     }
 
+    enum LifecycleSubmission {
+        Broadcast,
+        Expired,
+    }
+
+    struct RecordingPaymentLifecycle {
+        store: Store,
+        submissions: Mutex<VecDeque<LifecycleSubmission>>,
+        discarded: Mutex<Vec<String>>,
+        record_fails: AtomicBool,
+        confirm: bool,
+    }
+
+    impl RecordingPaymentLifecycle {
+        fn new(store: Store, submissions: impl IntoIterator<Item = LifecycleSubmission>) -> Self {
+            Self {
+                store,
+                submissions: Mutex::new(submissions.into_iter().collect()),
+                discarded: Mutex::new(Vec::new()),
+                record_fails: AtomicBool::new(false),
+                confirm: true,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PaymentLifecycle for RecordingPaymentLifecycle {
+        async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission> {
+            match self
+                .submissions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected submission")
+            {
+                LifecycleSubmission::Broadcast => Ok(PreparedSubmission::Broadcast(
+                    self.store.mark_broadcast(&activity.id, &activity.txid)?,
+                )),
+                LifecycleSubmission::Expired => Ok(PreparedSubmission::Expired(
+                    self.store.reset_for_retry(&activity.id, &activity.txid)?,
+                )),
+            }
+        }
+
+        async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
+            self.discarded.lock().unwrap().push(id.to_owned());
+            self.store.discard_preparing(id)
+        }
+
+        fn record_prepared(
+            &self,
+            id: &str,
+            prepared: &PreparedPayment,
+        ) -> anyhow::Result<Activity> {
+            if self.record_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("recording failed");
+            }
+            self.store.record_prepared(
+                id,
+                &prepared.txid,
+                &prepared.raw_transaction,
+                prepared.expiry_height,
+            )
+        }
+
+        async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
+            if self.confirm {
+                self.store
+                    .confirm(&activity.id, &activity.txid, "confirmed-block")
+            } else {
+                Ok(activity)
+            }
+        }
+    }
+
+    fn lifecycle_claim(store: &Store, key: &str) -> Activity {
+        store
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                key,
+                None,
+            )
+            .unwrap()
+    }
+
+    fn prepared_payment_result(txid: &str, expiry_height: u64) -> PreparedPayment {
+        PreparedPayment {
+            txid: txid.into(),
+            raw_transaction: format!("signed {txid}").into_bytes(),
+            expiry_height,
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_lifecycle_returns_confirmed_replays_without_preparation() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "confirmed-replay");
+        let prepared = store
+            .record_prepared(&claim.id, "confirmed-txid", b"signed", 140)
+            .unwrap();
+        store.mark_broadcast(&prepared.id, &prepared.txid).unwrap();
+        let confirmed = store
+            .confirm(&prepared.id, &prepared.txid, "confirmed-block")
+            .unwrap();
+        let runtime = RecordingPaymentLifecycle::new(store, []);
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_payment(&runtime, confirmed.clone(), {
+            let prepare_calls = prepare_calls.clone();
+            move |_| {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(prepared_payment_result("unused", 180)))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.id, confirmed.id);
+        assert_eq!(result.status, "confirmed");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn payment_lifecycle_submits_prepared_replays_without_preparation() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "prepared-replay");
+        let prepared = store
+            .record_prepared(&claim.id, "prepared-txid", b"signed", 140)
+            .unwrap();
+        let runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_payment(&runtime, prepared, {
+            let prepare_calls = prepare_calls.clone();
+            move |_| {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(prepared_payment_result("unused", 180)))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, "confirmed");
+        assert_eq!(result.txid, "prepared-txid");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn payment_lifecycle_prepares_again_after_expiry() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "expired-replay");
+        let prepared = store
+            .record_prepared(&claim.id, "expired-txid", b"expired", 140)
+            .unwrap();
+        let runtime = RecordingPaymentLifecycle::new(
+            store,
+            [LifecycleSubmission::Expired, LifecycleSubmission::Broadcast],
+        );
+        let prepare_calls = Arc::new(AtomicUsize::new(0));
+
+        let result = execute_payment(&runtime, prepared, {
+            let prepare_calls = prepare_calls.clone();
+            move |_| {
+                prepare_calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Ok(prepared_payment_result("replacement-txid", 180)))
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, "confirmed");
+        assert_eq!(result.txid, "replacement-txid");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn payment_lifecycle_does_not_discard_after_recording_failure() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "recording-failure");
+        let runtime = RecordingPaymentLifecycle::new(store.clone(), []);
+        runtime.record_fails.store(true, Ordering::SeqCst);
+
+        let result = execute_payment(&runtime, claim.clone(), |_| {
+            std::future::ready(Ok(prepared_payment_result("durable-txid", 180)))
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert!(runtime.discarded.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .activity_for_key("recording-failure")
+                .unwrap()
+                .unwrap()
+                .status,
+            "preparing"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_lifecycle_returns_pending_after_confirmation_failure() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = lifecycle_claim(&store, "mining-failure");
+        let prepared = store
+            .record_prepared(&claim.id, "pending-txid", b"signed", 140)
+            .unwrap();
+        let mut runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
+        runtime.confirm = false;
+
+        let result = execute_payment(&runtime, prepared, |_| {
+            std::future::ready(Ok(prepared_payment_result("unused", 180)))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.status, "broadcast");
+        assert_eq!(result.txid, "pending-txid");
+    }
+
     #[tokio::test]
     async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
         let (state, dir) = state_with_local_wallet();
@@ -3376,12 +3672,45 @@ mod tests {
             )
             .unwrap();
 
-        discard_unprepared_claim(&state, &claim.id).await.unwrap();
+        assert!(
+            execute_payment(&state, claim.clone(), |_| {
+                std::future::ready(Err(anyhow::anyhow!("preparation failed")))
+            })
+            .await
+            .is_err()
+        );
 
         assert_eq!(
             state.0.store.activity_for_key("same").unwrap().unwrap().id,
             claim.id
         );
+    }
+
+    #[tokio::test]
+    async fn failed_preparation_discards_a_claim_without_a_wallet_journal() {
+        let (state, _dir) = state_with_local_wallet();
+        let claim = state
+            .0
+            .store
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same",
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            execute_payment(&state, claim, |_| {
+                std::future::ready(Err(anyhow::anyhow!("preparation failed")))
+            })
+            .await
+            .is_err()
+        );
+        assert!(state.0.store.activity_for_key("same").unwrap().is_none());
     }
 
     #[test]
@@ -4473,16 +4802,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FaucetRuntime for RecordingFaucetRuntime {
-        async fn prepare_payment(
+        async fn prepare_payment<F>(
             &self,
             _activity_id: Option<&str>,
             _seed: &str,
             _destination: &str,
             _amount_zatoshi: u64,
-        ) -> anyhow::Result<PreparedPayment> {
+            record: F,
+        ) -> anyhow::Result<PreparedPayment>
+        where
+            F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+        {
             self.events.lock().unwrap().push("prepare".into());
             if self.funds_available.load(Ordering::SeqCst) {
-                Ok(PreparedPayment {
+                record(PreparedPayment {
                     txid: "recovered-txid".into(),
                     raw_transaction: b"recovered transaction".to_vec(),
                     expiry_height: 240,
@@ -4578,6 +4911,7 @@ mod tests {
             &treasury,
             "uregtest-recipient",
             100_000_000,
+            Ok,
         )
         .await
         .unwrap();
@@ -4604,6 +4938,7 @@ mod tests {
         recovered: Mutex<Option<PreparedPayment>>,
         height: AtomicU64,
         fail_next: AtomicBool,
+        queued_next: AtomicBool,
     }
 
     #[tokio::test]
@@ -4680,6 +5015,15 @@ mod tests {
                 .push(raw_transaction.to_vec());
             if self.fail_next.swap(false, Ordering::SeqCst) {
                 anyhow::bail!("response lost");
+            }
+            if self.queued_next.swap(false, Ordering::SeqCst) {
+                crate::wallet::check_broadcast_response(
+                    zcash_client_backend::proto::service::SendResponse {
+                        error_code: -1,
+                        error_message:
+                            "transaction dropped because it is already queued for download".into(),
+                    },
+                )?;
             }
             Ok(())
         }
@@ -4776,6 +5120,108 @@ mod tests {
         assert_eq!(
             store.activity_for_key("same").unwrap().unwrap().status,
             "prepared"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_retry_keeps_the_original_payment_pending_until_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same-queued",
+                None,
+            )
+            .unwrap();
+        let prepared = store
+            .record_prepared(&claim.id, "original-txid", b"original signed bytes", 140)
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        let runtime = RecordingPaymentSubmitter {
+            lookups: Mutex::new(VecDeque::from([Ok(false), Ok(true)])),
+            height: AtomicU64::new(139),
+            queued_next: AtomicBool::new(true),
+            ..Default::default()
+        };
+        let PreparedSubmission::Broadcast(pending) =
+            submit_prepared(&store, &runtime, &prepared).await.unwrap()
+        else {
+            panic!("queued bytes must not be replaced");
+        };
+        assert_eq!(pending.id, prepared.id);
+        assert_eq!(pending.txid, "original-txid");
+        assert_eq!(pending.status, "broadcast");
+        assert!(pending.block_hash.is_none());
+        assert_eq!(
+            store
+                .prepared_transaction(&pending.id)
+                .unwrap()
+                .raw_transaction,
+            b"original signed bytes"
+        );
+        // A later lookup observes the same transaction without another broadcast.
+        assert!(matches!(
+            submit_prepared(&store, &runtime, &pending).await.unwrap(),
+            PreparedSubmission::Broadcast(_)
+        ));
+        assert_eq!(
+            *runtime.broadcasts.lock().unwrap(),
+            [b"original signed bytes"]
+        );
+        let same = store
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "same-queued",
+                None,
+            )
+            .unwrap();
+        assert_eq!(same.id, pending.id);
+        assert_eq!(same.txid, pending.txid);
+    }
+
+    #[tokio::test]
+    async fn queued_external_faucet_retry_preserves_its_payment_and_bytes() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_address_faucet("external-regtest-address", 12_000, "queued-address")
+            .unwrap();
+        let prepared = store
+            .record_address_prepared(&claim.id, "address-txid", b"address signed bytes", 140)
+            .unwrap();
+        let runtime = RecordingPaymentSubmitter {
+            lookups: Mutex::new(VecDeque::from([Ok(false)])),
+            height: AtomicU64::new(139),
+            queued_next: AtomicBool::new(true),
+            ..Default::default()
+        };
+        let AddressSubmission::Broadcast(pending) =
+            submit_address_prepared(&store, &runtime, &prepared)
+                .await
+                .unwrap()
+        else {
+            panic!("queued payment must remain pending");
+        };
+        assert_eq!(pending.id, prepared.id);
+        assert_eq!(pending.txid, prepared.txid);
+        assert_eq!(pending.status, "broadcast");
+        assert!(pending.block_hash.is_none());
+        assert_eq!(
+            *runtime.broadcasts.lock().unwrap(),
+            [b"address signed bytes"]
         );
     }
 

@@ -77,6 +77,21 @@ mod recovery;
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
 const LIGHTWALLETD_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
 
+pub(crate) fn check_broadcast_response(response: SendResponse) -> Result<()> {
+    // Zakura reports AlreadyQueued for a hash already being downloaded. The
+    // submitted bytes are unchanged, but queue acceptance is not confirmation.
+    // Keep all other node rejections as errors, including a full download queue.
+    if response.error_code != 0
+        && response.error_message != "transaction dropped because it is already queued for download"
+    {
+        bail!(
+            "lightwalletd rejected transaction: {}",
+            response.error_message
+        );
+    }
+    Ok(())
+}
+
 const PREPARED_PAYMENTS_MIGRATION_ID: Uuid =
     Uuid::from_u128(0x695f93ac_6935_47e8_8f06_017b1d7ec3aa);
 
@@ -178,6 +193,18 @@ pub(crate) enum ShieldedProtocol {
 pub(crate) struct SubtreeRootData {
     pub completing_height: u32,
     pub root_hash: Vec<u8>,
+}
+
+fn to_roots<H: HashSer>(roots: Vec<SubtreeRootData>) -> Result<Vec<CommitmentTreeRoot<H>>> {
+    roots
+        .into_iter()
+        .map(|root| {
+            Ok(CommitmentTreeRoot::from_parts(
+                BlockHeight::from_u32(root.completing_height),
+                H::read(&root.root_hash[..])?,
+            ))
+        })
+        .collect()
 }
 
 pub(crate) enum ScanOutcome {
@@ -353,8 +380,8 @@ impl RealWallet {
         T: Send + 'static,
         F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
     {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || operation(&mut db.blocking_lock()))
+        let mut db = Arc::clone(&self.db).lock_owned().await;
+        tokio::task::spawn_blocking(move || operation(&mut db))
             .await
             .context("wallet worker stopped")?
     }
@@ -414,33 +441,16 @@ impl RealWallet {
         self.with_db(move |db| {
             match protocol {
                 ShieldedProtocol::Sapling => {
-                    let roots = roots
-                        .into_iter()
-                        .map(|root| {
-                            Ok(CommitmentTreeRoot::from_parts(
-                                BlockHeight::from_u32(root.completing_height),
-                                sapling::Node::read(&root.root_hash[..])?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    db.put_sapling_subtree_roots(0, &roots)?;
+                    db.put_sapling_subtree_roots(0, &to_roots::<sapling::Node>(roots)?)?
                 }
-                ShieldedProtocol::Orchard | ShieldedProtocol::Ironwood => {
-                    let roots = roots
-                        .into_iter()
-                        .map(|root| {
-                            Ok(CommitmentTreeRoot::from_parts(
-                                BlockHeight::from_u32(root.completing_height),
-                                orchard::tree::MerkleHashOrchard::read(&root.root_hash[..])?,
-                            ))
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-                    match protocol {
-                        ShieldedProtocol::Orchard => db.put_orchard_subtree_roots(0, &roots)?,
-                        ShieldedProtocol::Ironwood => db.put_ironwood_subtree_roots(0, &roots)?,
-                        ShieldedProtocol::Sapling => unreachable!(),
-                    }
-                }
+                ShieldedProtocol::Orchard => db.put_orchard_subtree_roots(
+                    0,
+                    &to_roots::<orchard::tree::MerkleHashOrchard>(roots)?,
+                )?,
+                ShieldedProtocol::Ironwood => db.put_ironwood_subtree_roots(
+                    0,
+                    &to_roots::<orchard::tree::MerkleHashOrchard>(roots)?,
+                )?,
             }
             Ok(())
         })
@@ -681,15 +691,14 @@ impl RealWallet {
     }
 
     fn send_input(
-        &self,
+        account_ids: &[AccountUuid],
         from_account: u8,
         destination: &str,
     ) -> Result<(u8, AccountUuid, LocalNetwork, Address)> {
         let account_index = from_account
             .checked_sub(1)
             .context("invalid source account")?;
-        let account_id = *self
-            .account_ids
+        let account_id = *account_ids
             .get(account_index as usize)
             .context("source account does not exist")?;
         let params = regtest_network();
@@ -698,8 +707,49 @@ impl RealWallet {
         Ok((account_index, account_id, params, recipient))
     }
 
+    fn serialize_transaction(txid: TxId, transaction: &Transaction) -> Result<PreparedPayment> {
+        let mut raw_transaction = vec![];
+        transaction.write(&mut raw_transaction)?;
+        Ok(PreparedPayment {
+            txid: txid.to_string(),
+            raw_transaction,
+            expiry_height: u64::from(u32::from(transaction.expiry_height())),
+        })
+    }
+
+    fn build_and_serialize<DbT, N>(
+        db: &mut DbT,
+        params: &LocalNetwork,
+        usk: UnifiedSpendingKey,
+        proposal: &Proposal<StandardFeeRule, N>,
+        build_label: &str,
+        missing_transaction: &'static str,
+    ) -> Result<PreparedPayment>
+    where
+        DbT: WalletWrite + WalletCommitmentTrees,
+        <DbT as WalletRead>::Error: std::error::Error + Send + Sync + 'static,
+        <DbT as WalletCommitmentTrees>::Error: std::fmt::Display,
+        N: std::fmt::Display,
+    {
+        let prover = LocalTxProver::bundled();
+        let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+            db,
+            params,
+            &prover,
+            &prover,
+            &SpendingKeys::from_unified_spending_key(usk),
+            OvkPolicy::Sender,
+            proposal,
+            None,
+        )
+        .map_err(|error| anyhow::anyhow!("building {build_label}: {error}"))?;
+        let txid = *txids.first();
+        let transaction = db.get_transaction(txid)?.context(missing_transaction)?;
+        Self::serialize_transaction(txid, &transaction)
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare(
+    pub async fn prepare<T, F>(
         &self,
         activity_id: Option<&str>,
         seed_hex: &str,
@@ -708,10 +758,48 @@ impl RealWallet {
         destination: &str,
         amount: u64,
         memo: Option<MemoBytes>,
+        record: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(PreparedPayment) -> Result<T> + Send + 'static,
+    {
+        let activity_id = activity_id.map(str::to_owned);
+        let seed_hex = seed_hex.to_owned();
+        let source_pool = source_pool.to_owned();
+        let destination = destination.to_owned();
+        let account_ids = self.account_ids.clone();
+        self.with_db(move |db| {
+            let prepared = Self::prepare_in(
+                db,
+                &account_ids,
+                activity_id.as_deref(),
+                &seed_hex,
+                from_account,
+                &source_pool,
+                &destination,
+                amount,
+                memo,
+            )?;
+            record(prepared)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_in(
+        db: &mut Db,
+        account_ids: &[AccountUuid],
+        activity_id: Option<&str>,
+        seed_hex: &str,
+        from_account: u8,
+        source_pool: &str,
+        destination: &str,
+        amount: u64,
+        memo: Option<MemoBytes>,
     ) -> Result<PreparedPayment> {
-        let mut db = self.db.lock().await;
         if let Some(activity_id) = activity_id
-            && let Some(prepared) = prepared_payment(&mut db, activity_id)?
+            && let Some(prepared) = prepared_payment(db, activity_id)?
             && (prepared.expiry_height == 0
                 || db
                     .chain_height()?
@@ -720,7 +808,7 @@ impl RealWallet {
             return Ok(prepared);
         }
         let (account_index, account_id, params, recipient) =
-            self.send_input(from_account, destination)?;
+            Self::send_input(account_ids, from_account, destination)?;
         if memo.is_some() && matches!(recipient, Address::Transparent(_) | Address::Tex(_)) {
             return Err(PaymentError::TransparentMemo.into());
         }
@@ -743,29 +831,14 @@ impl RealWallet {
         )
         .map_err(|e| anyhow::anyhow!("deriving spending key: {e:?}"))?;
         db.transactionally_with_extension::<_, _, anyhow::Error>(|wallet, ext| {
-            let prover = LocalTxProver::bundled();
-            let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
+            let prepared = Self::build_and_serialize(
                 wallet,
                 &params,
-                &prover,
-                &prover,
-                &SpendingKeys::from_unified_spending_key(usk),
-                OvkPolicy::Sender,
+                usk,
                 &proposal,
-                None,
-            )
-            .map_err(|error| anyhow::anyhow!("building transaction: {error}"))?;
-            let txid = *txids.first();
-            let tx = wallet
-                .get_transaction(txid)?
-                .context("built transaction was not stored")?;
-            let mut raw_transaction = vec![];
-            tx.write(&mut raw_transaction)?;
-            let prepared = PreparedPayment {
-                txid: txid.to_string(),
-                raw_transaction,
-                expiry_height: u64::from(u32::from(tx.expiry_height())),
-            };
+                "transaction",
+                "built transaction was not stored",
+            )?;
             if let Some(activity_id) = activity_id {
                 ext.execute(
                     "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height)
@@ -787,34 +860,25 @@ impl RealWallet {
     }
 
     pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
-        let mut db = self.db.lock().await;
-        Ok(prepared_payment(&mut db, activity_id)?.is_some())
+        let activity_id = activity_id.to_owned();
+        self.with_db(move |db| Ok(prepared_payment(db, &activity_id)?.is_some()))
+            .await
     }
 
     pub async fn recover_prepared(&self, txid: &str) -> Result<Option<PreparedPayment>> {
         let txid = TxId::from_hex(txid).context("invalid wallet transaction id")?;
-        let db = self.db.lock().await;
-        let Some(transaction) = db.get_transaction(txid)? else {
-            return Ok(None);
-        };
-        let mut raw_transaction = vec![];
-        transaction.write(&mut raw_transaction)?;
-        Ok(Some(PreparedPayment {
-            txid: txid.to_string(),
-            raw_transaction,
-            expiry_height: u64::from(u32::from(transaction.expiry_height())),
-        }))
+        self.with_db(move |db| {
+            let Some(transaction) = db.get_transaction(txid)? else {
+                return Ok(None);
+            };
+            Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+        })
+        .await
     }
 
     pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
         let result = self.send_transaction(raw_transaction.to_vec()).await?;
-        if result.error_code != 0 {
-            bail!(
-                "lightwalletd rejected transaction: {}",
-                result.error_message
-            );
-        }
-        Ok(())
+        check_broadcast_response(result)
     }
 
     async fn send_transaction(&self, data: Vec<u8>) -> Result<SendResponse> {
@@ -838,9 +902,11 @@ impl RealWallet {
         source_pool: &str,
         destination: &str,
     ) -> Result<SendQuote> {
-        let (_, account_id, params, recipient) = self.send_input(from_account, destination)?;
-        let mut db = self.db.lock().await;
-        Self::quote(&mut *db, &params, account_id, source_pool, &recipient)
+        let (_, account_id, params, recipient) =
+            Self::send_input(&self.account_ids, from_account, destination)?;
+        let source_pool = source_pool.to_owned();
+        self.with_db(move |db| Self::quote(db, &params, account_id, &source_pool, &recipient))
+            .await
     }
 
     fn quote<DbT>(
@@ -968,7 +1034,7 @@ impl RealWallet {
         let seed_hex = seed_hex.to_owned();
         let from = from.to_owned();
         let to = to.to_owned();
-        let (txid, raw) = self
+        let prepared = self
             .with_db(move |db| {
                 let params = regtest_network();
                 let from =
@@ -1020,35 +1086,24 @@ impl RealWallet {
                         .map_err(|_| anyhow::anyhow!("invalid treasury account"))?,
                 )
                 .map_err(|e| anyhow::anyhow!("deriving treasury key: {e:?}"))?;
-                let prover = LocalTxProver::bundled();
-                let txids = create_proposed_transactions::<_, _, Infallible, _, Infallible, _>(
-                    &mut *db,
+                Self::build_and_serialize(
+                    db,
                     &params,
-                    &prover,
-                    &prover,
-                    &SpendingKeys::from_unified_spending_key(usk),
-                    OvkPolicy::Sender,
+                    usk,
                     &proposal,
-                    None,
+                    "shielding transaction",
+                    "shielding transaction was not stored",
                 )
-                .map_err(|e| anyhow::anyhow!("building shielding transaction: {e}"))?;
-                let txid = *txids.first();
-                let tx = db
-                    .get_transaction(txid)?
-                    .context("shielding transaction was not stored")?;
-                let mut raw = vec![];
-                tx.write(&mut raw)?;
-                Ok((txid.to_string(), raw))
             })
             .await?;
-        let response = self.send_transaction(raw).await?;
+        let response = self.send_transaction(prepared.raw_transaction).await?;
         if response.error_code != 0 {
             bail!(
                 "lightwalletd rejected shielding: {}",
                 response.error_message
             );
         }
-        Ok(txid)
+        Ok(prepared.txid)
     }
 }
 
@@ -1428,6 +1483,156 @@ mod prepared_tests {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_the_exact_already_queued_rejection_is_accepted() {
+        check_broadcast_response(SendResponse {
+            error_code: 0,
+            error_message: String::new(),
+        })
+        .unwrap();
+        check_broadcast_response(SendResponse {
+            error_code: -1,
+            error_message: "transaction dropped because it is already queued for download".into(),
+        })
+        .unwrap();
+        for message in [
+            "transaction dropped because the queue is full",
+            "mempool is disabled since synchronization is behind the chain tip",
+            "transaction is non-standard",
+            "unexpected rejection: transaction dropped because it is already queued for download",
+            "",
+        ] {
+            let error = check_broadcast_response(SendResponse {
+                error_code: -1,
+                error_message: message.into(),
+            })
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("lightwalletd rejected transaction: {message}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wallet_broadcast_accepts_the_lightwalletd_queued_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (request, mut response) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(
+                request.uri().path(),
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+            );
+            let message = b"transaction dropped because it is already queued for download";
+            // SendResponse protobuf fields: error_code=1 and the queue message.
+            let mut protobuf = vec![0x08, 1, 0x12, u8::try_from(message.len()).unwrap()];
+            protobuf.extend_from_slice(message);
+            let mut frame = vec![0];
+            frame.extend_from_slice(&u32::try_from(protobuf.len()).unwrap().to_be_bytes());
+            frame.extend_from_slice(&protobuf);
+            let mut stream = response
+                .send_response(
+                    axum::http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(())
+                        .unwrap(),
+                    false,
+                )
+                .unwrap();
+            stream
+                .send_data(axum::body::Bytes::from(frame), false)
+                .unwrap();
+            let mut trailers = axum::http::HeaderMap::new();
+            trailers.insert("grpc-status", "0".parse().unwrap());
+            stream.send_trailers(trailers).unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut wallet = RealWallet::open(dir.path(), &hex::encode([7_u8; 64])).unwrap();
+        wallet.lightwalletd = endpoint;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wallet.broadcast(b"original signed bytes"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+    }
+
+    fn subtree_end_heights(path: &Path) -> (Option<u32>, Option<u32>, Option<u32>) {
+        let db = rusqlite::Connection::open(path.join("wallet.db")).unwrap();
+        let height = |table: &str| {
+            db.query_row(
+                &format!("SELECT subtree_end_height FROM {table} WHERE shard_index = 0"),
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        (
+            height("sapling_tree_shards"),
+            height("orchard_tree_shards"),
+            height("ironwood_tree_shards"),
+        )
+    }
+
+    #[tokio::test]
+    async fn subtree_roots_reject_malformed_data_and_route_by_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet = RealWallet::open(dir.path(), &hex::encode([7_u8; 64])).unwrap();
+
+        for protocol in [
+            ShieldedProtocol::Sapling,
+            ShieldedProtocol::Orchard,
+            ShieldedProtocol::Ironwood,
+        ] {
+            wallet
+                .put_subtree_roots(
+                    protocol,
+                    vec![
+                        SubtreeRootData {
+                            completing_height: 100,
+                            root_hash: vec![0; 32],
+                        },
+                        SubtreeRootData {
+                            completing_height: 101,
+                            root_hash: vec![0; 31],
+                        },
+                    ],
+                )
+                .await
+                .unwrap_err();
+        }
+        assert_eq!(subtree_end_heights(dir.path()), (None, None, None));
+
+        for (protocol, completing_height) in [
+            (ShieldedProtocol::Sapling, 100),
+            (ShieldedProtocol::Orchard, 101),
+            (ShieldedProtocol::Ironwood, 102),
+        ] {
+            wallet
+                .put_subtree_roots(
+                    protocol,
+                    vec![SubtreeRootData {
+                        completing_height,
+                        root_hash: vec![0; 32],
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            subtree_end_heights(dir.path()),
+            (Some(100), Some(101), Some(102))
+        );
+    }
+
     #[tokio::test]
     async fn prepared_payment_journal_survives_reopen() {
         let dir = tempfile::tempdir().unwrap();
@@ -1455,10 +1660,301 @@ mod tests {
                 "invalid address",
                 0,
                 None,
+                Ok,
             )
             .await
             .unwrap();
         assert_eq!(recovered.txid, "txid-1");
         assert_eq!(recovered.raw_transaction, b"signed transaction");
+        assert_eq!(recovered.expiry_height, 140);
+    }
+
+    struct TestWallet {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        wallet: RealWallet,
+        seed: String,
+        destination: String,
+    }
+
+    fn test_wallet() -> TestWallet {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(dir.path().join("server.db")).unwrap();
+        store.initialize().unwrap();
+        let seed = store.seed().unwrap();
+        TestWallet {
+            path: dir.path().to_owned(),
+            wallet: RealWallet::open(dir.path(), &seed).unwrap(),
+            destination: store.account(2).unwrap().transparent_address,
+            seed,
+            _dir: dir,
+        }
+    }
+
+    fn delay_wallet_queries(path: &std::path::Path, hold: Duration) -> std::thread::JoinHandle<()> {
+        let blocker = rusqlite::Connection::open(path.join("wallet.db")).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            blocker.execute_batch("COMMIT").unwrap();
+        })
+    }
+
+    async fn assert_runs_off_the_executor<T, F>(call: impl FnOnce(TestWallet) -> F)
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T>> + Send + 'static,
+    {
+        let test = test_wallet();
+        let release = delay_wallet_queries(&test.path, Duration::from_millis(500));
+        let work = tokio::spawn(call(test));
+        let started = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let elapsed = started.elapsed();
+        let still_waiting = !work.is_finished();
+        release.join().unwrap();
+        let _ = work.await.unwrap();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "wallet database work blocked the async executor for {elapsed:?}"
+        );
+        assert!(still_waiting, "the delayed wallet query finished early");
+    }
+
+    #[tokio::test]
+    async fn operation_cancelled_while_waiting_for_the_wallet_never_runs() {
+        let test = test_wallet();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |_| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting = {
+            let wallet = test.wallet.clone();
+            let ran = Arc::clone(&ran);
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |_| {
+                        ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        test.wallet.with_db(|_| Ok(())).await.unwrap();
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a caller cancelled before it held the wallet still ran its operation"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_operation_finishes_after_its_caller_is_cancelled() {
+        let test = test_wallet();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let started = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet
+                    .with_db(move |db| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                            ext.execute(
+                                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                                [],
+                            )?;
+                            Ok(())
+                        })
+                    })
+                    .await
+            })
+        };
+        entered_rx.await.unwrap();
+        started.abort();
+        assert!(started.await.unwrap_err().is_cancelled());
+
+        let check = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move { wallet.has_prepared("activity-1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !check.is_finished(),
+            "another caller used the wallet while a cancelled operation still held it"
+        );
+        release_tx.send(()).unwrap();
+        assert!(check.await.unwrap().unwrap());
+
+        let retried = test
+            .wallet
+            .prepare(
+                Some("activity-1"),
+                "invalid seed",
+                0,
+                "invalid pool",
+                "invalid address",
+                0,
+                None,
+                Ok,
+            )
+            .await
+            .unwrap();
+        assert_eq!(retried.txid, "txid-1");
+    }
+
+    #[tokio::test]
+    async fn prepared_payment_is_recorded_after_its_caller_is_dropped() {
+        let test = test_wallet();
+        rusqlite::Connection::open(test.path.join("wallet.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                [],
+            )
+            .unwrap();
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let release = delay_wallet_queries(&test.path, Duration::from_millis(300));
+        let caller = {
+            let wallet = test.wallet.clone();
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                wallet
+                    .prepare(
+                        Some("activity-1"),
+                        "invalid seed",
+                        0,
+                        "invalid pool",
+                        "invalid address",
+                        0,
+                        None,
+                        move |prepared| {
+                            *recorded.lock().unwrap() = Some(prepared.txid);
+                            Ok(())
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.join().unwrap();
+        test.wallet.with_db(|_| Ok(())).await.unwrap();
+        assert_eq!(
+            recorded.lock().unwrap().as_deref(),
+            Some("txid-1"),
+            "a journaled payment was not recorded after its caller was dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_errors_stay_typed_through_the_wallet_worker() {
+        let test = test_wallet();
+        let memo_to_transparent = test
+            .wallet
+            .prepare(
+                None,
+                &test.seed,
+                1,
+                "ironwood",
+                &test.destination,
+                10_000,
+                Some(MemoBytes::empty()),
+                Ok,
+            )
+            .await
+            .err()
+            .expect("a memo to a transparent address must be rejected");
+        assert!(matches!(
+            memo_to_transparent.downcast_ref(),
+            Some(PaymentError::TransparentMemo)
+        ));
+        let unscanned = test
+            .wallet
+            .prepare(
+                None,
+                &test.seed,
+                1,
+                "ironwood",
+                &test.destination,
+                10_000,
+                None,
+                Ok,
+            )
+            .await
+            .err()
+            .expect("an unscanned wallet must not build a payment");
+        assert!(matches!(
+            unscanned.downcast_ref(),
+            Some(PaymentError::ScanRequired)
+        ));
+    }
+
+    #[tokio::test]
+    async fn delayed_prepare_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .prepare(
+                    Some("activity-1"),
+                    &test.seed,
+                    1,
+                    "ironwood",
+                    &test.destination,
+                    10_000,
+                    None,
+                    Ok,
+                )
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_send_quote_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .send_quote(1, "ironwood", &test.destination)
+                .await
+                .map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_has_prepared_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet.has_prepared("activity-1").await.map(|_| ())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn delayed_recover_prepared_does_not_block_the_async_executor() {
+        assert_runs_off_the_executor(|test| async move {
+            test.wallet
+                .recover_prepared(&"00".repeat(32))
+                .await
+                .map(|_| ())
+        })
+        .await;
     }
 }

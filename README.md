@@ -205,6 +205,7 @@ Running `ths` with no command starts the default environment.
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
+| `ths wallet balances` | Print each development account's balances and addresses |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo |
 | `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address |
@@ -215,10 +216,10 @@ Running `ths` with no command starts the default environment.
 | `ths logs lightwalletd -f` | Follow lightwalletd logs |
 | `ths logs --tail 200 -f` | Print the last 200 app log lines, then follow |
 | `ths logs zakura --head 200` | Print the first 200 node log lines |
-| `ths list` | List known environments |
+| `ths list` | List environments and their container status |
 | `ths stop` | Stop and delete the environment |
 | `ths reset --force` | Force-delete one environment and all its data |
-| `ths doctor` | Check Docker and local configuration |
+| `ths doctor [--json]` | Check Docker and local configuration; exit nonzero if Docker is unreachable |
 | `ths pull` | Pull the exact images for this launcher version |
 | `ths update --check` | Check for a newer release |
 | `ths update` | Install the latest verified release |
@@ -307,6 +308,8 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucet_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_address_faucet_behavior_is_unchanged
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_send_retry_survives_lost_response_and_restart
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_external_faucet_retry_survives_lost_response_and_restart
 ```
 
 The first command compiles the integration target. The second runs its
@@ -324,6 +327,19 @@ node, then waits for the production background wallet-sync loop to update the
 existing activity row. Direct mining is intentional: retrying Send or using the
 server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
+
+The queued-retry regressions exercise Send and an external-address faucet through
+the production HTTP handlers. A loopback proxy withholds the original HTTP
+response until the client stops waiting. The real original transaction remains
+in the node's mempool. On the same-key retry, controlled proxies report that
+transaction missing and substitute the exact lightwalletd already-queued
+response. These are injected faults, not a naturally occurring node queue race.
+Both server and wallet journals, signed bytes, transaction identity, and reserved
+inputs must remain unchanged and pending without a block hash. After restarting
+the server against both existing databases, the tests mine the original and
+check canonical confirmation, exactly one payout, and no additional broadcast
+or block on confirmed replay. These tests retain caller-driven recovery; they
+do not establish autonomous payment progression.
 
 The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
 to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks

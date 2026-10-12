@@ -127,7 +127,12 @@ ths reset --force
 
 ### `ths list [--json]`
 
-Lists every known environment and its dashboard URL.
+Lists known environments in sections by state, with each one's dashboard URL,
+state (running, paused, degraded or stopped), and containers' status and
+creation and start times. `--json` gives the same data with unix-second
+timestamps. An environment whose container names are held by containers it
+doesn't own is listed as a conflict, and if Docker can't be reached,
+environments are still listed with their state as unknown.
 
 ```console
 ths list
@@ -136,7 +141,9 @@ ths list
 ### `ths doctor [--json]`
 
 Checks that Docker is reachable and prints the launcher's configuration
-directory.
+directory. If Docker is unreachable, the command exits nonzero in both output
+modes. With `--json`, stdout still contains one diagnostic JSON object with
+`ok: false` and `docker: null`; the error is written to stderr.
 
 ```console
 ths doctor
@@ -216,14 +223,26 @@ and Send dialogs, from a script or terminal:
 
 | Subcommand | What it does |
 | --- | --- |
+| `ths wallet balances` | Print each account's balances and addresses |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield` | Spend Ironwood funds into the same or another account's transparent balance |
 
-Every subcommand mines the confirming block automatically and prints the
-resulting transaction ID (and, for `send`, `shield`, and `unshield`, the
-confirming block hash). Pass `--json` for machine-readable output.
+Every subcommand except `balances` mines the confirming block automatically
+and prints the resulting transaction ID (and, for `send`, `shield`, and
+`unshield`, the confirming block hash). Pass `--json` for machine-readable
+output.
+
+### `ths wallet balances`
+
+Prints accounts 1-5 with their transparent and Ironwood balances in ZEC and the
+addresses that receive them. With `--json`, balances are in zatoshi.
+
+```console
+ths wallet balances
+ths wallet balances --json
+```
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -417,13 +436,14 @@ account 1 to account 3, all without opening the dashboard.
 | `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
+| `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
 | `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
 | `ths wallet send --from --uri [--amount] [--source-pool]` | Pay a ZIP-321 `zcash:` URI to any Regtest address |
 | `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield --from --to --amount` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs [service] [-f] [--tail N \| --head N]` | Stream or print service logs |
-| `ths list` | List known environments |
+| `ths list` | List environments and their container status |
 | `ths stop` | Stop and delete the environment |
 | `ths reset --force` | Force-delete one environment and all its data |
 | `ths doctor` | Check Docker and local configuration |
