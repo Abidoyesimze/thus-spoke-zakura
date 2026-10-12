@@ -328,6 +328,10 @@ impl Runtime {
     }
 
     pub fn doctor(&self, json: bool) -> Result<()> {
+        self.doctor_with(json, false)
+    }
+
+    fn doctor_with(&self, json: bool, diagnostics_to_stderr: bool) -> Result<()> {
         let docker = docker_output(["version", "--format", "{{.Server.Version}}"]);
         let result = serde_json::json!({
             "docker": docker.as_ref().ok(),
@@ -339,7 +343,10 @@ impl Runtime {
         }
         if let Ok(version) = docker {
             if !json {
-                println!("✓ Docker {version}\n✓ Config: {}", self.root.display());
+                print_progress(
+                    diagnostics_to_stderr,
+                    format_args!("✓ Docker {version}\n✓ Config: {}", self.root.display()),
+                );
             }
         } else {
             bail!("Docker is not reachable; start Docker Desktop or the Docker daemon");
@@ -374,7 +381,8 @@ impl Runtime {
     ) -> Result<()> {
         host_ports(port_offset)?;
         let shutdown = Shutdown::install()?;
-        let context = LifecycleContext::new(LifecyclePolicy::default());
+        self.doctor_with(false, json)?;
+        let context = LifecycleContext::new_for_start(LifecyclePolicy::default(), json);
         let prepared = {
             let requested = || shutdown.try_interrupted();
             let docker = LifecycleDocker::production(
@@ -384,7 +392,7 @@ impl Runtime {
                 Cancellation::Observe(&requested),
             );
             (|| {
-                startup_docker_reachable(&docker)?;
+                startup_docker_reachable(&docker, json)?;
                 for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
                     startup_require_image(&docker, &image)?;
                 }
@@ -460,7 +468,7 @@ impl Runtime {
                 Cancellation::Observe(&requested),
             );
             (|| {
-                startup_docker_reachable(&docker)?;
+                startup_docker_reachable(&docker, false)?;
                 for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
                     startup_require_image(&docker, &image)?;
                 }
@@ -1409,6 +1417,15 @@ fn require_free_loopback(port: u16) -> Result<()> {
 fn prefix(name: &InstanceName) -> String {
     format!("ths-{name}")
 }
+
+fn print_progress(diagnostics_to_stderr: bool, message: std::fmt::Arguments<'_>) {
+    if diagnostics_to_stderr {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
+    }
+}
+
 fn label(name: &InstanceName) -> String {
     format!("{INSTANCE_LABEL}={name}")
 }
@@ -1434,6 +1451,7 @@ struct LifecycleContext {
     policy: LifecyclePolicy,
     helpers: RefCell<HelperSet>,
     overall_deadline: Option<Deadline>,
+    diagnostics_to_stderr: bool,
 }
 
 impl LifecycleContext {
@@ -1442,6 +1460,14 @@ impl LifecycleContext {
             policy,
             helpers: RefCell::new(HelperSet::new()),
             overall_deadline: None,
+            diagnostics_to_stderr: false,
+        }
+    }
+
+    fn new_for_start(policy: LifecyclePolicy, diagnostics_to_stderr: bool) -> Self {
+        Self {
+            diagnostics_to_stderr,
+            ..Self::new(policy)
         }
     }
 
@@ -1550,7 +1576,12 @@ impl DockerResourceCommands for LifecycleDocker<'_> {
     }
 
     fn run(&self, args: &[&str]) -> Result<()> {
-        self.execute(args, OutputMode::Inherit)?;
+        let mode = if self.context.diagnostics_to_stderr {
+            OutputMode::InheritStderr
+        } else {
+            OutputMode::Inherit
+        };
+        self.execute(args, mode)?;
         Ok(())
     }
 }
@@ -3089,14 +3120,14 @@ impl Runtime {
             context,
             armed: false,
         };
-        println!("Preparing a fresh {name} environment…");
+        print_progress(json, format_args!("Preparing a fresh {name} environment…"));
         let initial_deadline = Deadline::after(context.policy.cleanup);
         let initial = host.delete(self, name, context, initial_deadline)?;
         if !initial.verified() {
             return initial.into_result();
         }
         cleanup.armed = true;
-        println!("Starting {name}…");
+        print_progress(json, format_args!("Starting {name}…"));
         let primary = (|| {
             fs::create_dir_all(self.instance_dir(name))?;
             let mut journal = recovery::RecoveryJournal::create(self.recovery_path(name), name)?;
@@ -3131,11 +3162,14 @@ impl Runtime {
         })();
         cleanup.armed = false;
         if matches!(primary, Ok(Ended::DeletedElsewhere)) {
-            println!("\n{name} was stopped and deleted by another command.");
+            print_progress(
+                json,
+                format_args!("\n{name} was stopped and deleted by another command."),
+            );
             return Ok(());
         }
         if primary.is_ok() {
-            println!("\nStopping and deleting {name}…");
+            print_progress(json, format_args!("\nStopping and deleting {name}…"));
         }
         let final_deadline = Deadline::after(context.policy.cleanup);
         let cleaned = host
@@ -3143,7 +3177,10 @@ impl Runtime {
             .and_then(CleanupReport::into_result);
         match (primary, cleaned) {
             (Ok(_), Ok(())) => {
-                println!("Deleted {name} and all of its development data.");
+                print_progress(
+                    json,
+                    format_args!("Deleted {name} and all of its development data."),
+                );
                 Ok(())
             }
             (Err(primary), Ok(())) => Err(primary),
@@ -3476,11 +3513,14 @@ fn published_port_with(
         .context("Docker returned an invalid published port")
 }
 
-fn startup_docker_reachable(docker: &impl DockerResourceCommands) -> Result<()> {
+fn startup_docker_reachable(
+    docker: &impl DockerResourceCommands,
+    diagnostics_to_stderr: bool,
+) -> Result<()> {
     let version = docker
         .output(&["version", "--format", "{{.Server.Version}}"])
         .context("Docker is not reachable; start Docker Desktop or the Docker daemon")?;
-    println!("✓ Docker {version}");
+    print_progress(diagnostics_to_stderr, format_args!("✓ Docker {version}"));
     Ok(())
 }
 

@@ -2,8 +2,18 @@
 set -eu
 printf '%s\n' "$*" >> "$THS_TEST_COMMANDS"
 case "$1 $2" in
-    'version --format') printf 'test-docker\n' ;;
-    'image inspect') : ;;
+    'version --format')
+        if [ "${THS_TEST_FAIL_DOCTOR:-0}" != 0 ]; then
+            printf 'Docker test failure\n' >&2
+            exit 1
+        fi
+        printf 'test-docker\n'
+        ;;
+    'image inspect')
+        [ "${THS_TEST_MISSING_IMAGE:-0}" = 0 ] || exit 1
+        ;;
+    'image ls') : ;;
+    'build '*|'pull '*) printf 'docker lifecycle output\n' ;;
     'inspect --format') printf '%s\n' "$THS_TEST_PORT" ;;
     'container ls'|'volume ls'|'network ls')
         for resource in "$THS_TEST_STATE/$1"/*; do
@@ -18,6 +28,7 @@ case "$1 $2" in
             case "$2" in
                 *HostPort*) printf '%s\n' "$THS_TEST_PORT" ;;
                 *Running*) printf 'true\n' ;;
+                    *Created*) printf '2026-10-12T00:00:00Z\n' ;;
                 *) exit 1 ;;
             esac
         else
@@ -41,6 +52,17 @@ case "$1 $2" in
         printf 'init diagnostic\n' >&2
         if [ "${THS_TEST_FAIL_INIT:-0}" = 1 ]; then exit 1; fi
         ;;
-    'start '*|'rm '*|'volume rm'|'network rm') printf 'docker lifecycle output\n' ;;
+    'rm '*)
+        shift
+        for target do rm -f "$THS_TEST_STATE/container/$target"; done
+        printf 'docker lifecycle output\n'
+        ;;
+    'volume rm'|'network rm')
+        kind=$1
+        shift 2
+        for target do rm -f "$THS_TEST_STATE/$kind/$target"; done
+        printf 'docker lifecycle output\n'
+        ;;
+    'start '*) printf 'docker lifecycle output\n' ;;
     *) printf 'unexpected Docker command: %s\n' "$*" >&2; exit 1 ;;
 esac

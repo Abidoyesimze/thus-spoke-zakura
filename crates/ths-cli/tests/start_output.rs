@@ -2,9 +2,11 @@
 
 use std::{
     fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
     os::unix::fs::PermissionsExt,
     process::{Child, Command, Stdio},
+    sync::Arc,
     sync::{
         atomic::{AtomicU16, Ordering},
         mpsc,
@@ -19,12 +21,51 @@ struct Fixture {
     directory: tempfile::TempDir,
     name: String,
     port_offset: u16,
+    stop_server: Arc<std::sync::atomic::AtomicBool>,
+    server: Option<thread::JoinHandle<()>>,
 }
 
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let port_offset = 20_000 + NEXT_PORT_OFFSET.fetch_add(10, Ordering::Relaxed);
+        let commands_path = directory.path().join("commands");
+        let stop_server = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server_stop = Arc::clone(&stop_server);
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed)
+                && !fs::read_to_string(&commands_path)
+                    .is_ok_and(|commands| commands.contains("start -a"))
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if server_stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let listeners = [
+                TcpListener::bind(("127.0.0.1", 18_232 + port_offset)).unwrap(),
+                TcpListener::bind(("127.0.0.1", 32_805 + port_offset)).unwrap(),
+            ];
+            for listener in &listeners {
+                listener.set_nonblocking(true).unwrap();
+            }
+            while !server_stop.load(Ordering::Relaxed) {
+                let mut accepted = false;
+                for listener in &listeners {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            accepted = true;
+                            respond_ready(stream);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => panic!("readiness fixture server failed: {error}"),
+                    }
+                }
+                if !accepted {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
         for (name, script) in [
             ("docker", include_str!("fixtures/docker.sh")),
             ("curl", include_str!("fixtures/curl.sh")),
@@ -37,6 +78,8 @@ impl Fixture {
             directory,
             name: format!("output-{}", uuid::Uuid::new_v4().simple()),
             port_offset,
+            stop_server,
+            server: Some(server),
         }
     }
 
@@ -84,6 +127,28 @@ impl Fixture {
     }
 }
 
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        self.stop_server.store(true, Ordering::Relaxed);
+        if let Some(server) = self.server.take() {
+            server.join().unwrap();
+        }
+    }
+}
+
+fn respond_ready(mut stream: TcpStream) {
+    let mut request = [0; 2048];
+    let _ = stream.read(&mut request);
+    let body = r#"{"result":"test-tip"}"#;
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .unwrap();
+}
+
 fn finish(child: &mut Child) -> std::process::ExitStatus {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
@@ -124,15 +189,23 @@ fn output_after_shutdown(
     });
     let stderr_thread = thread::spawn(move || std::io::read_to_string(stderr).unwrap());
     if !fail_init {
-        if ready_receiver
-            .recv_timeout(Duration::from_secs(20))
-            .is_err()
-        {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut saw_ready = false;
+        while Instant::now() < deadline {
+            match ready_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(()) => {
+                    saw_ready = true;
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+        if !saw_ready {
             let _ = child.kill();
             child.wait().unwrap();
             panic!(
-                "launcher did not become ready: {}",
-                stderr_thread.join().unwrap()
+                "launcher did not become ready; stderr: {}",
+                stderr_thread.join().unwrap(),
             );
         }
         if deleted_elsewhere {
@@ -208,7 +281,7 @@ fn json_start_failure_keeps_stdout_empty_through_partial_cleanup() {
     assert!(!success);
     assert!(stdout.is_empty(), "{stdout}");
     assert!(stderr.contains("disposable test mnemonic"));
-    assert!(stderr.contains("failed"));
+    assert!(stderr.contains("nonzero exit"), "{stderr}");
     assert!(commands.contains("rm -f"));
     assert!(commands.contains("volume rm"));
     assert!(commands.contains("network rm"));
@@ -307,10 +380,10 @@ fn json_start_preflight_failures_keep_stdout_empty() {
             .unwrap();
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(
-            String::from_utf8(output.stderr)
-                .unwrap()
-                .contains(diagnostic)
+            stderr.contains(diagnostic),
+            "expected {diagnostic}: {stderr}"
         );
     }
 }
