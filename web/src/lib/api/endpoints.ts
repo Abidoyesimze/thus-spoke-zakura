@@ -8,6 +8,7 @@ import {
   blockSchema,
   miningJobSchema,
   miningJobResponseSchema,
+  paymentRequestSchema,
   paymentUriSchema,
   sendQuoteSchema,
   statusSchema,
@@ -63,6 +64,14 @@ export const api = {
   sendQuote: (input: SendQuoteInput) => post('/send/quote', sendQuoteSchema, input),
 
   parsePaymentUri: (uri: string) => post('/zip321/parse', paymentUriSchema, { uri }),
+
+  paymentRequest: (input: { account_id: number; amount_zatoshi?: bigint; memo?: string }) =>
+    post('/zip321/request', paymentRequestSchema, {
+      ...input,
+      ...(input.amount_zatoshi === undefined
+        ? {}
+        : { amount_zatoshi: Number(input.amount_zatoshi) }),
+    }),
 
   faucet: (input: {
     account_id: number;

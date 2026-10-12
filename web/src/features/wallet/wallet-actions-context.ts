@@ -2,6 +2,7 @@ import { createContext, use } from 'react';
 
 export interface WalletActionsApi {
   openSend: (accountId?: number) => void;
+  openRequest: () => void;
   openFaucet: (accountId?: number) => void;
   openMine: () => void;
 }
