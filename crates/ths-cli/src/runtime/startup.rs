@@ -62,6 +62,7 @@ pub(super) struct Shutdown {
     /// Lets a `DeletionMonitor` end `wait` through the same channel as Ctrl+C.
     pub(super) sender: mpsc::Sender<Ended>,
     pub(super) receiver: mpsc::Receiver<Ended>,
+    worker: Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)>,
 }
 impl Shutdown {
     #[cfg(test)]
@@ -72,6 +73,7 @@ impl Shutdown {
             signal: Arc::new(AtomicI32::new(0)),
             sender: sender.clone(),
             receiver,
+            worker: None,
         };
         (sender, shutdown)
     }
@@ -88,7 +90,8 @@ impl Shutdown {
             signal_hook::consts::SIGTERM,
         ])
         .context("installing shutdown signal handlers")?;
-        thread::spawn(move || {
+        let handle = signals.handle();
+        let worker = thread::spawn(move || {
             for received in signals.forever() {
                 handler_signal.store(received, Ordering::SeqCst);
                 handler_flag.store(true, Ordering::SeqCst);
@@ -102,6 +105,7 @@ impl Shutdown {
             signal,
             sender,
             receiver,
+            worker: Some((handle, worker)),
         })
     }
 
@@ -165,6 +169,17 @@ impl Shutdown {
                     bail!("interrupted");
                 }
                 Err(anyhow!("waiting for a shutdown signal"))
+            }
+        }
+    }
+}
+
+impl Drop for Shutdown {
+    fn drop(&mut self) {
+        if let Some((handle, worker)) = self.worker.take() {
+            handle.close();
+            if worker.join().is_err() {
+                eprintln!("shutdown signal worker panicked");
             }
         }
     }

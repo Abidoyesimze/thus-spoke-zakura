@@ -1,6 +1,23 @@
 use super::*;
 
 #[test]
+fn dropping_shutdown_joins_signal_worker_without_a_signal() {
+    let shutdown = Shutdown::install().unwrap();
+    let worker_flag = Arc::downgrade(&shutdown.flag);
+
+    drop(shutdown);
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while worker_flag.upgrade().is_some() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        worker_flag.upgrade().is_none(),
+        "signal worker survived drop"
+    );
+}
+
+#[test]
 fn partial_startup_cleanup_removes_only_owned_resources() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Runtime {
