@@ -311,6 +311,17 @@ pub fn regtest_network() -> LocalNetwork {
     }
 }
 
+fn validate_lightwalletd_endpoint(endpoint: &str) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint).context("invalid THS_LIGHTWALLETD")?;
+    anyhow::ensure!(
+        url.scheme() == "http" && url.host_str().is_some(),
+        "invalid THS_LIGHTWALLETD: expected an HTTP endpoint"
+    );
+    tonic::transport::Endpoint::from_shared(endpoint.to_owned())
+        .context("invalid THS_LIGHTWALLETD")?;
+    Ok(())
+}
+
 impl RealWallet {
     pub fn open(data_dir: &Path, seed_hex: &str) -> Result<Self> {
         let seed = hex::decode(seed_hex).context("invalid wallet seed")?;
@@ -363,11 +374,13 @@ impl RealWallet {
         accounts.sort_by(|a, b| a.0.cmp(&b.0));
         let account_ids = accounts.into_iter().map(|(_, id)| id).collect();
 
+        let lightwalletd =
+            std::env::var("THS_LIGHTWALLETD").unwrap_or_else(|_| "http://127.0.0.1:9067".into());
+        validate_lightwalletd_endpoint(&lightwalletd)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             account_ids,
-            lightwalletd: std::env::var("THS_LIGHTWALLETD")
-                .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
+            lightwalletd,
         })
     }
 
@@ -590,15 +603,16 @@ impl RealWallet {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         };
-        if let Ok(result) = tokio::time::timeout(timeout, wait).await {
-            return result;
-        }
+        let error = match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => return result,
+            Err(error) => error,
+        };
         let latest_indexed =
             latest_indexed.map_or_else(|| "unknown".into(), |height| height.to_string());
-        bail!(
+        Err(error).with_context(|| format!(
             "lightwalletd did not index Zakura height {target} within {} seconds (latest indexed height: {latest_indexed})",
             timeout.as_secs()
-        );
+        ))
     }
 
     pub async fn apply_balances(&self, accounts: &mut [Account]) -> Result<()> {
@@ -881,6 +895,19 @@ impl RealWallet {
     pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
         let activity_id = activity_id.to_owned();
         self.with_db(move |db| Ok(prepared_payment(db, &activity_id)?.is_some()))
+            .await
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) repairs from this"
+        )
+    )]
+    pub async fn prepared(&self, activity_id: &str) -> Result<Option<PreparedPayment>> {
+        let activity_id = activity_id.to_owned();
+        self.with_db(move |db| prepared_payment(db, &activity_id))
             .await
     }
 
@@ -1300,6 +1327,22 @@ mod treasury_sync_tests {
 
 #[cfg(test)]
 mod prepared_tests {
+    #[test]
+    fn invalid_lightwalletd_configuration_is_fatal_before_connection() {
+        for endpoint in [
+            "not a url",
+            "http://[",
+            "/relative",
+            "mailto:wallet@example.com",
+            "ftp://127.0.0.1",
+            "https://127.0.0.1:9067",
+        ] {
+            let error = super::validate_lightwalletd_endpoint(endpoint).unwrap_err();
+            assert!(!crate::startup_retryable(&error), "{endpoint}: {error:#}");
+        }
+        super::validate_lightwalletd_endpoint("http://127.0.0.1:9067").unwrap();
+    }
+
     use transparent::{
         bundle::{OutPoint, TxOut},
         keys::TransparentKeyScope,
@@ -1670,6 +1713,11 @@ mod tests {
         let wallet = RealWallet::open(dir.path(), &seed).unwrap();
         assert!(wallet.has_prepared("activity-1").await.unwrap());
         assert!(!wallet.has_prepared("missing").await.unwrap());
+        let journaled = wallet.prepared("activity-1").await.unwrap().unwrap();
+        assert_eq!(journaled.txid, "txid-1");
+        assert_eq!(journaled.raw_transaction, b"signed transaction");
+        assert_eq!(journaled.expiry_height, 140);
+        assert!(wallet.prepared("missing").await.unwrap().is_none());
         let recovered = wallet
             .prepare(
                 Some("activity-1"),
@@ -1781,6 +1829,111 @@ mod tests {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "a caller cancelled before it held the wallet still ran its operation"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_keeps_serialization_while_the_real_preparation_worker_records_signed_bytes() {
+        let test = test_wallet();
+        let store = crate::db::Store::open(test.path.join("server.db")).unwrap();
+        let claim = store
+            .claim_faucet(1, "ironwood", 500_000_000, "startup-account-1-ironwood-v1")
+            .unwrap();
+        rusqlite::Connection::open(test.path.join("wallet.db")).unwrap().execute(
+            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',x'010203',140)", [&claim.id]).unwrap();
+        let payments = Arc::new(tokio::sync::Mutex::new(()));
+        let replenishment = Arc::new(tokio::sync::Mutex::new(()));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let work = {
+            let wallet = test.wallet.clone();
+            let store = store.clone();
+            let id = claim.id.clone();
+            let payments = payments.clone();
+            let replenishment = replenishment.clone();
+            let mut worker = Some((entered, released));
+            tokio::spawn(async move {
+                crate::retry_startup(|| {
+                    let (entered, released) =
+                        worker.take().expect("startup restarted a running worker");
+                    let wallet = wallet.clone();
+                    let store = store.clone();
+                    let id = id.clone();
+                    let payments = payments.clone();
+                    let replenishment = replenishment.clone();
+                    async move {
+                        let _payment = payments.lock().await;
+                        let _replenishment = replenishment.lock().await;
+                        let recorded_id = id.clone();
+                        wallet
+                            .prepare(
+                                Some(&id),
+                                "invalid seed",
+                                0,
+                                "invalid pool",
+                                "invalid address",
+                                0,
+                                None,
+                                move |prepared| {
+                                    entered.send(()).unwrap();
+                                    released.recv().unwrap();
+                                    store.record_prepared(
+                                        &recorded_id,
+                                        &prepared.txid,
+                                        &prepared.raw_transaction,
+                                        prepared.expiry_height,
+                                    )?;
+                                    Ok(prepared)
+                                },
+                            )
+                            .await?;
+                        Ok(())
+                    }
+                })
+                .await
+            })
+        };
+        ready.await.unwrap();
+        tokio::time::advance(Duration::from_secs(130)).await;
+        assert!(!work.is_finished());
+        assert!(payments.try_lock().is_err());
+        assert!(replenishment.try_lock().is_err());
+        assert!(test.wallet.db.try_lock().is_err());
+        release.send(()).unwrap();
+        work.await.unwrap().unwrap();
+        let payment = store
+            .activity_for_key("startup-account-1-ironwood-v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(payment.id, claim.id);
+        assert_eq!(payment.txid, "original-txid");
+        assert_eq!(
+            store
+                .prepared_transaction(&claim.id)
+                .unwrap()
+                .raw_transaction,
+            [1, 2, 3]
+        );
+        assert!(payments.try_lock().is_ok());
+        assert!(replenishment.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn startup_does_not_retry_a_panicked_wallet_worker() {
+        let test = test_wallet();
+        let error = crate::retry_startup(|| async {
+            test.wallet
+                .with_db(|_| -> Result<()> { panic!("injected wallet worker panic") })
+                .await
+        })
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<tokio::task::JoinError>()
+                .unwrap()
+                .is_panic()
+        );
+        assert!(!crate::startup_retryable(&error));
     }
 
     #[tokio::test]

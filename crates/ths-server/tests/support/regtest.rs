@@ -360,6 +360,10 @@ impl RegtestStack {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        self.start_with_funding_fault(false).await
+    }
+
+    pub async fn start_with_funding_fault(&mut self, fail_auto_mine: bool) -> Result<()> {
         ensure!(
             !self.start_attempted,
             "fixture startup may only be attempted once per owned stack"
@@ -511,6 +515,9 @@ impl RegtestStack {
 
         self.cleanup.push(CleanupResource::Proxy);
         self.proxy = Some(GenerateFaultProxy::start(self.node_url.clone()).await?);
+        if fail_auto_mine {
+            self.proxy().fail_startup_auto_mine(&self.data_dir)?;
+        }
         let api_port = select_loopback_port()?;
         self.api_url = format!("http://127.0.0.1:{api_port}");
         self.cleanup.push(CleanupResource::Server);

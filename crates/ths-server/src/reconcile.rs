@@ -1,6 +1,6 @@
 use std::{future::Future, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
 use tokio::time::{Instant, timeout_at};
 use zcash_client_backend::{
@@ -25,6 +25,10 @@ use crate::wallet::{
     TransparentQuery, WALLET_BIRTHDAY_HEIGHT,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("wallet reconciliation deadline exceeded")]
+pub(crate) struct ReconciliationDeadline;
+
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_BATCH_SIZE: u32 = 100;
 
@@ -41,10 +45,9 @@ where
     let Some(scanned) = wallet.max_scanned_checkpoint().await? else {
         return Ok(None);
     };
-    anyhow::ensure!(
-        target.height >= u64::from(WALLET_BIRTHDAY_HEIGHT - 1),
-        "chain is below the wallet birthday floor; waiting for canonical block 1"
-    );
+    if target.height < u64::from(WALLET_BIRTHDAY_HEIGHT - 1) {
+        return Err(crate::ReadinessError::BelowBirthday.into());
+    }
     let mut height = u32::try_from(scanned.height.min(target.height))?;
     loop {
         check_deadline(deadline)?;
@@ -90,10 +93,9 @@ pub async fn sync_wallet(
         };
         if canonical.as_deref() != Some(cursor.block_hash.as_str()) {
             let floor = WALLET_BIRTHDAY_HEIGHT - 1;
-            anyhow::ensure!(
-                target.height >= u64::from(floor),
-                "chain is below the wallet birthday floor"
-            );
+            if target.height < u64::from(floor) {
+                return Err(crate::ReadinessError::BelowBirthday.into());
+            }
             rewind = Some(ChainCheckpoint {
                 height: u64::from(floor),
                 hash: within_deadline(
@@ -127,11 +129,11 @@ async fn rewind_wallet(
 ) -> Result<()> {
     let height = u32::try_from(checkpoint.height)?;
     let chain_state = download_chain_state(client, height.into(), deadline).await?;
-    anyhow::ensure!(
-        chain_state.block_height() == height.into()
-            && chain_state.block_hash().to_string() == checkpoint.hash,
-        "lightwalletd has not indexed the canonical rewind checkpoint"
-    );
+    if chain_state.block_height() != height.into()
+        || chain_state.block_hash().to_string() != checkpoint.hash
+    {
+        return Err(crate::ReadinessError::RewindCheckpoint.into());
+    }
     check_deadline(deadline)?;
     wallet.rewind_to_height(chain_state).await?;
     check_deadline(deadline)
@@ -379,10 +381,9 @@ fn split_range(range: ScanRange) -> impl Iterator<Item = ScanRange> {
 }
 
 pub(crate) fn check_deadline(deadline: Instant) -> Result<()> {
-    anyhow::ensure!(
-        Instant::now() < deadline,
-        "wallet reconciliation deadline exceeded"
-    );
+    if Instant::now() >= deadline {
+        return Err(ReconciliationDeadline.into());
+    }
     Ok(())
 }
 
@@ -397,7 +398,8 @@ where
     check_deadline(deadline)?;
     match timeout_at(deadline.min(Instant::now() + NETWORK_TIMEOUT), future).await {
         Ok(result) => result.map_err(Into::into).with_context(|| label.to_owned()),
-        Err(_) => bail!("{label} exceeded the network or reconciliation deadline"),
+        Err(error) => Err(error)
+            .with_context(|| format!("{label} exceeded the network or reconciliation deadline")),
     }
 }
 
