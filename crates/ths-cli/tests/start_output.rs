@@ -189,17 +189,7 @@ fn output_after_shutdown(
     });
     let stderr_thread = thread::spawn(move || std::io::read_to_string(stderr).unwrap());
     if !fail_init {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        let mut saw_ready = false;
-        while Instant::now() < deadline {
-            match ready_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(()) => {
-                    saw_ready = true;
-                    break;
-                }
-                Err(_) => break,
-            }
-        }
+        let saw_ready = ready_receiver.recv_timeout(Duration::from_secs(20)).is_ok();
         if !saw_ready {
             let _ = child.kill();
             child.wait().unwrap();
