@@ -127,10 +127,23 @@ struct EnvironmentStatus {
     containers: Vec<ContainerStatus>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct MineResult {
-    blocks: usize,
-    hashes: Vec<String>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct MiningJob {
+    id: String,
+    requested_blocks: u32,
+    completed_blocks: u32,
+    state: MiningJobState,
+    error: Option<String>,
+    progress_uncertain: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum MiningJobState {
+    Mining,
+    Syncing,
+    Completed,
+    Failed,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -538,20 +551,59 @@ impl Runtime {
 
     pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
         let (dashboard, client) = self.instance_client(name)?;
-        let result: MineResult = client
-            .post(format!("{dashboard}/api/v1/mine"))
-            .json(&serde_json::json!({"blocks": blocks}))
-            .send()
-            .map_err(anyhow::Error::from)
-            .and_then(decode_response)
+        let shutdown = Shutdown::install()?;
+        self.mine_with(name, &dashboard, &client, blocks, json, &shutdown)
+    }
+
+    fn mine_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        blocks: u32,
+        json: bool,
+        shutdown: &Shutdown,
+    ) -> Result<()> {
+        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let mut job = submit_mining_job(client, dashboard, blocks, &idempotency_key)
             .with_context(|| format!("asking environment {name} to mine {blocks} blocks"))?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            println!("Mined {} blocks on {name}.", result.blocks);
-            if let Some(tip) = result.hashes.last() {
-                println!("New tip: {tip}");
+
+        let deadline = Deadline::after(MINE_POLL_DEADLINE);
+        loop {
+            match job.state {
+                MiningJobState::Completed | MiningJobState::Failed => break,
+                MiningJobState::Mining | MiningJobState::Syncing => {}
             }
+            if deadline.expired() {
+                bail!(
+                    "timed out waiting for mining job {} on {name}; it may still be running",
+                    job.id
+                );
+            }
+            if shutdown
+                .wait_timeout(MINE_POLL_INTERVAL.min(deadline.remaining()))
+                .is_err()
+            {
+                bail!(
+                    "interrupted while waiting for mining job {} on {name}; it may still be running",
+                    job.id
+                );
+            }
+            job = client
+                .get(format!("{dashboard}/api/v1/mining/jobs/{}", job.id))
+                .send()
+                .map_err(anyhow::Error::from)
+                .and_then(decode_response)
+                .with_context(|| format!("checking mining job {} on {name}", job.id))?;
+        }
+
+        if job.state == MiningJobState::Failed {
+            bail!(job.error.unwrap_or_else(|| "mining failed".to_owned()));
+        }
+        if json {
+            println!("{}", serde_json::to_string_pretty(&job)?);
+        } else {
+            println!("Mined {} blocks on {name}.", job.completed_blocks);
         }
         Ok(())
     }
@@ -1350,6 +1402,40 @@ fn decode_response<T: serde::de::DeserializeOwned>(
         bail!("rejected ({status}): {detail}");
     }
     response.json().context("decoding response")
+}
+
+/// How long `mine` waits between polling a mining job, and the most it will wait
+/// in total before giving up and reporting the job ID, matching the old blocking
+/// endpoint's HTTP client timeout.
+const MINE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const MINE_POLL_DEADLINE: Duration = Duration::from_secs(300);
+/// One retry: a lost response after the server already accepted the request
+/// must not submit a second mining operation with a different idempotency key.
+const MINE_SUBMIT_ATTEMPTS: u32 = 2;
+
+/// Only retries a transport-level send failure, where it is unknown whether the
+/// server received the request. A decoded HTTP response, even an error one,
+/// confirms the server saw this attempt, so it is returned immediately.
+fn submit_mining_job(
+    client: &reqwest::blocking::Client,
+    dashboard: &str,
+    blocks: u32,
+    idempotency_key: &str,
+) -> Result<MiningJob> {
+    let body = serde_json::json!({"blocks": blocks, "idempotency_key": idempotency_key});
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match client
+            .post(format!("{dashboard}/api/v1/mining/jobs"))
+            .json(&body)
+            .send()
+        {
+            Ok(response) => return decode_response(response),
+            Err(_) if attempt < MINE_SUBMIT_ATTEMPTS => continue,
+            Err(error) => return Err(error).context("submitting the mining job"),
+        }
+    }
 }
 
 fn format_zec(zatoshi: u64) -> String {
@@ -5692,21 +5778,164 @@ mod tests {
     #[test]
     fn responses_decode_or_report_their_status_and_body() {
         let (url, _requests) = serve(vec![
-            ("200 OK", r#"{"blocks":1,"hashes":["tip"]}"#),
+            (
+                "200 OK",
+                r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false}"#,
+            ),
             ("409 Conflict", "already claimed"),
             ("200 OK", "not json"),
         ]);
         let client = reqwest::blocking::Client::new();
         let get = || client.get(&url).send().unwrap();
 
-        let mined: MineResult = decode_response(get()).unwrap();
-        assert_eq!(mined.hashes, ["tip"]);
-        let rejected = decode_response::<MineResult>(get())
-            .unwrap_err()
-            .to_string();
+        let job: MiningJob = decode_response(get()).unwrap();
+        assert_eq!(job.state, MiningJobState::Completed);
+        let rejected = decode_response::<MiningJob>(get()).unwrap_err().to_string();
         assert_eq!(rejected, "rejected (409 Conflict): already claimed");
-        let malformed = format!("{:#}", decode_response::<MineResult>(get()).unwrap_err());
+        let malformed = format!("{:#}", decode_response::<MiningJob>(get()).unwrap_err());
         assert!(malformed.starts_with("decoding response: "), "{malformed}");
+    }
+
+    #[test]
+    fn mine_polls_until_completion_and_reports_the_confirmed_count() {
+        let (url, requests) = serve(vec![
+            (
+                "202 Accepted",
+                r#"{"id":"job-1","requested_blocks":3,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"id":"job-1","requested_blocks":3,"completed_blocks":1,"state":"mining","error":null,"progress_uncertain":false}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"id":"job-1","requested_blocks":3,"completed_blocks":3,"state":"completed","error":null,"progress_uncertain":false}"#,
+            ),
+        ]);
+        let client = reqwest::blocking::Client::new();
+        let (_sender, shutdown) = Shutdown::channel();
+
+        runtime_for_tests()
+            .mine_with(&name("alpha"), &url, &client, 3, false, &shutdown)
+            .unwrap();
+
+        // The POST carries a JSON body; the two GET polls that follow carry none.
+        let mut requests = requests.try_iter();
+        let post: serde_json::Value = serde_json::from_str(&requests.next().unwrap()).unwrap();
+        assert_eq!(post["blocks"], 3);
+        assert!(post["idempotency_key"].is_string());
+        assert_eq!(requests.count(), 2, "expected exactly two GET polls");
+    }
+
+    #[test]
+    fn mine_reports_the_servers_error_on_a_failed_job() {
+        let (url, _requests) = serve(vec![
+            (
+                "202 Accepted",
+                r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"failed","error":"generate failed","progress_uncertain":false}"#,
+            ),
+        ]);
+        let client = reqwest::blocking::Client::new();
+        let (_sender, shutdown) = Shutdown::channel();
+
+        let error = runtime_for_tests()
+            .mine_with(&name("alpha"), &url, &client, 1, false, &shutdown)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "generate failed");
+    }
+
+    #[test]
+    fn mine_reports_the_job_id_when_interrupted_while_polling() {
+        let (url, _requests) = serve(vec![(
+            "202 Accepted",
+            r#"{"id":"job-9","requested_blocks":5,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+        )]);
+        let client = reqwest::blocking::Client::new();
+        let (sender, shutdown) = Shutdown::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            sender.send(Ended::Interrupted).unwrap();
+        });
+
+        let error = runtime_for_tests()
+            .mine_with(&name("alpha"), &url, &client, 5, false, &shutdown)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("job-9"), "{message}");
+        assert!(message.contains("interrupted"), "{message}");
+    }
+
+    #[test]
+    fn mine_prints_only_the_job_as_json() {
+        let (url, _requests) = serve(vec![(
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false}"#,
+        )]);
+        let client = reqwest::blocking::Client::new();
+        let (_sender, shutdown) = Shutdown::channel();
+
+        runtime_for_tests()
+            .mine_with(&name("alpha"), &url, &client, 1, true, &shutdown)
+            .unwrap();
+    }
+
+    #[test]
+    fn lost_response_retries_the_submission_with_the_same_idempotency_key() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (requests, received) = mpsc::channel();
+        thread::spawn(move || {
+            for respond in [false, true] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                requests.send(String::from_utf8(body).unwrap()).unwrap();
+                if respond {
+                    let body = r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#;
+                    write!(
+                        stream,
+                        "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    )
+                    .unwrap();
+                }
+                // Otherwise the connection is dropped here without a response,
+                // simulating a lost reply after the server already read the request.
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let job = submit_mining_job(&client, &url, 1, "same-key").unwrap();
+        assert_eq!(job.id, "job-1");
+
+        let bodies: Vec<serde_json::Value> = received
+            .try_iter()
+            .map(|body| serde_json::from_str(&body).unwrap())
+            .collect();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["idempotency_key"], "same-key");
+        assert_eq!(bodies[1]["idempotency_key"], "same-key");
     }
 
     #[test]

@@ -162,11 +162,14 @@ lifetime. At capacity, it rejects new admissions with HTTP 503 while reads and
 existing-key replays remain available. Stopping the server cancels running work
 and discards the history; jobs are not recovered after restart.
 
-`ths mine` still waits for the server-owned job and wallet synchronization before
-reporting success. Its HTTP client times out after 300 seconds, but an admitted
-job continues after that timeout or a client disconnection. Inspect the latest
-job before issuing another command. Each legacy request uses a fresh internal
-key, so repeating a command after completion starts another job.
+`ths mine` submits through this same job API, polling the job until it
+completes or fails and reporting its confirmed block count. It retries a lost
+initial response with the same idempotency key rather than starting a second
+job. Polling gives up after 300 seconds, but an admitted job continues after
+that timeout, an interruption, or a client disconnection; the command reports
+the job ID so you can inspect it before issuing another. Each invocation
+submits a fresh idempotency key, so repeating a command after completion
+starts another job.
 
 ![Mine blocks on the local Regtest network](docs/images/mine.png)
 
