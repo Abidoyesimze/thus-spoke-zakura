@@ -703,9 +703,14 @@ impl Runtime {
                 );
             }
             // A stalled poll must not itself delay Ctrl+C or the overall
-            // deadline, so each attempt is capped well under either: a
-            // timeout here just loops back to the shutdown and deadline
-            // checks above instead of blocking on one slow request.
+            // deadline, so each attempt is capped well under either. The job
+            // is the server's; a send-level failure here (a timeout, a reset
+            // or dropped connection, anything that is not an actual response
+            // from the server) says nothing about whether it is still
+            // running, so it loops back to the shutdown and deadline checks
+            // above and polls again rather than failing the whole command.
+            // Only a real response, even an error one, is treated as
+            // authoritative and handled by `decode_response`.
             let attempt_timeout = MINE_POLL_ATTEMPT_TIMEOUT.min(deadline.remaining());
             match client
                 .get(format!("{dashboard}/api/v1/mining/jobs/{}", job.id))
@@ -716,11 +721,7 @@ impl Runtime {
                     job = decode_response(response)
                         .with_context(|| format!("checking mining job {} on {name}", job.id))?;
                 }
-                Err(error) if error.is_timeout() => continue,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("checking mining job {} on {name}", job.id));
-                }
+                Err(_) => continue,
             }
         }
 
@@ -5978,6 +5979,27 @@ mod tests {
         (dir, runtime)
     }
 
+    /// Reads and discards one HTTP request from a raw socket, for tests that
+    /// hand-write responses (or deliberately withhold them) on a real
+    /// connection instead of going through `serve`.
+    fn drain_request(stream: &mut std::net::TcpStream) {
+        use std::io::{BufRead, Read};
+        let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+    }
+
     #[test]
     fn mine_polls_until_completion_and_reports_the_confirmed_count() {
         let (url, requests) = serve(vec![
@@ -6191,26 +6213,9 @@ mod tests {
 
     #[test]
     fn a_stalled_poll_does_not_block_the_next_attempt() {
-        use std::io::{BufRead, Read, Write};
+        use std::io::Write;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
-
-        fn drain_request(stream: &mut std::net::TcpStream) {
-            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-            let mut length = 0;
-            loop {
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                if line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-        }
 
         thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -6226,8 +6231,9 @@ mod tests {
 
             // First poll: accept and read the request, then hold the
             // connection open without responding until well past the
-            // per-attempt timeout, so reqwest's own timeout fires rather
-            // than a connection error.
+            // per-attempt timeout. Whether the client ultimately reports
+            // this as its own timeout or as a reset connection is platform
+            // dependent; either is handled the same way.
             let (mut stalled, _) = listener.accept().unwrap();
             drain_request(&mut stalled);
             thread::sleep(MINE_POLL_ATTEMPT_TIMEOUT + Duration::from_millis(500));
@@ -6258,6 +6264,64 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(10),
             "a single stalled poll must not wait anywhere close to the 300s deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_dropped_poll_connection_is_retried_within_the_deadline() {
+        // Distinct from the stalled-poll case above: here the connection is
+        // reset immediately, with no delay at all, rather than held open
+        // past the attempt timeout. The job may still be running on the
+        // server; a disconnected poll must not be treated as the job itself
+        // having failed.
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            drain_request(&mut stream);
+            let body = r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#;
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            // First poll: accept, read the request, then drop the
+            // connection immediately without writing anything at all.
+            let (mut dropped, _) = listener.accept().unwrap();
+            drain_request(&mut dropped);
+            drop(dropped);
+
+            // Second poll: respond normally.
+            let (mut stream, _) = listener.accept().unwrap();
+            drain_request(&mut stream);
+            let body = r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+        let started = std::time::Instant::now();
+        runtime
+            .mine_with(&alpha, &url, &client, 1, false, &shutdown)
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a dropped poll connection should be retried almost immediately, not after a timeout: {:?}",
             started.elapsed()
         );
     }
