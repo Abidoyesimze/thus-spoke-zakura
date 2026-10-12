@@ -5,7 +5,7 @@ mod runtime;
 mod test_support;
 mod updater;
 
-use std::{process::ExitCode, str::FromStr};
+use std::{ffi::OsString, process::ExitCode, str::FromStr, time::Duration};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -19,8 +19,8 @@ use runtime::{InstanceName, Runtime};
 )]
 struct Cli {
     /// Isolated environment name.
-    #[arg(long, global = true, default_value = "default")]
-    name: InstanceName,
+    #[arg(long, global = true)]
+    name: Option<InstanceName>,
     /// Print machine-readable output where supported.
     #[arg(long, global = true)]
     json: bool,
@@ -37,6 +37,21 @@ enum Command {
         /// Add this many to the default loopback ports. Must be a multiple of 10.
         #[arg(long, default_value_t = 0)]
         port_offset: u16,
+    },
+    /// Wait until an existing environment is settled.
+    Wait {
+        /// Maximum time for settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Run a command in a fresh, settled environment and delete it afterward.
+    Run {
+        /// Maximum time for startup and settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
     /// Build the runtime images from the current source.
     Build {
@@ -205,6 +220,9 @@ impl Pool {
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    if cli.json && matches!(cli.command, Some(Command::Run { .. })) {
+        bail!("--json cannot be used with `run`; the child command owns stdout");
+    }
     if let Some(Command::Update { version, check }) = &cli.command {
         return updater::run(version.as_deref(), *check, cli.json);
     }
@@ -216,6 +234,8 @@ fn main() -> Result<ExitCode> {
     {
         println!("{notice}");
     }
+    let run = matches!(cli.command, Some(Command::Run { .. }));
+    let name = resolve_name(cli.name, run);
     let runtime = Runtime::discover()?;
     match cli.command.unwrap_or(Command::Start {
         no_open: false,
@@ -224,32 +244,32 @@ fn main() -> Result<ExitCode> {
         Command::Start {
             no_open,
             port_offset,
-        } => runtime.start(&cli.name, no_open, cli.json, port_offset),
+        } => runtime.start(&name, no_open, cli.json, port_offset),
+        Command::Wait { timeout } => runtime.wait(&name, Duration::from_secs(timeout), cli.json),
+        Command::Run { timeout, command } => {
+            return runtime
+                .run(&name, Duration::from_secs(timeout), &command)
+                .map(ExitCode::from);
+        }
         Command::Build { dev } => runtime.build(dev),
         Command::Pull => runtime.pull(),
         Command::Update { .. } => unreachable!("update is handled before runtime discovery"),
         Command::Uninstall => unreachable!("uninstall is handled before runtime discovery"),
-        Command::Status => runtime.status(&cli.name, cli.json),
-        Command::Open => runtime.open(&cli.name),
-        Command::Endpoints => runtime.endpoints(&cli.name, cli.json),
-        Command::Mine { blocks } => runtime.mine(&cli.name, blocks, cli.json),
+        Command::Status => runtime.status(&name, cli.json),
+        Command::Open => runtime.open(&name),
+        Command::Endpoints => runtime.endpoints(&name, cli.json),
+        Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
         Command::Faucet { address, amount } => {
-            runtime.faucet(&cli.name, &address, amount.zatoshi(), cli.json)
+            runtime.faucet(&name, &address, amount.zatoshi(), cli.json)
         }
         Command::Wallet { action } => match action {
-            WalletCommand::Balances => runtime.wallet_balances(&cli.name, cli.json),
+            WalletCommand::Balances => runtime.wallet_balances(&name, cli.json),
             WalletCommand::Faucet {
                 accounts,
                 amount,
                 pool,
-            } => runtime.wallet_faucet(
-                &cli.name,
-                &accounts,
-                amount.zatoshi(),
-                pool.as_str(),
-                cli.json,
-            ),
-            WalletCommand::Send(args) => send(&runtime, &cli.name, args, cli.json),
+            } => runtime.wallet_faucet(&name, &accounts, amount.zatoshi(), pool.as_str(), cli.json),
+            WalletCommand::Send(args) => send(&runtime, &name, args, cli.json),
             WalletCommand::Shield {
                 from,
                 to,
@@ -257,7 +277,7 @@ fn main() -> Result<ExitCode> {
                 memo,
             } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
                     to,
@@ -270,7 +290,7 @@ fn main() -> Result<ExitCode> {
             ),
             WalletCommand::Unshield { from, to, amount } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
                     to,
@@ -287,9 +307,9 @@ fn main() -> Result<ExitCode> {
             follow,
             tail,
             head,
-        } => runtime.logs(&cli.name, service.as_deref(), follow, tail, head),
-        Command::Stop => runtime.stop(&cli.name),
-        Command::Reset { force } => runtime.reset(&cli.name, force),
+        } => runtime.logs(&name, service.as_deref(), follow, tail, head),
+        Command::Stop => runtime.stop(&name),
+        Command::Reset { force } => runtime.reset(&name, force),
         Command::List => runtime.list(cli.json),
         Command::Doctor => runtime.doctor(cli.json),
     }?;
@@ -320,6 +340,22 @@ fn send(runtime: &Runtime, name: &InstanceName, args: SendArgs, json: bool) -> R
         args.memo.as_deref(),
         json,
     )
+}
+
+fn resolve_name(name: Option<InstanceName>, run: bool) -> InstanceName {
+    name.unwrap_or_else(|| {
+        if run {
+            generated_run_name()
+        } else {
+            "default".parse().expect("default instance name is valid")
+        }
+    })
+}
+
+fn generated_run_name() -> InstanceName {
+    format!("run-{}", uuid::Uuid::new_v4().simple())
+        .parse()
+        .expect("UUID-based run instance name is valid")
 }
 
 fn should_check_for_updates(cli: &Cli) -> bool {
@@ -434,11 +470,11 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Mine { blocks: 10 })));
 
         let cli = Cli::try_parse_from(["ths", "--name", "alice", "mine", "3"]).unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
         assert!(matches!(cli.command, Some(Command::Mine { blocks: 3 })));
 
         let cli = Cli::try_parse_from(["ths", "mine", "3", "--name", "alice"]).unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
 
         assert!(Cli::try_parse_from(["ths", "mine", "0"]).is_err());
         assert!(Cli::try_parse_from(["ths", "mine", "10001"]).is_err());
@@ -462,7 +498,7 @@ mod tests {
             "alice",
         ])
         .unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
         assert!(matches!(
             cli.command,
             Some(Command::Faucet {
@@ -536,6 +572,30 @@ mod tests {
                 "accepted {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn parses_wait_and_run_without_reusing_the_default_name() {
+        let run = Cli::try_parse_from(["ths", "run", "--", "npm", "test"]).unwrap();
+        assert!(run.name.is_none());
+        assert!(matches!(
+            run.command,
+            Some(Command::Run { timeout: 120, command })
+                if command == [OsString::from("npm"), OsString::from("test")]
+        ));
+
+        let wait = Cli::try_parse_from(["ths", "--name", "api", "wait", "--timeout", "7"]).unwrap();
+        assert_eq!(wait.name.as_ref().unwrap().to_string(), "api");
+        assert!(matches!(wait.command, Some(Command::Wait { timeout: 7 })));
+
+        assert!(Cli::try_parse_from(["ths", "--json", "run", "--", "true"]).is_ok());
+
+        let first = generated_run_name();
+        let second = generated_run_name();
+        assert_ne!(first.to_string(), second.to_string());
+        assert!(first.to_string().starts_with("run-"));
+
+        assert_eq!(resolve_name(None, false).to_string(), "default");
     }
 
     #[test]

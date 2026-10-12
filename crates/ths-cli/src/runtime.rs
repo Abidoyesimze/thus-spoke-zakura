@@ -1,19 +1,20 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
+    ffi::OsString,
     fmt::{self, Display},
     fs::{self, File, OpenOptions, TryLockError},
     io::{BufRead, BufReader},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     str::FromStr,
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicI32, Ordering},
         mpsc::{self, RecvTimeoutError, TryRecvError},
     },
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::lifecycle::{
@@ -180,6 +181,16 @@ struct WalletSyncStatus {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RuntimeStatus {
+    node_height: Option<u64>,
+    lightwalletd_height: Option<u64>,
+    wallet_scanned_height: Option<u64>,
+    wallet_sync_state: String,
+    settled: bool,
+    settlement_blocker: Option<String>,
+}
+
 pub struct Runtime {
     root: PathBuf,
 }
@@ -297,6 +308,16 @@ impl Drop for FaucetJournal {
     }
 }
 
+struct InstanceLock(File);
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            eprintln!("could not release the instance lock: {error}");
+        }
+    }
+}
+
 impl Runtime {
     pub fn discover() -> Result<Self> {
         let dirs = ProjectDirs::from("com", "zakura", "thus-spoke-zakura")
@@ -389,6 +410,81 @@ impl Runtime {
             no_open,
             json,
             port_offset,
+            &DockerHost,
+            &shutdown,
+            &context,
+        )
+    }
+
+    pub fn wait(&self, name: &InstanceName, timeout: Duration, json: bool) -> Result<()> {
+        let shutdown = Shutdown::install()?;
+        let endpoints = self.read_instance(name)?.endpoints;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("settlement timeout is too large")?;
+        let status = wait_until_settled(
+            &|remaining| runtime_status(&endpoints, remaining),
+            deadline,
+            Duration::from_millis(750),
+            &shutdown,
+            !json,
+        )?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        } else {
+            println!(
+                "{name} is settled at node {}, lightwalletd {}, wallet {}.",
+                display_height(status.node_height),
+                display_height(status.lightwalletd_height),
+                display_height(status.wallet_scanned_height)
+            );
+        }
+        Ok(())
+    }
+
+    pub fn run(&self, name: &InstanceName, timeout: Duration, command: &[OsString]) -> Result<u8> {
+        let shutdown = Shutdown::install()?;
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        let deadline = Deadline(
+            Instant::now()
+                .checked_add(timeout)
+                .context("startup timeout is too large")?,
+        );
+        context.overall_deadline = Some(deadline);
+        let prepared = {
+            let requested = || shutdown.try_interrupted();
+            let docker = LifecycleDocker::production(
+                &context,
+                Some(deadline),
+                context.policy.startup_docker,
+                Cancellation::Observe(&requested),
+            );
+            (|| {
+                startup_docker_reachable(&docker)?;
+                for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
+                    startup_require_image(&docker, &image)?;
+                }
+                Ok(())
+            })()
+        };
+        if let Err(error) = prepared {
+            let failures = context.finish_helpers(Deadline::after(context.policy.cleanup));
+            if failures.is_empty() {
+                return Err(error);
+            }
+            return Err(anyhow!(
+                "{error:#}; helper cleanup: {}",
+                failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        self.run_with_policy(
+            name,
+            command,
+            &std::env::current_dir().context("reading the current directory")?,
             &DockerHost,
             &shutdown,
             &context,
@@ -714,6 +810,7 @@ impl Runtime {
     }
 
     fn verified_cleanup(&self, name: &InstanceName) -> Result<CleanupReport> {
+        let _lock = self.lock_instance(name)?;
         let policy = LifecyclePolicy::default();
         let context = LifecycleContext::new(policy);
         let deadline = Deadline::after(policy.cleanup);
@@ -755,6 +852,24 @@ impl Runtime {
 
     fn instance_dir(&self, name: &InstanceName) -> PathBuf {
         self.root.join(name.to_string())
+    }
+
+    fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
+        let lock_dir = self.root.join(".locks");
+        fs::create_dir_all(&lock_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_dir.join(format!("{name}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(InstanceLock(file)),
+            Err(TryLockError::WouldBlock) => {
+                bail!("environment {name} is already in use by another command")
+            }
+            Err(TryLockError::Error(error)) => Err(error).context("locking environment"),
+        }
     }
     fn write_instance(&self, name: &InstanceName, endpoints: &Endpoints) -> Result<()> {
         let instance = Instance {
@@ -1318,6 +1433,7 @@ impl DockerResourceCommands for DockerCli {
 struct LifecycleContext {
     policy: LifecyclePolicy,
     helpers: RefCell<HelperSet>,
+    overall_deadline: Option<Deadline>,
 }
 
 impl LifecycleContext {
@@ -1325,7 +1441,15 @@ impl LifecycleContext {
         Self {
             policy,
             helpers: RefCell::new(HelperSet::new()),
+            overall_deadline: None,
         }
+    }
+
+    fn startup_deadline(&self, duration: Duration) -> Deadline {
+        self.overall_deadline.map_or_else(
+            || Deadline::after(duration),
+            |deadline| deadline.clipped(duration),
+        )
     }
 
     fn finish_helpers(&self, deadline: Deadline) -> Vec<CommandFailure> {
@@ -2200,6 +2324,7 @@ fn build_project_images(dev: bool) -> Result<()> {
 }
 struct Shutdown {
     flag: Arc<AtomicBool>,
+    signal: Arc<AtomicI32>,
     /// Lets a `DeletionMonitor` end `wait` through the same channel as Ctrl+C.
     sender: mpsc::Sender<Ended>,
     receiver: mpsc::Receiver<Ended>,
@@ -2211,6 +2336,7 @@ impl Shutdown {
         let (sender, receiver) = mpsc::channel();
         let shutdown = Self {
             flag: Arc::new(AtomicBool::new(false)),
+            signal: Arc::new(AtomicI32::new(0)),
             sender: sender.clone(),
             receiver,
         };
@@ -2220,15 +2346,27 @@ impl Shutdown {
     fn install() -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let flag = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(AtomicI32::new(0));
         let handler_flag = flag.clone();
+        let handler_signal = signal.clone();
         let handler_sender = sender.clone();
-        ctrlc::set_handler(move || {
-            handler_flag.store(true, Ordering::SeqCst);
-            let _ = handler_sender.send(Ended::Interrupted);
-        })
-        .context("installing the shutdown signal handler")?;
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])
+        .context("installing shutdown signal handlers")?;
+        thread::spawn(move || {
+            for received in signals.forever() {
+                handler_signal.store(received, Ordering::SeqCst);
+                handler_flag.store(true, Ordering::SeqCst);
+                if handler_sender.send(Ended::Interrupted).is_err() {
+                    break;
+                }
+            }
+        });
         Ok(Self {
             flag,
+            signal,
             sender,
             receiver,
         })
@@ -2240,6 +2378,19 @@ impl Shutdown {
             self.flag.store(true, Ordering::SeqCst);
         }
         self.flag.load(Ordering::SeqCst)
+    }
+
+    fn received_signal(&self) -> Option<i32> {
+        if self.try_interrupted() {
+            let signal = self.signal.load(Ordering::SeqCst);
+            Some(if signal == 0 {
+                signal_hook::consts::SIGTERM
+            } else {
+                signal
+            })
+        } else {
+            None
+        }
     }
 
     fn check(&self) -> Result<()> {
@@ -2469,6 +2620,38 @@ impl Drop for DeletionMonitor {
 }
 
 trait StartHost {
+    fn instance_exists(
+        &self,
+        runtime: &Runtime,
+        name: &InstanceName,
+        _shutdown: &Shutdown,
+        _context: &LifecycleContext,
+    ) -> Result<bool> {
+        Ok(runtime.instance_dir(name).exists())
+    }
+    fn runtime_status(&self, endpoints: &Endpoints, timeout: Duration) -> Result<RuntimeStatus> {
+        runtime_status(endpoints, timeout)
+    }
+    fn run_child(
+        &self,
+        command: &[OsString],
+        current_dir: &Path,
+        name: &InstanceName,
+        endpoints: &Endpoints,
+        shutdown: &Shutdown,
+    ) -> Result<ChildOutcome> {
+        run_child(
+            command,
+            current_dir,
+            name,
+            endpoints,
+            shutdown,
+            Duration::from_secs(5),
+        )
+    }
+    fn diagnostics(&self, _name: &InstanceName, _context: &LifecycleContext) -> String {
+        String::new()
+    }
     fn delete(
         &self,
         runtime: &Runtime,
@@ -2511,6 +2694,77 @@ trait StartHost {
 struct DockerHost;
 
 impl StartHost for DockerHost {
+    fn diagnostics(&self, name: &InstanceName, context: &LifecycleContext) -> String {
+        let deadline = Deadline::after(Duration::from_secs(5));
+        let docker = LifecycleDocker::production(
+            context,
+            Some(deadline),
+            context.policy.readiness_docker,
+            Cancellation::Ignore,
+        );
+        ["app", "zakura", "lightwalletd"]
+            .map(|service| {
+                let container = format!("{}-{service}", prefix(name));
+                let logs = readiness::diagnostic_logs(&docker, &container)
+                    .unwrap_or_else(|error| format!("could not read logs: {error:#}"));
+                format!("\n--- {service} ---\n{logs}")
+            })
+            .join("")
+    }
+
+    fn instance_exists(
+        &self,
+        runtime: &Runtime,
+        name: &InstanceName,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+    ) -> Result<bool> {
+        if runtime.instance_dir(name).exists() {
+            return Ok(true);
+        }
+        let requested = || shutdown.try_interrupted();
+        let docker = LifecycleDocker::production(
+            context,
+            context.overall_deadline,
+            context.policy.startup_docker,
+            Cancellation::Observe(&requested),
+        );
+        let label_filter = format!("label={}", label(name));
+        let network_name = format!("name=^{}$", prefix(name));
+        for args in [
+            vec![
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.ID}}",
+            ],
+            vec![
+                "volume",
+                "ls",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.Name}}",
+            ],
+            vec![
+                "network",
+                "ls",
+                "--filter",
+                &network_name,
+                "--format",
+                "{{.Name}}",
+            ],
+        ] {
+            if !docker.output(&args)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn delete(
         &self,
         runtime: &Runtime,
@@ -2545,7 +2799,7 @@ impl StartHost for DockerHost {
         let requested = || shutdown.try_interrupted();
         let docker = LifecycleDocker::production(
             context,
-            None,
+            context.overall_deadline,
             context.policy.startup_docker,
             Cancellation::Observe(&requested),
         );
@@ -2558,7 +2812,7 @@ impl StartHost for DockerHost {
         require_free_loopback(ports.p2p)?;
         require_free_loopback(ports.lightwalletd)?;
         shutdown.check()?;
-        let network_budget = Deadline::after(context.policy.startup_docker);
+        let network_budget = context.startup_deadline(context.policy.startup_docker);
         let network = ensure_network_with(
             &prefix,
             name,
@@ -2569,7 +2823,7 @@ impl StartHost for DockerHost {
         shutdown.check()?;
         let mut volumes = Vec::new();
         for suffix in ["chain", "wallet", "lightwalletd", "config"] {
-            let budget = Deadline::after(context.policy.startup_docker);
+            let budget = context.startup_deadline(context.policy.startup_docker);
             volumes.push(ensure_volume_with(
                 &format!("{prefix}-{suffix}"),
                 name,
@@ -2580,7 +2834,7 @@ impl StartHost for DockerHost {
             shutdown.check()?;
         }
         let init_name = format!("{prefix}-init");
-        let init_budget = Deadline::after(context.policy.startup_docker);
+        let init_budget = context.startup_deadline(context.policy.startup_docker);
         let init_docker = docker.scoped(init_budget, context.policy.startup_docker);
         if owned_resource(&init_docker, "container", &init_name, name)?.is_none() {
             let app = app_image();
@@ -2610,7 +2864,7 @@ impl StartHost for DockerHost {
                 ],
             )?;
             shutdown.check()?;
-            let start_budget = Deadline::after(context.policy.initialization);
+            let start_budget = context.startup_deadline(context.policy.initialization);
             let starter = docker.scoped(start_budget, context.policy.initialization);
             let index = journal.begin(
                 recovery::ResourceRef {
@@ -2631,7 +2885,7 @@ impl StartHost for DockerHost {
             )?;
             shutdown.check()?;
         }
-        let zakura_budget = Deadline::after(context.policy.startup_docker);
+        let zakura_budget = context.startup_deadline(context.policy.startup_docker);
         let zakura_id = ensure_zakura(
             &prefix,
             name,
@@ -2642,7 +2896,7 @@ impl StartHost for DockerHost {
             vec![network.clone()],
         )?;
         shutdown.check()?;
-        let lightwalletd_budget = Deadline::after(context.policy.startup_docker);
+        let lightwalletd_budget = context.startup_deadline(context.policy.startup_docker);
         let lightwalletd_id = ensure_lightwalletd(
             &prefix,
             name,
@@ -2653,7 +2907,7 @@ impl StartHost for DockerHost {
             vec![network.clone()],
         )?;
         shutdown.check()?;
-        let zakura_start = Deadline::after(context.policy.startup_docker);
+        let zakura_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
             &zakura_id,
             &format!("{prefix}-zakura"),
@@ -2670,7 +2924,7 @@ impl StartHost for DockerHost {
                 "18232/tcp",
             )?
         );
-        let tip_deadline = Deadline::after(context.policy.readiness);
+        let tip_deadline = context.startup_deadline(context.policy.readiness);
         readiness::wait_for_zakura_tip(
             &zakura_rpc,
             &zakura_id,
@@ -2679,7 +2933,7 @@ impl StartHost for DockerHost {
             &context.policy,
             &docker.scoped(tip_deadline, context.policy.readiness_docker),
         )?;
-        let lightwalletd_start = Deadline::after(context.policy.startup_docker);
+        let lightwalletd_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
             &lightwalletd_id,
             &format!("{prefix}-lightwalletd"),
@@ -2688,7 +2942,7 @@ impl StartHost for DockerHost {
             lightwalletd_start,
         )?;
         shutdown.check()?;
-        let app_budget = Deadline::after(context.policy.startup_docker);
+        let app_budget = context.startup_deadline(context.policy.startup_docker);
         let app_container = ensure_app(
             &prefix,
             name,
@@ -2699,7 +2953,7 @@ impl StartHost for DockerHost {
             vec![network],
         )?;
         shutdown.check()?;
-        let app_start = Deadline::after(context.policy.startup_docker);
+        let app_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
             &app_container.id,
             &format!("{prefix}-app"),
@@ -2725,7 +2979,7 @@ impl StartHost for DockerHost {
         context: &LifecycleContext,
     ) -> Result<()> {
         let requested = || shutdown.try_interrupted();
-        let deadline = Deadline::after(context.policy.readiness);
+        let deadline = context.startup_deadline(context.policy.readiness);
         let docker = LifecycleDocker::production(
             context,
             Some(deadline),
@@ -2827,6 +3081,7 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<()> {
         host_ports(port_offset)?;
+        let mut lifecycle = Some(self.lock_instance(name)?);
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
@@ -2871,6 +3126,7 @@ impl Runtime {
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
             }
+            drop(lifecycle.take());
             host.wait_for_shutdown(&allocated.app_container, shutdown)
         })();
         cleanup.armed = false;
@@ -2895,6 +3151,303 @@ impl Runtime {
             (Err(primary), Err(error)) => Err(anyhow!("{primary:#}\n{error:#}")),
         }
     }
+
+    fn run_with_policy(
+        &self,
+        name: &InstanceName,
+        command: &[OsString],
+        current_dir: &Path,
+        host: &dyn StartHost,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+    ) -> Result<u8> {
+        host_ports(0)?;
+        let _lifecycle = self.lock_instance(name)?;
+        let deadline = context.overall_deadline.context("missing run deadline")?;
+        if deadline.expired() {
+            bail!("environment did not start before the timeout");
+        }
+        if host.instance_exists(self, name, shutdown, context)? {
+            bail!("environment {name} already exists");
+        }
+        if deadline.expired() {
+            bail!("environment did not start before the timeout");
+        }
+        fs::create_dir_all(&self.root)?;
+        fs::create_dir(self.instance_dir(name))
+            .with_context(|| format!("reserving fresh environment {name}"))?;
+        let mut cleanup = CleanupOnDrop {
+            runtime: self,
+            name,
+            host,
+            context,
+            armed: true,
+        };
+        println!("Preparing a fresh {name} environment…");
+        let primary = (|| {
+            let mut journal = recovery::RecoveryJournal::create(self.recovery_path(name), name)?;
+            let allocated = host.allocate(self, name, shutdown, 0, context, &mut journal)?;
+            if allocated.zakura_container_id.is_empty()
+                || allocated
+                    .resources
+                    .iter()
+                    .any(|resource| resource.name.is_empty())
+            {
+                bail!("startup did not record the allocated resource identities");
+            }
+            shutdown.check()?;
+            if deadline.expired() {
+                bail!("environment did not start before the timeout");
+            }
+            host.wait_ready(&allocated, shutdown, context)?;
+            shutdown.check()?;
+            if deadline.expired() {
+                bail!("environment did not become ready before the timeout");
+            }
+            wait_until_settled(
+                &|remaining| host.runtime_status(&allocated.endpoints, remaining),
+                deadline.0,
+                Duration::from_millis(750),
+                shutdown,
+                true,
+            )?;
+            println!("{name} is settled; running child command…");
+            host.run_child(command, current_dir, name, &allocated.endpoints, shutdown)
+        })();
+        if matches!(&primary, Ok(ChildOutcome::Exited(code)) if *code != 0)
+            || matches!(&primary, Ok(ChildOutcome::Signaled))
+        {
+            let diagnostics = host.diagnostics(name, context);
+            if !diagnostics.is_empty() {
+                eprintln!("Run diagnostics:{diagnostics}");
+            }
+        }
+        cleanup.armed = false;
+        let cleaned = host
+            .delete_partial(self, name, context, Deadline::after(context.policy.cleanup))
+            .and_then(CleanupReport::into_result);
+        match (primary, cleaned) {
+            (Ok(ChildOutcome::Exited(code)), Ok(())) => Ok(code),
+            (Ok(ChildOutcome::Signaled), Ok(())) => Ok(1),
+            (Err(primary), Ok(())) => Err(primary),
+            (Ok(ChildOutcome::Exited(0)), Err(cleanup)) => Err(cleanup),
+            (Ok(ChildOutcome::Exited(code)), Err(cleanup)) => {
+                eprintln!("could not delete {name}: {cleanup:#}");
+                Ok(code)
+            }
+            (Ok(ChildOutcome::Signaled), Err(cleanup)) => {
+                eprintln!("could not delete {name}: {cleanup:#}");
+                Ok(1)
+            }
+            (Err(primary), Err(cleanup)) => Err(anyhow!("{primary:#}\n{cleanup:#}")),
+        }
+    }
+}
+
+fn display_height(height: Option<u64>) -> String {
+    height.map_or_else(|| "unavailable".to_owned(), |height| height.to_string())
+}
+
+fn wait_until_settled(
+    read_status: &dyn Fn(Duration) -> Result<RuntimeStatus>,
+    deadline: Instant,
+    poll_interval: Duration,
+    shutdown: &Shutdown,
+    progress: bool,
+) -> Result<RuntimeStatus> {
+    let mut last = None;
+    let mut last_error = None;
+    loop {
+        shutdown.check()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let mut detail = last.as_ref().map_or_else(
+                || "no status received".to_owned(),
+                |status: &RuntimeStatus| {
+                    format!(
+                        "node {}, lightwalletd {}, wallet {}, blocker {}",
+                        display_height(status.node_height),
+                        display_height(status.lightwalletd_height),
+                        display_height(status.wallet_scanned_height),
+                        status.settlement_blocker.as_deref().unwrap_or("unknown")
+                    )
+                },
+            );
+            if let Some(error) = last_error {
+                detail.push_str(&format!("; last status read failed: {error}"));
+            }
+            bail!("environment did not settle before the timeout ({detail})");
+        }
+        let status = match read_status(remaining.min(Duration::from_secs(5))) {
+            Ok(status) => status,
+            Err(error) => {
+                let error = format!("{error:#}");
+                if progress && last_error.as_deref() != Some(error.as_str()) {
+                    eprintln!("Waiting: runtime status unavailable ({error})");
+                }
+                last_error = Some(error);
+                shutdown.wait_timeout(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(poll_interval),
+                )?;
+                continue;
+            }
+        };
+        last_error = None;
+        if Instant::now() >= deadline {
+            continue;
+        }
+        if status.settled {
+            return Ok(status);
+        }
+        if progress && last.as_ref() != Some(&status) {
+            eprintln!(
+                "Waiting: node {}, lightwalletd {}, wallet {} ({})",
+                display_height(status.node_height),
+                display_height(status.lightwalletd_height),
+                display_height(status.wallet_scanned_height),
+                status
+                    .settlement_blocker
+                    .as_deref()
+                    .unwrap_or("not settled")
+            );
+        }
+        last = Some(status);
+        shutdown.wait_timeout(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(poll_interval),
+        )?;
+    }
+}
+
+fn runtime_status(endpoints: &Endpoints, timeout: Duration) -> Result<RuntimeStatus> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(format!("{}/api/v1/status", endpoints.dashboard))
+        .send()
+        .context("reading runtime status")?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("runtime status returned {status}");
+    }
+    response.json().context("decoding runtime status")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildOutcome {
+    Exited(u8),
+    Signaled,
+}
+
+fn run_child(
+    command: &[OsString],
+    current_dir: &Path,
+    name: &InstanceName,
+    endpoints: &Endpoints,
+    shutdown: &Shutdown,
+    shutdown_grace: Duration,
+) -> Result<ChildOutcome> {
+    let (program, arguments) = command
+        .split_first()
+        .context("run requires a child command")?;
+    let mut process = Command::new(program);
+    process
+        .args(arguments)
+        .current_dir(current_dir)
+        .env("THS_INSTANCE", name.to_string())
+        .env("THS_NETWORK", "regtest")
+        .env("THS_API_URL", &endpoints.dashboard)
+        .env("THS_ZAKURA_RPC_URL", &endpoints.rpc)
+        .env("THS_LIGHTWALLETD_URL", &endpoints.lightwalletd)
+        .env("THS_LIGHTWALLETD_TLS", "false")
+        .env("THS_P2P_ADDR", &endpoints.p2p);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        process.process_group(0);
+    }
+    let mut child = process
+        .spawn()
+        .with_context(|| format!("starting child command {}", program.to_string_lossy()))?;
+    loop {
+        if let Some(status) = child.try_wait().context("waiting for child command")? {
+            return Ok(
+                match status.code().and_then(|code| u8::try_from(code).ok()) {
+                    Some(code) => ChildOutcome::Exited(code),
+                    None => ChildOutcome::Signaled,
+                },
+            );
+        }
+        if let Some(signal) = shutdown.received_signal() {
+            terminate_child_group(&mut child, signal, shutdown_grace)?;
+            return Ok(ChildOutcome::Signaled);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn terminate_child_group(
+    child: &mut std::process::Child,
+    signal: i32,
+    grace: Duration,
+) -> Result<()> {
+    use nix::{
+        errno::Errno,
+        sys::signal::{Signal, killpg},
+        unistd::Pid,
+    };
+
+    let pgid = Pid::from_raw(i32::try_from(child.id()).context("child process ID is too large")?);
+    let signal = Signal::try_from(signal).context("unsupported shutdown signal")?;
+    if let Err(error) = killpg(pgid, signal)
+        && error != Errno::ESRCH
+    {
+        return Err(error).context("forwarding shutdown signal to child process group");
+    }
+
+    let deadline = Instant::now() + grace;
+    let mut reaped = false;
+    loop {
+        if !reaped
+            && child
+                .try_wait()
+                .context("waiting for child command")?
+                .is_some()
+        {
+            reaped = true;
+        }
+        match killpg(pgid, None) {
+            Err(Errno::ESRCH) => break,
+            Ok(()) | Err(Errno::EPERM) => {}
+            Err(error) => return Err(error).context("checking child process group"),
+        }
+        if Instant::now() >= deadline {
+            killpg(pgid, Signal::SIGKILL)
+                .or_else(|error| (error == Errno::ESRCH).then_some(()).ok_or(error))
+                .context("force-terminating child process group")?;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !reaped {
+        child.wait().context("reaping child command")?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn terminate_child_group(
+    child: &mut std::process::Child,
+    _signal: i32,
+    _grace: Duration,
+) -> Result<()> {
+    child.kill().context("terminating child command")?;
+    child.wait().context("reaping child command")?;
+    Ok(())
 }
 
 /// Lists only running containers, so a stopped or missing one is `false` rather than an error.
@@ -4288,6 +4841,8 @@ mod tests {
         interrupt_before_ready: bool,
         final_cleanup_failure: Option<String>,
         deleted_elsewhere: bool,
+        allocate_delay: Duration,
+        run_status: Option<RuntimeStatus>,
     }
 
     impl RecordingHost {
@@ -4303,6 +4858,8 @@ mod tests {
                     interrupt_before_ready: false,
                     final_cleanup_failure: None,
                     deleted_elsewhere: false,
+                    allocate_delay: Duration::ZERO,
+                    run_status: None,
                 },
                 events,
             )
@@ -4323,6 +4880,29 @@ mod tests {
     }
 
     impl StartHost for RecordingHost {
+        fn runtime_status(
+            &self,
+            _endpoints: &Endpoints,
+            _timeout: Duration,
+        ) -> Result<RuntimeStatus> {
+            self.push("runtime_status");
+            self.run_status
+                .clone()
+                .context("no recorded runtime status")
+        }
+
+        fn run_child(
+            &self,
+            _command: &[OsString],
+            _current_dir: &Path,
+            name: &InstanceName,
+            _endpoints: &Endpoints,
+            _shutdown: &Shutdown,
+        ) -> Result<ChildOutcome> {
+            self.push(&format!("child:{name}"));
+            Ok(ChildOutcome::Exited(42))
+        }
+
         fn delete(
             &self,
             runtime: &Runtime,
@@ -4352,7 +4932,9 @@ mod tests {
             {
                 return runtime.cleanup_with(name, docker, false, &context.policy);
             }
-            if later && let Some(message) = &self.final_cleanup_failure {
+            if (later || self.run_status.is_some())
+                && let Some(message) = &self.final_cleanup_failure
+            {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Uncertain,
                     failures: vec![message.clone()],
@@ -4394,6 +4976,7 @@ mod tests {
             _journal: &mut recovery::RecoveryJournal,
         ) -> Result<AllocatedInstance> {
             self.push(&format!("allocate:{name}"));
+            std::thread::sleep(self.allocate_delay);
             shutdown.check()?;
             Ok(AllocatedInstance {
                 endpoints: Endpoints {
@@ -4472,6 +5055,258 @@ mod tests {
 
     fn name(value: &str) -> InstanceName {
         value.parse().unwrap()
+    }
+
+    #[test]
+    fn run_timeout_after_allocation_skips_child_and_cleans_its_instance() {
+        let (mut host, events) = RecordingHost::new();
+        host.allocate_delay = Duration::from_millis(80);
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        context.overall_deadline = Some(Deadline::after(Duration::from_millis(30)));
+        let (_sender, shutdown) = Shutdown::channel();
+        let runtime = runtime_for_tests();
+        let error = runtime
+            .run_with_policy(
+                &name("alpha"),
+                &[OsString::from("true")],
+                &runtime.root,
+                &host,
+                &shutdown,
+                &context,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+        let events = events.lock().unwrap();
+        assert!(events.contains(&"allocate:alpha".to_owned()));
+        assert!(events.contains(&"delete:alpha".to_owned()));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event == "wait_ready" || event.starts_with("child:"))
+        );
+    }
+
+    #[test]
+    fn settlement_does_not_accept_a_late_status_response() {
+        let (_sender, shutdown) = Shutdown::channel();
+        let started = Instant::now();
+        let error = wait_until_settled(
+            &|_| {
+                std::thread::sleep(Duration::from_millis(80));
+                Ok(RuntimeStatus {
+                    node_height: Some(1),
+                    lightwalletd_height: Some(1),
+                    wallet_scanned_height: Some(1),
+                    wallet_sync_state: "ready".into(),
+                    settled: true,
+                    settlement_blocker: None,
+                })
+            },
+            started + Duration::from_millis(30),
+            Duration::from_millis(750),
+            &shutdown,
+            false,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("timeout"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_millis(250));
+    }
+
+    #[test]
+    fn run_preserves_child_exit_code_and_cleans_after_settlement() {
+        let (mut host, events) = RecordingHost::new();
+        host.run_status = Some(RuntimeStatus {
+            node_height: Some(105),
+            lightwalletd_height: Some(105),
+            wallet_scanned_height: Some(105),
+            wallet_sync_state: "ready".into(),
+            settled: true,
+            settlement_blocker: None,
+        });
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        context.overall_deadline = Some(Deadline::after(Duration::from_secs(1)));
+        let (_sender, shutdown) = Shutdown::channel();
+        let runtime = runtime_for_tests();
+        let code = runtime
+            .run_with_policy(
+                &name("alpha"),
+                &[OsString::from("true")],
+                &runtime.root,
+                &host,
+                &shutdown,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(code, 42);
+        let events = events.lock().unwrap();
+        assert!(events.contains(&"runtime_status".to_owned()));
+        assert!(events.contains(&"child:alpha".to_owned()));
+        assert_eq!(events.last().map(String::as_str), Some("delete:alpha"));
+    }
+
+    #[test]
+    fn failed_cleanup_reports_error_without_replacing_child_exit_code() {
+        let (mut host, _events) = RecordingHost::new();
+        host.run_status = Some(RuntimeStatus {
+            node_height: Some(105),
+            lightwalletd_height: Some(105),
+            wallet_scanned_height: Some(105),
+            wallet_sync_state: "ready".into(),
+            settled: true,
+            settlement_blocker: None,
+        });
+        host.final_cleanup_failure = Some("Docker cleanup failed".into());
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        context.overall_deadline = Some(Deadline::after(Duration::from_secs(1)));
+        let (_sender, shutdown) = Shutdown::channel();
+        let runtime = runtime_for_tests();
+        let code = runtime
+            .run_with_policy(
+                &name("alpha"),
+                &[OsString::from("true")],
+                &runtime.root,
+                &host,
+                &shutdown,
+                &context,
+            )
+            .unwrap();
+        assert_eq!(code, 42);
+    }
+
+    #[test]
+    fn run_refuses_existing_instance_without_cleanup() {
+        let (host, events) = RecordingHost::new();
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        context.overall_deadline = Some(Deadline::after(Duration::from_secs(1)));
+        let (_sender, shutdown) = Shutdown::channel();
+        let runtime = runtime_for_tests();
+        fs::create_dir_all(runtime.instance_dir(&name("alpha"))).unwrap();
+        let error = runtime
+            .run_with_policy(
+                &name("alpha"),
+                &[OsString::from("true")],
+                &runtime.root,
+                &host,
+                &shutdown,
+                &context,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("already exists"));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stop_does_not_delete_an_instance_held_by_run() {
+        let runtime = runtime_for_tests();
+        let lock = runtime.lock_instance(&name("alpha")).unwrap();
+        let error = runtime.stop(&name("alpha")).unwrap_err();
+        assert!(format!("{error:#}").contains("already in use"));
+        drop(lock);
+    }
+
+    #[test]
+    fn child_receives_project_directory_and_regtest_endpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("child-environment");
+        let command = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("{ pwd; env; } > \"$1\""),
+            OsString::from("sh"),
+            output.as_os_str().to_owned(),
+        ];
+        let (_sender, shutdown) = Shutdown::channel();
+        let outcome = run_child(
+            &command,
+            dir.path(),
+            &name("alpha"),
+            &endpoints_for(&host_ports(0).unwrap()),
+            &shutdown,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(outcome, ChildOutcome::Exited(0));
+        let output = fs::read_to_string(output).unwrap();
+        assert_eq!(
+            output.lines().next(),
+            fs::canonicalize(dir.path()).unwrap().to_str()
+        );
+        for expected in [
+            "THS_INSTANCE=alpha",
+            "THS_NETWORK=regtest",
+            "THS_API_URL=http://127.0.0.1:32805",
+            "THS_ZAKURA_RPC_URL=http://127.0.0.1:18232",
+            "THS_LIGHTWALLETD_URL=http://127.0.0.1:9067",
+            "THS_LIGHTWALLETD_TLS=false",
+            "THS_P2P_ADDR=127.0.0.1:18233",
+        ] {
+            assert!(
+                output.lines().any(|line| line == expected),
+                "missing {expected}"
+            );
+        }
+        assert!(!output.lines().any(|line| line.starts_with("THS_SEED=")));
+    }
+
+    #[test]
+    fn child_exit_code_is_preserved() {
+        let command = [
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("exit 7"),
+        ];
+        let (_sender, shutdown) = Shutdown::channel();
+        let outcome = run_child(
+            &command,
+            Path::new("."),
+            &name("alpha"),
+            &endpoints_for(&host_ports(0).unwrap()),
+            &shutdown,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(outcome, ChildOutcome::Exited(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupted_child_terminates_its_background_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let command = vec![
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("sleep 30 & echo $! > \"$1\"; wait"),
+            OsString::from("sh"),
+            pid_file.as_os_str().to_owned(),
+        ];
+        let (sender, shutdown) = Shutdown::channel();
+        let signal_file = pid_file.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !signal_file.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            sender.send(Ended::Interrupted).unwrap();
+        });
+        let outcome = run_child(
+            &command,
+            dir.path(),
+            &name("alpha"),
+            &endpoints_for(&host_ports(0).unwrap()),
+            &shutdown,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert_eq!(outcome, ChildOutcome::Signaled);
+        let pid = fs::read_to_string(pid_file).unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(!alive, "background descendant {} survived", pid.trim());
     }
 
     #[test]

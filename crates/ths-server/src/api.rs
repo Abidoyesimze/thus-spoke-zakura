@@ -77,6 +77,59 @@ struct WalletSyncStatus {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct SettlementStatus {
+    node_height: Option<u64>,
+    lightwalletd_height: Option<u64>,
+    wallet_scanned_height: Option<u64>,
+    wallet_sync_state: &'static str,
+    settled: bool,
+    settlement_blocker: Option<&'static str>,
+}
+
+fn settlement_status(
+    node: Option<&ChainCheckpoint>,
+    lightwalletd: Option<&ChainCheckpoint>,
+    wallet: &WalletSyncStatus,
+) -> SettlementStatus {
+    let settlement_blocker = if node.is_none() {
+        Some("node_unavailable")
+    } else if lightwalletd.is_none() {
+        Some("lightwalletd_unavailable")
+    } else if wallet.state == "error" {
+        Some("wallet_error")
+    } else if wallet.state != "ready" {
+        Some("wallet_syncing")
+    } else if node.map(|tip| tip.height) != lightwalletd.map(|tip| tip.height) {
+        Some("height_mismatch")
+    } else if node != lightwalletd {
+        Some("chain_mismatch")
+    } else if !node.is_some_and(|tip| wallet_matches_tip(wallet, tip)) {
+        Some("wallet_behind")
+    } else {
+        None
+    };
+
+    SettlementStatus {
+        node_height: node.map(|tip| tip.height),
+        lightwalletd_height: lightwalletd.map(|tip| tip.height),
+        wallet_scanned_height: wallet.fully_scanned_height,
+        wallet_sync_state: wallet.state,
+        settled: settlement_blocker.is_none(),
+        settlement_blocker,
+    }
+}
+
+fn wallet_matches_tip(wallet: &WalletSyncStatus, tip: &ChainCheckpoint) -> bool {
+    wallet.state == "ready"
+        && ((wallet.fully_scanned_height == Some(tip.height)
+            && wallet.fully_scanned_hash.as_deref() == Some(&tip.hash))
+            || (tip.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
+                && wallet.fully_scanned_height.is_none()
+                && wallet.observed_height == Some(tip.height)
+                && wallet.observed_hash.as_deref() == Some(&tip.hash)))
+}
+
 impl AppState {
     pub fn new(store: Store, wallet: RealWallet, rpc: String, instance: String) -> Self {
         let (events, _) = broadcast::channel(128);
@@ -203,13 +256,7 @@ impl AppState {
     async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
         let observed = self.0.rpc.checkpoint().await?;
         let status = self.0.wallet_snapshot.read().await.status.clone();
-        let settled = status.state == "ready"
-            && ((status.fully_scanned_height == Some(observed.height)
-                && status.fully_scanned_hash.as_deref() == Some(&observed.hash))
-                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
-                    && status.fully_scanned_height.is_none()
-                    && status.observed_height == Some(observed.height)
-                    && status.observed_hash.as_deref() == Some(&observed.hash)));
+        let settled = wallet_matches_tip(&status, &observed);
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
             snapshot.status.observed_height = Some(observed.height);
@@ -373,6 +420,8 @@ struct Status {
     network: &'static str,
     endpoints: PublicEndpoints,
     wallet_sync: WalletSyncStatus,
+    #[serde(flatten)]
+    settlement: SettlementStatus,
 }
 
 #[derive(Serialize)]
@@ -388,9 +437,19 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("127.0.0.1:8080");
+    let (node, lightwalletd) =
+        tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
+    let node = node.ok();
+    let lightwalletd = lightwalletd.ok();
+    let wallet_sync = state.wallet_sync_status().await;
+    let node_tip = node.as_ref().map(|chain| ChainCheckpoint {
+        height: chain.blocks,
+        hash: chain.bestblockhash.clone(),
+    });
+    let settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
     Ok(Json(Status {
         instance: state.0.instance.clone(),
-        node: state.0.rpc.chain_info().await.ok(),
+        node,
         account_count: usize::from(USER_ACCOUNT_COUNT),
         auto_mine: true,
         network: "Regtest",
@@ -402,7 +461,8 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
                 .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
             p2p: std::env::var("THS_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
         },
-        wallet_sync: state.wallet_sync_status().await,
+        wallet_sync,
+        settlement,
     }))
 }
 async fn accounts(State(state): State<AppState>) -> ApiResult<Json<Vec<Account>>> {
@@ -2209,6 +2269,148 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let (status, _) = get(&dir, "/wallet").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn wallet_status(
+        state: &'static str,
+        fully_scanned_height: Option<u64>,
+        error: Option<&str>,
+    ) -> WalletSyncStatus {
+        WalletSyncStatus {
+            state,
+            fully_scanned_height,
+            fully_scanned_hash: fully_scanned_height.map(|_| "canonical".to_owned()),
+            observed_hash: fully_scanned_height.map(|_| "canonical".to_owned()),
+            observed_height: fully_scanned_height,
+            last_success_at: Some(123),
+            error: error.map(str::to_owned),
+        }
+    }
+
+    fn settlement_for_test(
+        node: Option<u64>,
+        lightwalletd: Option<u64>,
+        wallet: &WalletSyncStatus,
+    ) -> SettlementStatus {
+        let checkpoint = |height| ChainCheckpoint {
+            height,
+            hash: "canonical".to_owned(),
+        };
+        settlement_status(
+            node.map(checkpoint).as_ref(),
+            lightwalletd.map(checkpoint).as_ref(),
+            wallet,
+        )
+    }
+
+    #[test]
+    fn settlement_requires_all_three_components_at_the_same_tip() {
+        let status = settlement_for_test(
+            Some(105),
+            Some(105),
+            &wallet_status("ready", Some(105), None),
+        );
+        assert!(status.settled);
+        assert_eq!(status.settlement_blocker, None);
+
+        let status = settlement_for_test(
+            Some(105),
+            Some(104),
+            &wallet_status("ready", Some(105), None),
+        );
+        assert!(!status.settled);
+        assert_eq!(status.settlement_blocker, Some("height_mismatch"));
+
+        let status = settlement_for_test(
+            Some(105),
+            Some(105),
+            &wallet_status("ready", Some(106), None),
+        );
+        assert!(
+            !status.settled,
+            "a wallet ahead of the current tip needs reconciliation"
+        );
+
+        let canonical = ChainCheckpoint {
+            height: 105,
+            hash: "canonical".to_owned(),
+        };
+        let replacement = ChainCheckpoint {
+            height: 105,
+            hash: "replacement".to_owned(),
+        };
+        let wallet = wallet_status("ready", Some(105), None);
+        let status = settlement_status(Some(&canonical), Some(&replacement), &wallet);
+        assert_eq!(status.settlement_blocker, Some("chain_mismatch"));
+
+        let status = settlement_status(Some(&replacement), Some(&replacement), &wallet);
+        assert!(
+            !status.settled,
+            "a same-height reorg needs wallet reconciliation"
+        );
+        assert_eq!(status.settlement_blocker, Some("wallet_behind"));
+    }
+
+    #[test]
+    fn settlement_reports_the_first_blocking_component() {
+        let cases = [
+            (
+                None,
+                Some(105),
+                wallet_status("ready", Some(105), None),
+                "node_unavailable",
+            ),
+            (
+                Some(105),
+                None,
+                wallet_status("ready", Some(105), None),
+                "lightwalletd_unavailable",
+            ),
+            (
+                Some(105),
+                Some(105),
+                wallet_status("error", Some(104), Some("scan failed")),
+                "wallet_error",
+            ),
+            (
+                Some(105),
+                Some(105),
+                wallet_status("syncing", Some(104), None),
+                "wallet_syncing",
+            ),
+            (
+                Some(105),
+                Some(105),
+                wallet_status("ready", None, None),
+                "wallet_behind",
+            ),
+            (
+                Some(105),
+                Some(105),
+                wallet_status("ready", Some(104), None),
+                "wallet_behind",
+            ),
+        ];
+
+        for (node, lightwalletd, wallet, expected) in cases {
+            let status = settlement_for_test(node, lightwalletd, &wallet);
+            assert!(!status.settled);
+            assert_eq!(status.settlement_blocker, Some(expected));
+        }
+    }
+
+    #[test]
+    fn settlement_allows_a_canonical_tip_before_the_wallet_birthday() {
+        let tip = ChainCheckpoint {
+            height: u64::from(WALLET_BIRTHDAY_HEIGHT) - 1,
+            hash: "canonical".to_owned(),
+        };
+        let mut wallet = wallet_status("ready", None, None);
+        wallet.observed_height = Some(tip.height);
+        wallet.observed_hash = Some(tip.hash.clone());
+        assert!(settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+        wallet.observed_hash = Some("orphaned".to_owned());
+        assert!(!settlement_status(Some(&tip), Some(&tip), &wallet).settled);
     }
 
     #[test]

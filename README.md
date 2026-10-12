@@ -228,6 +228,35 @@ Account 4: uregtest1549x97unhklahphm9rzvf9dl6fm8nnpw8upggjnet7090sf994wm8crdnv8u
 Account 5: uregtest1l82ktar6wygqsncxp7famz8manh48tv283pve29fnumsrskyj9dyhn50l9gntm9k524cjq5xxm0zr7qwsspcmtrm5jlc7tqww60p9uvd8dke3sah86yzkj4rakhkpp0um6n08dxg50jv4pxnf3stenmyeyzqm0746g87sjh6kd328d0jetnwgktkuhjsfnhca5s9stselz02q52zvcj
 ```
 
+### Run project commands against a settled environment
+
+`ths run` creates a fresh environment, waits until Zakura, lightwalletd, and
+the wallet agree on the chain tip, runs your command, then deletes the runtime
+and its development data:
+
+```console
+ths run -- npm test
+ths run --timeout 300 -- cargo test --test payments
+```
+
+If Docker cannot confirm a timed-out mutation, the launcher keeps a recovery
+journal and reports the incomplete cleanup instead of deleting uncertain
+resources.
+
+Startup and settlement have a 120-second default timeout. The child command
+has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
+`THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS`, and
+`THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
+the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
+endpoint. `ths run` supports non-interactive commands; commands that read from
+the controlling terminal are not supported.
+
+To wait for an environment you started separately:
+
+```console
+ths --name protocol wait --timeout 300
+```
+
 ## Useful commands
 
 Running `ths` with no command starts the default environment.
@@ -240,6 +269,8 @@ Running `ths` with no command starts the default environment.
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
+| `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
+| `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |

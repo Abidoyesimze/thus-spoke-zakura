@@ -554,6 +554,25 @@ impl RealWallet {
         .await
     }
 
+    pub(crate) async fn latest_checkpoint(&self) -> Result<ChainCheckpoint> {
+        let query = async {
+            let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
+            let tip = client
+                .get_latest_block(ChainSpec::default())
+                .await?
+                .into_inner();
+            let hash = BlockHash::try_from_slice(&tip.hash)
+                .context("lightwalletd returned an invalid tip hash")?;
+            Ok::<_, anyhow::Error>(ChainCheckpoint {
+                height: tip.height,
+                hash: hash.to_string(),
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), query)
+            .await
+            .context("reading lightwalletd tip timed out")?
+    }
+
     pub async fn wait_for_height(&self, target: u64, timeout: Duration) -> Result<()> {
         let mut latest_indexed = None;
         let wait = async {
