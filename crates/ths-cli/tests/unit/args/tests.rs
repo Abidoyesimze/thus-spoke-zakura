@@ -27,11 +27,11 @@ fn separates_building_from_starting() {
     assert!(matches!(cli.command, Some(Command::Mine { blocks: 10 })));
 
     let cli = Cli::try_parse_from(["ths", "--name", "alice", "mine", "3"]).unwrap();
-    assert_eq!(cli.name.to_string(), "alice");
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
     assert!(matches!(cli.command, Some(Command::Mine { blocks: 3 })));
 
     let cli = Cli::try_parse_from(["ths", "mine", "3", "--name", "alice"]).unwrap();
-    assert_eq!(cli.name.to_string(), "alice");
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
 
     assert!(Cli::try_parse_from(["ths", "mine", "0"]).is_err());
     assert!(Cli::try_parse_from(["ths", "mine", "10001"]).is_err());
@@ -55,7 +55,7 @@ fn separates_building_from_starting() {
         "alice",
     ])
     .unwrap();
-    assert_eq!(cli.name.to_string(), "alice");
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
     assert!(matches!(
         cli.command,
         Some(Command::Faucet {
@@ -222,4 +222,16 @@ fn memo_values_follow_the_server_contract() {
     assert!(parse_memo(&"🌸".repeat(129)).is_err());
     assert!(parse_memo("hi\0").is_err());
     assert!(parse_memo("a\0b").is_ok());
+}
+
+#[test]
+fn parses_wallet_balances_with_global_json_after_subcommand() {
+    let cli = Cli::try_parse_from(["ths", "wallet", "balances", "--json"]).unwrap();
+    assert!(cli.json);
+    assert!(matches!(
+        cli.command,
+        Some(Command::Wallet {
+            action: WalletCommand::Balances
+        })
+    ));
 }

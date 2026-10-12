@@ -1,6 +1,7 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
     ffi::OsString,
     fmt::{self, Display},
     fs::{self, File, OpenOptions, TryLockError},
@@ -53,8 +54,12 @@ mod logs;
 #[cfg(test)]
 use logs::*;
 mod resources;
+use crate::client::{RuntimeStatus, runtime_status};
+pub(crate) use instance::Endpoints;
 pub(crate) use resources::container_running;
 use resources::*;
+mod runner;
+use runner::*;
 mod startup;
 use startup::*;
 

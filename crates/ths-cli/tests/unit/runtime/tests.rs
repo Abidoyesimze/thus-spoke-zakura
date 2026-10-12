@@ -151,6 +151,7 @@ struct RecordingHost {
     final_cleanup_failure: Option<String>,
     deleted_elsewhere: bool,
     allocate_delay: Duration,
+    run_status: Option<RuntimeStatus>,
 }
 
 impl RecordingHost {
@@ -167,6 +168,7 @@ impl RecordingHost {
                 final_cleanup_failure: None,
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
+                run_status: None,
             },
             events,
         )
@@ -187,6 +189,25 @@ fn verified_report() -> CleanupReport {
 }
 
 impl StartHost for RecordingHost {
+    fn runtime_status(&self, _endpoints: &Endpoints, _timeout: Duration) -> Result<RuntimeStatus> {
+        self.push("runtime_status");
+        self.run_status
+            .clone()
+            .context("no recorded runtime status")
+    }
+
+    fn run_child(
+        &self,
+        _command: &[OsString],
+        _current_dir: &Path,
+        name: &InstanceName,
+        _endpoints: &Endpoints,
+        _shutdown: &Shutdown,
+    ) -> Result<ChildOutcome> {
+        self.push(&format!("child:{name}"));
+        Ok(ChildOutcome::Exited(42))
+    }
+
     fn delete(
         &self,
         runtime: &Runtime,
@@ -218,7 +239,9 @@ impl StartHost for RecordingHost {
         {
             return runtime.cleanup_with(name, docker, false, &context.policy);
         }
-        if later && let Some(message) = &self.final_cleanup_failure {
+        if (later || self.run_status.is_some())
+            && let Some(message) = &self.final_cleanup_failure
+        {
             return Ok(CleanupReport {
                 outcome: CleanupOutcome::Uncertain,
                 failures: vec![message.clone()],
@@ -420,3 +443,6 @@ fn with_unreachable_docker<T>(test: impl FnOnce() -> T) -> T {
     DOCKER_UNREACHABLE.set(false);
     result
 }
+
+#[path = "tests/runner.rs"]
+mod runner;

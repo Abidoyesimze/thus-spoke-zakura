@@ -1,15 +1,18 @@
 mod wallet;
 
-use std::process::ExitCode;
+use std::{process::ExitCode, time::Duration};
 
 use crate::{
     args::{Cli, Command, Pool, SendArgs, WalletCommand},
-    runtime::Runtime,
+    runtime::{InstanceName, Runtime},
     updater,
 };
 use wallet::send;
 
 pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
+    if cli.json && matches!(cli.command, Some(Command::Run { .. })) {
+        anyhow::bail!("--json cannot be used with `run`; the child command owns stdout");
+    }
     if let Some(Command::Update { version, check }) = &cli.command {
         return updater::run(version.as_deref(), *check, cli.json);
     }
@@ -21,6 +24,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     {
         println!("{notice}");
     }
+    let run = matches!(cli.command, Some(Command::Run { .. }));
+    let name = resolve_name(cli.name, run);
     let runtime = Runtime::discover()?;
     match cli.command.unwrap_or(Command::Start {
         no_open: false,
@@ -29,32 +34,32 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Start {
             no_open,
             port_offset,
-        } => runtime.start(&cli.name, no_open, cli.json, port_offset),
+        } => runtime.start(&name, no_open, cli.json, port_offset),
+        Command::Wait { timeout } => runtime.wait(&name, Duration::from_secs(timeout), cli.json),
+        Command::Run { timeout, command } => {
+            return runtime
+                .run(&name, Duration::from_secs(timeout), &command)
+                .map(ExitCode::from);
+        }
         Command::Build { dev } => runtime.build(dev),
         Command::Pull => runtime.pull(),
         Command::Update { .. } => unreachable!("update is handled before runtime discovery"),
         Command::Uninstall => unreachable!("uninstall is handled before runtime discovery"),
-        Command::Status => runtime.status(&cli.name, cli.json),
-        Command::Open => runtime.open(&cli.name),
-        Command::Endpoints => runtime.endpoints(&cli.name, cli.json),
-        Command::Mine { blocks } => runtime.mine(&cli.name, blocks, cli.json),
+        Command::Status => runtime.status(&name, cli.json),
+        Command::Open => runtime.open(&name),
+        Command::Endpoints => runtime.endpoints(&name, cli.json),
+        Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
         Command::Faucet { address, amount } => {
-            runtime.faucet(&cli.name, &address, amount.zatoshi(), cli.json)
+            runtime.faucet(&name, &address, amount.zatoshi(), cli.json)
         }
         Command::Wallet { action } => match action {
-            WalletCommand::Balances => runtime.wallet_balances(&cli.name, cli.json),
+            WalletCommand::Balances => runtime.wallet_balances(&name, cli.json),
             WalletCommand::Faucet {
                 accounts,
                 amount,
                 pool,
-            } => runtime.wallet_faucet(
-                &cli.name,
-                &accounts,
-                amount.zatoshi(),
-                pool.as_str(),
-                cli.json,
-            ),
-            WalletCommand::Send(args) => send(&runtime, &cli.name, args, cli.json),
+            } => runtime.wallet_faucet(&name, &accounts, amount.zatoshi(), pool.as_str(), cli.json),
+            WalletCommand::Send(args) => send(&runtime, &name, args, cli.json),
             WalletCommand::Shield {
                 from,
                 to,
@@ -62,7 +67,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 memo,
             } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
                     to,
@@ -75,7 +80,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             ),
             WalletCommand::Unshield { from, to, amount } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
                     to,
@@ -92,9 +97,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             follow,
             tail,
             head,
-        } => runtime.logs(&cli.name, service.as_deref(), follow, tail, head),
-        Command::Stop => runtime.stop(&cli.name),
-        Command::Reset { force } => runtime.reset(&cli.name, force),
+        } => runtime.logs(&name, service.as_deref(), follow, tail, head),
+        Command::Stop => runtime.stop(&name),
+        Command::Reset { force } => runtime.reset(&name, force),
         Command::List => runtime.list(cli.json),
         Command::Doctor => runtime.doctor(cli.json),
     }?;
@@ -108,3 +113,18 @@ fn should_check_for_updates(cli: &Cli) -> bool {
 #[cfg(test)]
 #[path = "../tests/unit/commands/tests.rs"]
 mod tests;
+
+fn resolve_name(name: Option<InstanceName>, run: bool) -> InstanceName {
+    name.unwrap_or_else(|| {
+        if run {
+            generated_run_name()
+        } else {
+            "default".parse().expect("default instance name is valid")
+        }
+    })
+}
+fn generated_run_name() -> InstanceName {
+    format!("run-{}", uuid::Uuid::new_v4().simple())
+        .parse()
+        .expect("UUID-based run instance name is valid")
+}

@@ -180,6 +180,38 @@ pub(super) enum Ended {
 }
 
 pub(super) trait StartHost {
+    fn instance_exists(
+        &self,
+        runtime: &Runtime,
+        name: &InstanceName,
+        _shutdown: &Shutdown,
+        _context: &LifecycleContext,
+    ) -> Result<bool> {
+        Ok(runtime.instance_dir(name).exists())
+    }
+    fn runtime_status(&self, endpoints: &Endpoints, timeout: Duration) -> Result<RuntimeStatus> {
+        runtime_status(endpoints, timeout)
+    }
+    fn run_child(
+        &self,
+        command: &[OsString],
+        current_dir: &Path,
+        name: &InstanceName,
+        endpoints: &Endpoints,
+        shutdown: &Shutdown,
+    ) -> Result<ChildOutcome> {
+        run_child(
+            command,
+            current_dir,
+            name,
+            endpoints,
+            shutdown,
+            Duration::from_secs(5),
+        )
+    }
+    fn diagnostics(&self, _name: &InstanceName, _context: &LifecycleContext) -> String {
+        String::new()
+    }
     fn delete(
         &self,
         runtime: &Runtime,
@@ -222,6 +254,77 @@ pub(super) trait StartHost {
 pub(super) struct DockerHost;
 
 impl StartHost for DockerHost {
+    fn diagnostics(&self, name: &InstanceName, context: &LifecycleContext) -> String {
+        let deadline = Deadline::after(Duration::from_secs(5));
+        let docker = LifecycleDocker::production(
+            context,
+            Some(deadline),
+            context.policy.readiness_docker,
+            Cancellation::Ignore,
+        );
+        ["app", "zakura", "lightwalletd"]
+            .map(|service| {
+                let container = format!("{}-{service}", prefix(name));
+                let logs = readiness::diagnostic_logs(&docker, &container)
+                    .unwrap_or_else(|error| format!("could not read logs: {error:#}"));
+                format!("\n--- {service} ---\n{logs}")
+            })
+            .join("")
+    }
+
+    fn instance_exists(
+        &self,
+        runtime: &Runtime,
+        name: &InstanceName,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+    ) -> Result<bool> {
+        if runtime.instance_dir(name).exists() {
+            return Ok(true);
+        }
+        let requested = || shutdown.try_interrupted();
+        let docker = LifecycleDocker::production(
+            context,
+            context.overall_deadline,
+            context.policy.startup_docker,
+            Cancellation::Observe(&requested),
+        );
+        let label_filter = format!("label={}", label(name));
+        let network_name = format!("name=^{}$", prefix(name));
+        for args in [
+            vec![
+                "container",
+                "ls",
+                "--all",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.ID}}",
+            ],
+            vec![
+                "volume",
+                "ls",
+                "--filter",
+                &label_filter,
+                "--format",
+                "{{.Name}}",
+            ],
+            vec![
+                "network",
+                "ls",
+                "--filter",
+                &network_name,
+                "--format",
+                "{{.Name}}",
+            ],
+        ] {
+            if !docker.output(&args)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn delete(
         &self,
         runtime: &Runtime,

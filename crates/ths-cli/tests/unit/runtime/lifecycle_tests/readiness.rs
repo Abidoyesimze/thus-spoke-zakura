@@ -384,3 +384,48 @@ fn hanging_diagnostic_logs_expire_on_the_readiness_budget() {
     );
     fixture.finish();
 }
+
+#[test]
+fn run_deadline_interrupts_a_blocked_network_create() {
+    let script = tempfile::tempdir().unwrap();
+    let marker = script.path().join("network-create-started");
+    let path = script.path().join("docker");
+    fs::write(
+        &path,
+        "#!/bin/sh\nif [ \"$1\" = network ] && [ \"$2\" = create ]; then\n  touch \"$THS_MARKER\"\n  sleep 3\nfi\n",
+    )
+    .unwrap();
+    make_executable(&path);
+    let mut policy = short_policy();
+    policy.startup_docker = Duration::from_secs(5);
+    let mut context = LifecycleContext::new(policy);
+    context.overall_deadline = Some(Deadline::after(Duration::from_millis(800)));
+    let stage = context.startup_deadline(policy.startup_docker);
+    let mut docker = script_docker(&script, &context, policy.startup_docker)
+        .scoped(stage, policy.startup_docker);
+    docker
+        .env
+        .push(("THS_MARKER".into(), marker.to_string_lossy().into_owned()));
+    let root = tempfile::tempdir().unwrap();
+    let instance = name("alpha");
+    let mut journal =
+        RecoveryJournal::create(root.path().join("recovery.json"), &instance).unwrap();
+    let started = Instant::now();
+    let error =
+        ensure_network_with("ths-alpha", &instance, &docker, &mut journal, stage).unwrap_err();
+    assert!(
+        marker.exists(),
+        "the fake Docker command did not reach network create: {error:#}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "network create ignored the run deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+    assert!(
+        context
+            .finish_helpers(Deadline::after(policy.cleanup))
+            .is_empty()
+    );
+}

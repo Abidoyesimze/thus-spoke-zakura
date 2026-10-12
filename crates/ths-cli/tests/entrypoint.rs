@@ -37,3 +37,16 @@ fn binary_preserves_help_and_parse_error_exits() {
     assert!(invalid.stdout.is_empty());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("unexpected argument"));
 }
+
+#[test]
+fn json_run_reaches_dispatch_before_runtime_discovery() {
+    let error = thus_spoke_zakura::run_from(["ths", "--json", "run", "--", "echo", "ready"])
+        .expect_err("run owns stdout");
+    assert!(
+        error
+            .to_string()
+            .contains("--json cannot be used with `run`"),
+        "{error:#}"
+    );
+    assert!(error.downcast_ref::<clap::Error>().is_none());
+}

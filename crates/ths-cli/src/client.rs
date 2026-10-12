@@ -1,6 +1,6 @@
 use crate::{
     intents::FaucetJournal,
-    runtime::{InstanceName, Runtime, container_running, prefix},
+    runtime::{Endpoints, InstanceName, Runtime, container_running, prefix},
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -381,4 +381,27 @@ pub(crate) fn balance_lines(accounts: &[Account]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuntimeStatus {
+    pub(crate) node_height: Option<u64>,
+    pub(crate) lightwalletd_height: Option<u64>,
+    pub(crate) wallet_scanned_height: Option<u64>,
+    pub(crate) wallet_sync_state: String,
+    pub(crate) settled: bool,
+    pub(crate) settlement_blocker: Option<String>,
+}
+pub(crate) fn runtime_status(endpoints: &Endpoints, timeout: Duration) -> Result<RuntimeStatus> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(format!("{}/api/v1/status", endpoints.dashboard))
+        .send()
+        .context("reading runtime status")?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("runtime status returned {status}");
+    }
+    response.json().context("decoding runtime status")
 }

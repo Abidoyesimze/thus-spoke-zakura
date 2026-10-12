@@ -1,6 +1,6 @@
 mod amount;
 
-use std::path::PathBuf;
+use std::{ffi::OsString, path::PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -16,8 +16,8 @@ pub(crate) use amount::{SendAmount, ZecAmount};
 )]
 pub(crate) struct Cli {
     /// Isolated environment name.
-    #[arg(long, global = true, default_value = "default")]
-    pub(crate) name: InstanceName,
+    #[arg(long, global = true)]
+    pub(crate) name: Option<InstanceName>,
     /// Print machine-readable output where supported.
     #[arg(long, global = true)]
     pub(crate) json: bool,
@@ -34,6 +34,21 @@ pub(crate) enum Command {
         /// Add this many to the default loopback ports. Must be a multiple of 10.
         #[arg(long, default_value_t = 0)]
         port_offset: u16,
+    },
+    /// Wait until an existing environment is settled.
+    Wait {
+        /// Maximum time for settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Run a command in a fresh, settled environment and delete it afterward.
+    Run {
+        /// Maximum time for startup and settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
     /// Build the runtime images from the current source.
     Build {
