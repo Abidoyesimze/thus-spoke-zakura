@@ -4,6 +4,11 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
 
 ## Unreleased
 
+- **Explorer search feedback:** Numeric 64-character hashes are searched as hashes,
+  missing hashes are distinguished from service failures, and transparent
+  addresses are no longer mislabeled as P2PKH.
+  [#129](https://github.com/zcashlabs/thus-spoke-zakura/pull/129)
+
 ## v0.3.0
 
 ![Thus Spoke Zakura v0.3.0 release artwork](docs/images/release-v0.3.0.png)
