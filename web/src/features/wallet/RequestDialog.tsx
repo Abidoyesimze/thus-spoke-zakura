@@ -102,7 +102,7 @@ export function RequestDialog({
         </Field>
         <Field
           label="Memo (optional)"
-          hint={`${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes, encrypted to the recipient.`}
+          hint={`${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes`}
           error={form.formState.errors.memo?.message}
         >
           {(aria) => (
