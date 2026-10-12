@@ -14,6 +14,38 @@ Thus Spoke Zakura starts everything you need for local experiments:
 Nothing connects to Zcash mainnet or testnet. Every run begins with a fresh
 chain, and pressing Ctrl+C deletes the containers and development data.
 
+Startup and shutdown are sums of separate phases, not one short HTTP timeout.
+Each readiness phase allows 120 seconds. A single health or RPC attempt,
+including a stalled connection or body, allows 2 seconds plus a short scheduling
+delay for cancellation. Ordinary finite startup commands allow 30 seconds.
+Attached initialization allows 120 seconds. Cleanup then gets its own 120
+seconds, even if startup was already cancelled. Killing the `docker` process
+does not cancel work the daemon has already accepted.
+
+If cleanup cannot prove that this instance's resources, helpers, and metadata
+are gone, the command fails. It keeps `lifecycle-recovery.json` and any
+remaining `instance.json` so the instance can be identified. Do not delete
+those files by hand, retry a create whose result is unknown, or prune shared
+Docker state.
+
+A failed `docker start`, or a failed inspection after `docker create` returns
+an original container ID, can be recovered: cleanup validates ownership, removes
+that ID, proves its absence, and persists the create or start's resolution before
+deleting its wallet volumes and network. A later start can allocate fresh
+resources under the same instance name. Cleanup does not retry the failed
+mutation or turn the original launch error into success. A create or start
+without a trustworthy original ID remains uncertain and keeps its dependencies
+and recovery state. Same-name replacements are not adopted; shared unresolved
+dependencies remain protected. Existing recovery journals with a known container
+ID can be reconciled without changing their format.
+
+The recovery journal records resources by kind and name and retains their
+allocation identities. It does not lock an instance name or coordinate separate
+launcher sessions. Exclusive ownership and coordinated stop/reset remain tracked
+in [#175](https://github.com/zcashlabs/thus-spoke-zakura/issues/175). Once ready,
+the foreground launcher watches the allocated app container and exits when
+another command deletes it, without deleting the environment again.
+
 ![Wallet dashboard with five development accounts](docs/images/wallet.png)
 
 ## Get started
@@ -45,11 +77,17 @@ ths
 ```
 
 The first start can take a little longer while Docker prepares the images.
-When the environment is ready, the dashboard opens automatically.
+When the environment is ready, the dashboard opens automatically. Zakura's RPC
+tip and the dashboard each have 120 seconds to become ready. Ordinary Docker
+commands during startup have 30 seconds, and attached initialization has 120
+seconds.
 
-Keep this terminal open. Press Ctrl+C when you are finished; the launcher will
-stop the environment and delete its chain, wallets, keys, volumes, and
-containers.
+Keep this terminal open. Press Ctrl+C when you are finished. The launcher then
+uses a separate 120 second cleanup allowance to stop the environment and delete
+its chain, wallets, keys, volumes, and containers. That allowance is not
+restarted by the shutdown signal. An incomplete or uncertain cleanup is a
+failed command and leaves `lifecycle-recovery.json` beside any remaining
+`instance.json`.
 
 ## What can I do?
 
@@ -190,23 +228,56 @@ Account 4: uregtest1549x97unhklahphm9rzvf9dl6fm8nnpw8upggjnet7090sf994wm8crdnv8u
 Account 5: uregtest1l82ktar6wygqsncxp7famz8manh48tv283pve29fnumsrskyj9dyhn50l9gntm9k524cjq5xxm0zr7qwsspcmtrm5jlc7tqww60p9uvd8dke3sah86yzkj4rakhkpp0um6n08dxg50jv4pxnf3stenmyeyzqm0746g87sjh6kd328d0jetnwgktkuhjsfnhca5s9stselz02q52zvcj
 ```
 
+### Run project commands against a settled environment
+
+`ths run` creates a fresh environment, waits until Zakura, lightwalletd, and
+the wallet agree on the chain tip, runs your command, then deletes the runtime
+and its development data:
+
+```console
+ths run -- npm test
+ths run --timeout 300 -- cargo test --test payments
+```
+
+If Docker cannot confirm a timed-out mutation, the launcher keeps a recovery
+journal and reports the incomplete cleanup instead of deleting uncertain
+resources.
+
+Startup and settlement have a 120-second default timeout. The child command
+has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
+`THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS`, and
+`THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
+the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
+endpoint. `ths run` supports non-interactive commands; commands that read from
+the controlling terminal are not supported.
+
+To wait for an environment you started separately:
+
+```console
+ths --name protocol wait --timeout 300
+```
+
 ## Useful commands
 
 Running `ths` with no command starts the default environment.
 
 | Command | What it does |
 | --- | --- |
-| `ths` | Start a fresh environment and open the dashboard |
-| `ths start --no-open` | Start without opening a browser |
+| `ths` | Start a fresh environment and open the dashboard. Readiness is 120 seconds per phase, ordinary startup commands are 30 seconds, initialization is 120 seconds, and cleanup is a separate 120 seconds |
+| `ths start --no-open` | Start without opening a browser, with the same phase budgets as `ths` |
 | `ths start --port-offset 10` | Start on loopback ports shifted by 10 for another instance |
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
+| `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
+| `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
+| `ths wallet balances` | Print each development account's balances and addresses |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo |
+| `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address |
 | `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
@@ -215,9 +286,9 @@ Running `ths` with no command starts the default environment.
 | `ths logs --tail 200 -f` | Print the last 200 app log lines, then follow |
 | `ths logs zakura --head 200` | Print the first 200 node log lines |
 | `ths list` | List environments and their container status |
-| `ths stop` | Stop and delete the environment |
-| `ths reset --force` | Force-delete one environment and all its data |
-| `ths doctor` | Check Docker and local configuration |
+| `ths stop` | Stop and delete the environment after verified cleanup. Incomplete or uncertain cleanup fails and keeps `lifecycle-recovery.json` |
+| `ths reset --force` | Force-delete one environment and all its data after verified cleanup. A failed cleanup keeps recovery metadata and does not prune other Docker resources |
+| `ths doctor [--json]` | Check Docker and local configuration; exit nonzero if Docker is unreachable |
 | `ths pull` | Pull the exact images for this launcher version |
 | `ths update --check` | Check for a newer release |
 | `ths update` | Install the latest verified release |
@@ -279,6 +350,17 @@ npm test --prefix web
 npm run build --prefix web
 ```
 
+Docker-free tests do not start a daemon. These ignored launcher regressions
+need a disposable Docker daemon and, for the lost-create and lost-start cases, the prepared
+runtime images. Run one at a time:
+
+```console
+cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_start_reply_is_cleaned_up_and_can_be_retried -- --ignored --exact
+cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_create_reply_retains_uncertainty_and_recovery -- --ignored --exact
+cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::lost_remove_reply_is_verified_against_daemon_state -- --ignored --exact
+cargo test -p thus-spoke-zakura runtime::docker_lifecycle_tests::partial_cleanup_preserves_foreign_resources_and_other_instances -- --ignored --exact
+```
+
 ### Activity-recovery integration test
 
 The `activity-recovery` CI job runs the real recovery regression on Linux for
@@ -300,12 +382,15 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
 docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact startup_funding_retry_after_auto_mine_failure_has_one_payout
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucets_record_confirmed_activity
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucet_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_address_faucet_behavior_is_unchanged
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact same_account_cross_pool_round_trip_is_replay_safe
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_send_retry_survives_lost_response_and_restart
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_external_faucet_retry_survives_lost_response_and_restart
 ```
 
 The first command compiles the integration target. The second runs its
@@ -323,6 +408,19 @@ node, then waits for the production background payment-confirmation loop to upda
 existing activity row. Direct mining is intentional: retrying Send or using the
 server's mine endpoint would repair the row through a different path and would
 not prove background recovery.
+
+The queued-retry regressions exercise Send and an external-address faucet through
+the production HTTP handlers. A loopback proxy withholds the original HTTP
+response until the client stops waiting. The real original transaction remains
+in the node's mempool. On the same-key retry, controlled proxies report that
+transaction missing and substitute the exact lightwalletd already-queued
+response. These are injected faults, not a naturally occurring node queue race.
+Both server and wallet journals, signed bytes, transaction identity, and reserved
+inputs must remain unchanged and pending without a block hash. After restarting
+the server against both existing databases, the tests mine the original and
+check canonical confirmation, exactly one payout, and no additional broadcast
+or block on confirmed replay. These tests retain caller-driven recovery; they
+do not establish autonomous payment progression.
 
 The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
 to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks
@@ -423,7 +521,19 @@ ths logs lightwalletd
 ths reset --force
 ```
 
-This permanently deletes that instance's development data.
+This permanently deletes that instance's development data when cleanup is
+verified. If reset or stop fails and `lifecycle-recovery.json` is still in the
+instance directory, cleanup could not prove the outcome. Keep that file and
+any remaining `instance.json`. Do not remove them manually, do not repeat an
+unknown create, and do not prune shared Docker data. A killed `docker` command
+does not mean the daemon cancelled the request.
+
+**Cleanup did not finish**
+
+An incomplete cleanup still knows which of this instance's resources remain. An
+uncertain cleanup does not, and uncertainty takes precedence when both apply.
+The command exits nonzero either way. `lifecycle-recovery.json` is the record
+of the unfinished mutations.
 
 **Uninstall the launcher**
 

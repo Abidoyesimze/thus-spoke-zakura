@@ -1,7 +1,11 @@
+mod lifecycle;
 mod runtime;
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;
 mod updater;
 
-use std::{process::ExitCode, str::FromStr};
+use std::{ffi::OsString, process::ExitCode, str::FromStr, time::Duration};
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
@@ -15,8 +19,8 @@ use runtime::{InstanceName, Runtime};
 )]
 struct Cli {
     /// Isolated environment name.
-    #[arg(long, global = true, default_value = "default")]
-    name: InstanceName,
+    #[arg(long, global = true)]
+    name: Option<InstanceName>,
     /// Print machine-readable output where supported.
     #[arg(long, global = true)]
     json: bool,
@@ -33,6 +37,21 @@ enum Command {
         /// Add this many to the default loopback ports. Must be a multiple of 10.
         #[arg(long, default_value_t = 0)]
         port_offset: u16,
+    },
+    /// Wait until an existing environment is settled.
+    Wait {
+        /// Maximum time for settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Run a command in a fresh, settled environment and delete it afterward.
+    Run {
+        /// Maximum time for startup and settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
     },
     /// Build the runtime images from the current source.
     Build {
@@ -111,6 +130,8 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WalletCommand {
+    /// Print each account's transparent and Ironwood balances and addresses.
+    Balances,
     /// Send faucet funds from the treasury to one or more accounts.
     Faucet {
         /// Account indices to fund (1-5), e.g. --accounts 1,2,3,5.
@@ -165,11 +186,21 @@ struct SendArgs {
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     from: u8,
     /// Destination account index (1-5); may match --from when pools differ.
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
-    to: u8,
-    /// Amount of ZEC to send, up to 8 decimal places.
-    #[arg(long)]
-    amount: SendAmount,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(1..=5),
+        required_unless_present = "uri",
+        conflicts_with = "uri"
+    )]
+    to: Option<u8>,
+    /// ZIP-321 payment URI to pay instead of --to. It sets the destination,
+    /// pool, and memo, and the amount unless it omits one.
+    #[arg(long, conflicts_with_all = ["destination_pool", "memo"])]
+    uri: Option<String>,
+    /// Amount of ZEC to send, up to 8 decimal places. With --uri, only for a
+    /// URI that does not set an amount.
+    #[arg(long, required_unless_present = "uri")]
+    amount: Option<SendAmount>,
     /// Pool to spend from.
     #[arg(long = "source-pool", value_enum, default_value = "ironwood")]
     source_pool: Pool,
@@ -199,6 +230,9 @@ impl Pool {
 
 fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
+    if cli.json && matches!(cli.command, Some(Command::Run { .. })) {
+        bail!("--json cannot be used with `run`; the child command owns stdout");
+    }
     if let Some(Command::Update { version, check }) = &cli.command {
         return updater::run(version.as_deref(), *check, cli.json);
     }
@@ -210,6 +244,8 @@ fn main() -> Result<ExitCode> {
     {
         println!("{notice}");
     }
+    let run = matches!(cli.command, Some(Command::Run { .. }));
+    let name = resolve_name(cli.name, run);
     let runtime = Runtime::discover()?;
     match cli.command.unwrap_or(Command::Start {
         no_open: false,
@@ -218,31 +254,32 @@ fn main() -> Result<ExitCode> {
         Command::Start {
             no_open,
             port_offset,
-        } => runtime.start(&cli.name, no_open, cli.json, port_offset),
+        } => runtime.start(&name, no_open, cli.json, port_offset),
+        Command::Wait { timeout } => runtime.wait(&name, Duration::from_secs(timeout), cli.json),
+        Command::Run { timeout, command } => {
+            return runtime
+                .run(&name, Duration::from_secs(timeout), &command)
+                .map(ExitCode::from);
+        }
         Command::Build { dev } => runtime.build(dev),
         Command::Pull => runtime.pull(),
         Command::Update { .. } => unreachable!("update is handled before runtime discovery"),
         Command::Uninstall => unreachable!("uninstall is handled before runtime discovery"),
-        Command::Status => runtime.status(&cli.name, cli.json),
-        Command::Open => runtime.open(&cli.name),
-        Command::Endpoints => runtime.endpoints(&cli.name, cli.json),
-        Command::Mine { blocks } => runtime.mine(&cli.name, blocks, cli.json),
+        Command::Status => runtime.status(&name, cli.json),
+        Command::Open => runtime.open(&name),
+        Command::Endpoints => runtime.endpoints(&name, cli.json),
+        Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
         Command::Faucet { address, amount } => {
-            runtime.faucet(&cli.name, &address, amount.zatoshi(), cli.json)
+            runtime.faucet(&name, &address, amount.zatoshi(), cli.json)
         }
         Command::Wallet { action } => match action {
+            WalletCommand::Balances => runtime.wallet_balances(&name, cli.json),
             WalletCommand::Faucet {
                 accounts,
                 amount,
                 pool,
-            } => runtime.wallet_faucet(
-                &cli.name,
-                &accounts,
-                amount.zatoshi(),
-                pool.as_str(),
-                cli.json,
-            ),
-            WalletCommand::Send(args) => send(&runtime, &cli.name, args, cli.json),
+            } => runtime.wallet_faucet(&name, &accounts, amount.zatoshi(), pool.as_str(), cli.json),
+            WalletCommand::Send(args) => send(&runtime, &name, args, cli.json),
             WalletCommand::Shield {
                 from,
                 to,
@@ -250,11 +287,12 @@ fn main() -> Result<ExitCode> {
                 memo,
             } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
-                    to,
-                    amount,
+                    to: Some(to),
+                    uri: None,
+                    amount: Some(amount),
                     source_pool: Pool::Transparent,
                     destination_pool: Pool::Ironwood,
                     memo,
@@ -263,11 +301,12 @@ fn main() -> Result<ExitCode> {
             ),
             WalletCommand::Unshield { from, to, amount } => send(
                 &runtime,
-                &cli.name,
+                &name,
                 SendArgs {
                     from,
-                    to,
-                    amount,
+                    to: Some(to),
+                    uri: None,
+                    amount: Some(amount),
                     source_pool: Pool::Ironwood,
                     destination_pool: Pool::Transparent,
                     memo: None,
@@ -280,9 +319,9 @@ fn main() -> Result<ExitCode> {
             follow,
             tail,
             head,
-        } => runtime.logs(&cli.name, service.as_deref(), follow, tail, head),
-        Command::Stop => runtime.stop(&cli.name),
-        Command::Reset { force } => runtime.reset(&cli.name, force),
+        } => runtime.logs(&name, service.as_deref(), follow, tail, head),
+        Command::Stop => runtime.stop(&name),
+        Command::Reset { force } => runtime.reset(&name, force),
         Command::List => runtime.list(cli.json),
         Command::Doctor => runtime.doctor(cli.json),
     }?;
@@ -290,7 +329,7 @@ fn main() -> Result<ExitCode> {
 }
 
 fn check_send(args: &SendArgs) -> Result<()> {
-    if args.from == args.to && args.source_pool == args.destination_pool {
+    if args.to == Some(args.from) && args.source_pool == args.destination_pool {
         bail!("choose a different --to account or a different --destination-pool");
     }
     if args.memo.is_some() && args.destination_pool == Pool::Transparent {
@@ -303,16 +342,45 @@ fn check_send(args: &SendArgs) -> Result<()> {
 
 fn send(runtime: &Runtime, name: &InstanceName, args: SendArgs, json: bool) -> Result<()> {
     check_send(&args)?;
+    if let Some(uri) = &args.uri {
+        return runtime.wallet_send_uri(
+            name,
+            args.from,
+            args.source_pool.as_str(),
+            uri,
+            args.amount.map(SendAmount::zatoshi),
+            json,
+        );
+    }
+    let (Some(to), Some(amount)) = (args.to, args.amount) else {
+        bail!("--to and --amount are required unless --uri is given");
+    };
     runtime.wallet_send(
         name,
         args.from,
-        args.to,
+        to,
         args.source_pool.as_str(),
         args.destination_pool.as_str(),
-        args.amount.zatoshi(),
+        amount.zatoshi(),
         args.memo.as_deref(),
         json,
     )
+}
+
+fn resolve_name(name: Option<InstanceName>, run: bool) -> InstanceName {
+    name.unwrap_or_else(|| {
+        if run {
+            generated_run_name()
+        } else {
+            "default".parse().expect("default instance name is valid")
+        }
+    })
+}
+
+fn generated_run_name() -> InstanceName {
+    format!("run-{}", uuid::Uuid::new_v4().simple())
+        .parse()
+        .expect("UUID-based run instance name is valid")
 }
 
 fn should_check_for_updates(cli: &Cli) -> bool {
@@ -427,11 +495,11 @@ mod tests {
         assert!(matches!(cli.command, Some(Command::Mine { blocks: 10 })));
 
         let cli = Cli::try_parse_from(["ths", "--name", "alice", "mine", "3"]).unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
         assert!(matches!(cli.command, Some(Command::Mine { blocks: 3 })));
 
         let cli = Cli::try_parse_from(["ths", "mine", "3", "--name", "alice"]).unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
 
         assert!(Cli::try_parse_from(["ths", "mine", "0"]).is_err());
         assert!(Cli::try_parse_from(["ths", "mine", "10001"]).is_err());
@@ -455,7 +523,7 @@ mod tests {
             "alice",
         ])
         .unwrap();
-        assert_eq!(cli.name.to_string(), "alice");
+        assert_eq!(cli.name.as_ref().unwrap().to_string(), "alice");
         assert!(matches!(
             cli.command,
             Some(Command::Faucet {
@@ -532,6 +600,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_wait_and_run_without_reusing_the_default_name() {
+        let run = Cli::try_parse_from(["ths", "run", "--", "npm", "test"]).unwrap();
+        assert!(run.name.is_none());
+        assert!(matches!(
+            run.command,
+            Some(Command::Run { timeout: 120, command })
+                if command == [OsString::from("npm"), OsString::from("test")]
+        ));
+
+        let wait = Cli::try_parse_from(["ths", "--name", "api", "wait", "--timeout", "7"]).unwrap();
+        assert_eq!(wait.name.as_ref().unwrap().to_string(), "api");
+        assert!(matches!(wait.command, Some(Command::Wait { timeout: 7 })));
+
+        assert!(Cli::try_parse_from(["ths", "--json", "run", "--", "true"]).is_ok());
+
+        let first = generated_run_name();
+        let second = generated_run_name();
+        assert_ne!(first.to_string(), second.to_string());
+        assert!(first.to_string().starts_with("run-"));
+
+        assert_eq!(resolve_name(None, false).to_string(), "default");
+    }
+
+    #[test]
     fn checks_for_updates_only_during_human_readable_startup() {
         let default = Cli::try_parse_from(["ths"]).unwrap();
         assert!(should_check_for_updates(&default));
@@ -570,8 +662,8 @@ mod tests {
         else {
             panic!("expected ths wallet send");
         };
-        assert_eq!((args.from, args.to), (1, 2));
-        assert_eq!(args.amount.zatoshi(), 150_000_000);
+        assert_eq!((args.from, args.to), (1, Some(2)));
+        assert_eq!(args.amount.map(SendAmount::zatoshi), Some(150_000_000));
         assert_eq!(args.source_pool, Pool::Transparent);
         assert_eq!(args.destination_pool, Pool::Ironwood);
         assert_eq!(args.memo.as_deref(), Some("hello"));
@@ -629,11 +721,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_wallet_balances_with_global_json_after_subcommand() {
+        let cli = Cli::try_parse_from(["ths", "wallet", "balances", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Some(Command::Wallet {
+                action: WalletCommand::Balances
+            })
+        ));
+    }
+
     fn send_args(from: u8, to: u8, destination_pool: Pool, memo: Option<&str>) -> SendArgs {
         SendArgs {
             from,
-            to,
-            amount: SendAmount(1),
+            to: Some(to),
+            uri: None,
+            amount: Some(SendAmount(1)),
             source_pool: Pool::Ironwood,
             destination_pool,
             memo: memo.map(str::to_owned),
@@ -656,6 +761,45 @@ mod tests {
         assert!(check_send(&shield).is_ok());
         assert!(check_send(&send_args(1, 1, Pool::Transparent, Some("hi"))).is_err());
         assert!(check_send(&send_args(1, 1, Pool::Transparent, Some(""))).is_err());
+    }
+
+    #[test]
+    fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["ths", "wallet", "send", "--from", "1"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+        let Ok(Cli {
+            command:
+                Some(Command::Wallet {
+                    action: WalletCommand::Send(args),
+                }),
+            ..
+        }) = parse(&["--uri", "zcash:uregtest1abc?amount=1"])
+        else {
+            panic!("expected ths wallet send --uri");
+        };
+        assert_eq!(args.uri.as_deref(), Some("zcash:uregtest1abc?amount=1"));
+        assert_eq!((args.to, args.amount), (None, None));
+
+        // --amount is still accepted for a URI that omits one.
+        assert!(parse(&["--uri", "zcash:uregtest1abc", "--amount", "1"]).is_ok());
+        // The URI already names the destination, its pool, and any memo.
+        assert!(parse(&["--uri", "zcash:uregtest1abc", "--to", "2"]).is_err());
+        assert!(
+            parse(&[
+                "--uri",
+                "zcash:uregtest1abc",
+                "--destination-pool",
+                "ironwood"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--uri", "zcash:uregtest1abc", "--memo", "hi"]).is_err());
+        // Without a URI, a destination and an amount are required.
+        assert!(parse(&["--amount", "1"]).is_err());
+        assert!(parse(&["--to", "2"]).is_err());
     }
 
     #[test]

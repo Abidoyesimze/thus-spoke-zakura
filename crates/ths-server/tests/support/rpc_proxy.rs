@@ -30,11 +30,31 @@ pub struct GenerateCounts {
     pub forwarded: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupPaymentSnapshot {
+    pub id: String,
+    pub txid: String,
+    pub raw: Vec<u8>,
+    pub expiry_height: u64,
+}
+
+fn startup_payment_snapshot(path: &std::path::Path) -> Result<StartupPaymentSnapshot> {
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("ths.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    Ok(db.query_row("SELECT a.id,a.txid,p.raw_transaction,p.expiry_height FROM activity a JOIN idempotency i ON i.activity_id=a.id JOIN prepared_payments p ON p.activity_id=a.id WHERE i.key='startup-account-1-ironwood-v1' AND a.status='broadcast'", [], |row| Ok(StartupPaymentSnapshot { id: row.get(0)?, txid: row.get(1)?, raw: row.get(2)?, expiry_height: row.get(3)? }))?)
+}
+
 #[derive(Default)]
 struct ProxyState {
     armed: bool,
     rejected: usize,
     forwarded: usize,
+    hidden_transaction: Option<String>,
+    hidden_lookups: usize,
+    startup_snapshot_path: Option<std::path::PathBuf>,
+    startup_snapshot: Option<StartupPaymentSnapshot>,
 }
 
 struct SharedProxy {
@@ -54,14 +74,14 @@ struct FallbackReaperState {
 /// The reaper is started before the listener. Its independent runtime keeps
 /// the JoinHandle owned until it can observe graceful completion or abort and
 /// join the server task, while the dropping owner waits only a bounded time.
-struct FallbackTaskReaper {
+pub(super) struct FallbackTaskReaper {
     state: Arc<(Mutex<FallbackReaperState>, Condvar)>,
     completion: Mutex<Receiver<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl FallbackTaskReaper {
-    fn start() -> Result<Self> {
+    pub(super) fn start() -> Result<Self> {
         let state = Arc::new((Mutex::new(FallbackReaperState::default()), Condvar::new()));
         let worker_state = Arc::clone(&state);
         let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
@@ -112,7 +132,7 @@ impl FallbackTaskReaper {
         }
     }
 
-    fn hand_off(&self, task: JoinHandle<Result<()>>) {
+    pub(super) fn hand_off(&self, task: JoinHandle<Result<()>>) {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         debug_assert!(
@@ -123,7 +143,7 @@ impl FallbackTaskReaper {
         wake.notify_one();
     }
 
-    fn wait_for_reap(&self) -> bool {
+    pub(super) fn wait_for_reap(&self) -> bool {
         self.completion
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -140,7 +160,7 @@ impl FallbackTaskReaper {
         }
     }
 
-    fn stop(&mut self) {
+    pub(super) fn stop(&mut self) {
         self.request_stop();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -179,6 +199,23 @@ pub struct GenerateFaultProxy {
 }
 
 impl GenerateFaultProxy {
+    pub fn hide_transaction(&self, txid: Option<String>) -> Result<()> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture proxy lock"))?
+            .hidden_transaction = txid;
+        Ok(())
+    }
+
+    pub fn hidden_lookups(&self) -> Result<usize> {
+        Ok(self
+            .shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture proxy lock"))?
+            .hidden_lookups)
+    }
     pub async fn start(upstream: String) -> Result<Self> {
         let fallback_reaper = FallbackTaskReaper::start()?;
         let client = Client::builder()
@@ -233,6 +270,26 @@ impl GenerateFaultProxy {
         }
         state.armed = true;
         Ok(())
+    }
+
+    pub fn fail_startup_auto_mine(&self, data_dir: &std::path::Path) -> Result<()> {
+        self.fail_next_generate()?;
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot_path = Some(data_dir.to_owned());
+        Ok(())
+    }
+
+    pub fn startup_funding_snapshot(&self) -> Result<StartupPaymentSnapshot> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot
+            .clone()
+            .context("startup funding fault did not capture signed bytes")
     }
 
     pub fn counts(&self) -> GenerateCounts {
@@ -336,7 +393,23 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
     let is_generate = method == Some("generate");
     let is_fault_target = is_generate && payload.get("params") == Some(&json!([1]));
 
-    let rejected = {
+    let hidden = {
+        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        let hidden = method == Some("getrawtransaction")
+            && state
+                .hidden_transaction
+                .as_deref()
+                .is_some_and(|txid| payload["params"][0].as_str() == Some(txid));
+        if hidden {
+            state.hidden_lookups += 1;
+        }
+        hidden
+    };
+    if hidden {
+        return json_rpc_error(StatusCode::OK, id, -5, "injected missing transaction");
+    }
+
+    let rejected_code = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(_) => {
@@ -349,15 +422,44 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
             }
         };
         if is_fault_target && state.armed {
-            state.armed = false;
-            state.rejected += 1;
-            true
+            if let Some(path) = state.startup_snapshot_path.as_ref() {
+                match startup_payment_snapshot(path) {
+                    Ok(snapshot) => {
+                        state.startup_snapshot = Some(snapshot);
+                        state.startup_snapshot_path = None;
+                        state.armed = false;
+                        state.rejected += 1;
+                        Some(-28)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::QueryReturnedNoRows)
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "capturing startup funding fault failed");
+                        return json_rpc_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            id,
+                            -32603,
+                            "startup funding snapshot failed",
+                        );
+                    }
+                }
+            } else {
+                state.armed = false;
+                state.rejected += 1;
+                Some(-32603)
+            }
         } else {
-            false
+            None
         }
     };
-    if rejected {
-        return json_rpc_error(StatusCode::OK, id, -32603, "injected auto-mine failure");
+    if let Some(code) = rejected_code {
+        return json_rpc_error(StatusCode::OK, id, code, "injected auto-mine failure");
     }
 
     if is_generate {

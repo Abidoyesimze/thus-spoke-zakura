@@ -41,6 +41,10 @@ pub struct RpcError {
     message: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Zakura returned HTTP {0} while unavailable")]
+pub(crate) struct RpcUnavailable(pub reqwest::StatusCode);
+
 impl NodeRpc {
     pub fn new(endpoint: String) -> Self {
         Self {
@@ -77,6 +81,15 @@ impl NodeRpc {
                 anyhow::Error::new(error).context(context)
             })?;
         let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return Err(RpcUnavailable(status).into());
+        }
         let envelope: Value = response.json().await.context("decoding Zakura response")?;
         classify_response(status, method, envelope)
     }
@@ -173,6 +186,43 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.to_string(), "Zakura getblockcount timed out after 50ms");
+    }
+
+    #[tokio::test]
+    async fn explicit_availability_statuses_are_retryable_without_a_json_rpc_body() {
+        for (status, body, retryable) in [
+            (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily unavailable",
+                true,
+            ),
+            (axum::http::StatusCode::BAD_GATEWAY, "{", true),
+            (axum::http::StatusCode::GATEWAY_TIMEOUT, "{}", true),
+            (axum::http::StatusCode::TOO_MANY_REQUESTS, "busy", true),
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "{", false),
+            (axum::http::StatusCode::OK, "{", false),
+            (
+                axum::http::StatusCode::OK,
+                "{\"result\":{},\"error\":null}",
+                false,
+            ),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let rpc = NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+            let app = axum::Router::new().route(
+                "/",
+                axum::routing::post(move || async move { (status, body) }),
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let error = rpc.chain_info().await.unwrap_err();
+            assert_eq!(
+                crate::startup_retryable(&error),
+                retryable,
+                "{status}: {error:#}"
+            );
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
     }
 
     #[test]

@@ -5,13 +5,7 @@ mod reconcile;
 mod rpc;
 mod wallet;
 
-use std::{
-    fmt::Write,
-    fs,
-    net::SocketAddr,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use std::{fmt::Write, fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -166,24 +160,76 @@ fn background_tasks(state: api::AppState) -> tokio::task::JoinSet<Result<()>> {
     background
 }
 
-async fn start_and_sync(state: api::AppState) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(120);
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadinessError {
+    #[error("chain is below the wallet birthday floor; waiting for canonical block 1")]
+    BelowBirthday,
+    #[error("lightwalletd has not indexed the canonical rewind checkpoint")]
+    RewindCheckpoint,
+    #[error("chain checkpoint changed before wallet publication")]
+    CheckpointChanged,
+    #[error("initial funding is awaiting confirmation")]
+    FundingPending,
+}
+
+fn startup_retryable(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<rpc::RpcUnavailable>().is_some()
+        || error.downcast_ref::<ReadinessError>().is_some()
+        || error
+            .downcast_ref::<reconcile::ReconciliationDeadline>()
+            .is_some()
+        || error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.is_connect() || error.is_timeout();
+    }
+    if let Some(error) = error.downcast_ref::<rpc::RpcError>() {
+        return error.code == -28;
+    }
+    if let Some(error) = error.downcast_ref::<tonic::Status>() {
+        return matches!(
+            error.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::ResourceExhausted
+        );
+    }
+    error.downcast_ref::<tonic::transport::Error>().is_some()
+}
+
+async fn retry_startup<F, Fut>(mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     loop {
-        match api::dependencies_ready(&state).await {
-            Ok(()) => break,
-            Err(error) if Instant::now() < deadline => {
-                tracing::info!(
-                    error = %format_args!("{error:#}"),
-                    "waiting for Zakura and lightwalletd"
-                );
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error) if startup_retryable(&error) => {
+                tracing::info!(error = %format_args!("{error:#}"), "waiting for startup readiness");
                 tokio::time::sleep(Duration::from_millis(750)).await;
             }
-            Err(error) => return Err(error).context("waiting for startup dependencies"),
+            Err(error) => return Err(error),
         }
     }
-    api::provision_initial_balance(&state)
-        .await
-        .context("provisioning Account 1 with 5 Ironwood ZEC")?;
+}
+
+async fn start_and_sync(state: api::AppState) -> Result<()> {
+    // Network stages have their own deadlines. Await provisioning to completion
+    // so its payment guards remain owned while a wallet worker is running.
+    retry_startup(|| async {
+        api::dependencies_ready(&state)
+            .await
+            .context("waiting for startup dependencies")?;
+        api::provision_initial_balance(&state)
+            .await
+            .context("provisioning Account 1 with 5 Ironwood ZEC")
+    })
+    .await?;
     state.mark_started();
     tracing::info!("dashboard ready");
     api::wallet_sync_loop(state).await;
@@ -211,6 +257,129 @@ async fn serve_with_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_retries_past_two_minutes_with_a_delay_then_recovers() {
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = attempts.clone();
+        let started = tokio::time::Instant::now();
+        retry_startup(|| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async {
+                if started.elapsed() < Duration::from_secs(125) {
+                    Err(tonic::Status::unavailable("dependency unavailable").into())
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_secs(125));
+        assert!(attempts.load(std::sync::atomic::Ordering::SeqCst) < 180);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_does_not_cancel_a_slow_preparation_or_release_its_guard() {
+        let guard = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let owned = guard.clone();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut attempt = Some((entered, released));
+        let startup = tokio::spawn(async move {
+            retry_startup(|| {
+                let owned = owned.clone();
+                let (entered, released) = attempt.take().expect("preparation was restarted");
+                async move {
+                    let _guard = owned.lock().await;
+                    entered.send(()).unwrap();
+                    released.await.unwrap();
+                    Ok(())
+                }
+            })
+            .await
+        });
+        ready.await.unwrap();
+        tokio::time::advance(Duration::from_secs(130)).await;
+        assert!(!startup.is_finished());
+        assert!(guard.try_lock().is_err());
+        release.send(()).unwrap();
+        startup.await.unwrap().unwrap();
+        assert!(guard.try_lock().is_ok());
+    }
+
+    #[test]
+    fn startup_retries_only_typed_transient_failures() {
+        for code in [-28, -5, -32603] {
+            let rpc: rpc::RpcError =
+                serde_json::from_value(serde_json::json!({"code": code, "message": "waiting"}))
+                    .unwrap();
+            assert_eq!(
+                startup_retryable(&anyhow::Error::new(rpc).context("startup")),
+                code == -28
+            );
+        }
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::DeadlineExceeded,
+            tonic::Code::ResourceExhausted,
+            tonic::Code::InvalidArgument,
+            tonic::Code::DataLoss,
+            tonic::Code::Internal,
+            tonic::Code::Unknown,
+        ] {
+            let error = anyhow::Error::new(tonic::Status::new(code, "waiting"));
+            assert_eq!(
+                startup_retryable(&error),
+                matches!(
+                    code,
+                    tonic::Code::Unavailable
+                        | tonic::Code::DeadlineExceeded
+                        | tonic::Code::ResourceExhausted
+                )
+            );
+        }
+        for error in [
+            anyhow::anyhow!("node unavailable"),
+            anyhow::anyhow!("invalid Regtest checkpoint"),
+            rusqlite::Error::InvalidQuery.into(),
+            db::IdempotencyConflict.into(),
+            wallet::PaymentError::TreasuryExhausted.into(),
+            wallet::PaymentError::ScanRequired.into(),
+        ] {
+            assert!(!startup_retryable(&error), "{error}");
+        }
+        for pending in [
+            ReadinessError::BelowBirthday,
+            ReadinessError::RewindCheckpoint,
+            ReadinessError::CheckpointChanged,
+            ReadinessError::FundingPending,
+        ] {
+            assert!(startup_retryable(&pending.into()));
+        }
+        assert!(startup_retryable(&reconcile::ReconciliationDeadline.into()));
+    }
+
+    #[tokio::test]
+    async fn fatal_startup_error_stops_http_and_cancels_siblings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (cancelled, cancellation) = tokio::sync::oneshot::channel::<()>();
+        let mut background = tokio::task::JoinSet::new();
+        background.spawn(async move {
+            let _cancelled = cancelled;
+            std::future::pending::<Result<()>>().await
+        });
+        background.spawn(retry_startup(|| async {
+            Err(rusqlite::Error::InvalidQuery.into())
+        }));
+        let error = serve_with_background(listener, axum::Router::new(), background)
+            .await
+            .unwrap_err();
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        assert!(cancellation.await.is_err());
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
 
     async fn assert_background_failure_stops_http(panics: bool) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -287,7 +456,15 @@ mod tests {
         let store = Store::open(dir.path().join("ths.db")).unwrap();
         store.initialize().unwrap();
         let failed = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "restart-failed", None)
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "restart-failed",
+                None,
+            )
             .unwrap();
         store.fail(&failed.id, "insufficient funds").unwrap();
         let external = store
@@ -328,6 +505,7 @@ mod tests {
             }
         };
 
+        tokio::time::sleep(Duration::from_secs(122)).await;
         let (status, activity) = get("/api/v1/activity?idempotency_key=restart-failed").await;
         assert_eq!(status, reqwest::StatusCode::OK);
         assert_eq!(activity[0]["id"], failed.id);

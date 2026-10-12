@@ -360,6 +360,10 @@ impl RegtestStack {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        self.start_with_funding_fault(false).await
+    }
+
+    pub async fn start_with_funding_fault(&mut self, fail_auto_mine: bool) -> Result<()> {
         ensure!(
             !self.start_attempted,
             "fixture startup may only be attempted once per owned stack"
@@ -511,6 +515,9 @@ impl RegtestStack {
 
         self.cleanup.push(CleanupResource::Proxy);
         self.proxy = Some(GenerateFaultProxy::start(self.node_url.clone()).await?);
+        if fail_auto_mine {
+            self.proxy().fail_startup_auto_mine(&self.data_dir)?;
+        }
         let api_port = select_loopback_port()?;
         self.api_url = format!("http://127.0.0.1:{api_port}");
         self.cleanup.push(CleanupResource::Server);
@@ -535,7 +542,22 @@ impl RegtestStack {
         self.stop_server().await?;
         self.server_exit_code = None;
         self.spawn_server(api_port, lightwalletd_port).await?;
-        self.wait_for_funded_server().await
+        // Reopened wallets may already have a pending spend of their initial funding.
+        self.wait_for_ready_server(false).await
+    }
+
+    pub fn lightwalletd_port(&self) -> Result<u16> {
+        self.lightwalletd_port
+            .context("fixture lightwalletd port is missing")
+    }
+
+    pub async fn restart_with_lightwalletd(&mut self, port: u16) -> Result<()> {
+        self.lightwalletd_port = Some(port);
+        self.restart_server().await
+    }
+
+    pub async fn interrupt_server(&mut self) -> Result<()> {
+        self.stop_server().await
     }
 
     pub fn node_url(&self) -> &str {
@@ -797,6 +819,10 @@ impl RegtestStack {
     }
 
     async fn wait_for_funded_server(&mut self) -> Result<()> {
+        self.wait_for_ready_server(true).await
+    }
+
+    async fn wait_for_ready_server(&mut self, require_initial_funding: bool) -> Result<()> {
         let deadline = Instant::now() + FUNDED_STARTUP_TIMEOUT;
         loop {
             self.assert_running_before(deadline).await?;
@@ -825,7 +851,7 @@ impl RegtestStack {
                     let funded = accounts
                         .iter()
                         .any(|account| account.id == 1 && account.ironwood_zatoshi == 500_000_000);
-                    if health.wallet_sync.state == "ready" && funded {
+                    if health.wallet_sync.state == "ready" && (!require_initial_funding || funded) {
                         return Ok(());
                     }
                 }
