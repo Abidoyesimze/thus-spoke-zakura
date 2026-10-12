@@ -542,14 +542,15 @@ pub(super) fn published_port(container: &str, port: &str) -> Result<u16> {
     .parse()
     .context("Docker returned an invalid published port")
 }
+/// Lists only running containers, so a stopped or missing one is `false` rather than an error.
 pub(crate) fn container_running(name: &str) -> Result<bool> {
-    Ok(docker_output([
+    docker_listed([
         "container",
-        "inspect",
-        "--format",
-        "{{.State.Running}}",
-        name,
-    ])? == "true")
+        "ls",
+        "--quiet",
+        "--filter",
+        &format!("name=^{name}$"),
+    ])
 }
 pub(super) fn published_port_with(
     docker: &impl DockerResourceCommands,

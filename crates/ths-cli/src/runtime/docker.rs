@@ -5,10 +5,8 @@ pub(super) trait DockerResourceCommands {
     fn run(&self, args: &[&str]) -> Result<()>;
 }
 
-#[cfg(test)]
 pub(super) struct DockerCli;
 
-#[cfg(test)]
 impl DockerResourceCommands for DockerCli {
     fn output(&self, args: &[&str]) -> Result<String> {
         docker_output_args(args)
@@ -109,7 +107,11 @@ impl<'a> LifecycleDocker<'a> {
         args: &[&str],
         mode: OutputMode,
     ) -> Result<CapturedOutput, CommandFailure> {
-        let mut command = Command::new(&self.program);
+        let mut command = if self.program == "docker" {
+            docker_cli()
+        } else {
+            Command::new(&self.program)
+        };
         command.args(&self.prefix_args);
         command.args(args);
         for (key, value) in &self.env {

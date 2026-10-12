@@ -42,6 +42,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             runtime.faucet(&cli.name, &address, amount.zatoshi(), cli.json)
         }
         Command::Wallet { action } => match action {
+            WalletCommand::Balances => runtime.wallet_balances(&cli.name, cli.json),
             WalletCommand::Faucet {
                 accounts,
                 amount,

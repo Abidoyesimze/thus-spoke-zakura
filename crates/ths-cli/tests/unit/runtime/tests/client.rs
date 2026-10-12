@@ -69,3 +69,69 @@ fn wallet_faucet_keeps_funding_after_a_failed_account_and_keeps_its_keys() {
         );
     }
 }
+
+#[test]
+fn balances_print_each_account_without_viewing_keys() {
+    let accounts: Vec<Account> = serde_json::from_str(
+        r#"[{"id":1,"name":"Account 1","unified_address":"uregtest1a","transparent_address":"tm1a","unified_full_viewing_key":"uviewregtest1a","transparent_zatoshi":50000000,"ironwood_zatoshi":500000000},
+            {"id":2,"name":"Account 2","unified_address":"uregtest1b","transparent_address":"tm1b","unified_full_viewing_key":"uviewregtest1b","transparent_zatoshi":0,"ironwood_zatoshi":1}]"#,
+    )
+    .unwrap();
+    assert_eq!(
+        balance_lines(&accounts),
+        "Account 1\n  Transparent  0.5 ZEC  tm1a\n  Ironwood     5 ZEC  uregtest1a\n\
+         Account 2\n  Transparent  0 ZEC  tm1b\n  Ironwood     0.00000001 ZEC  uregtest1b"
+    );
+    assert_eq!(
+        serde_json::to_value(&accounts).unwrap()[0],
+        serde_json::json!({
+            "id": 1,
+            "transparent_address": "tm1a",
+            "unified_address": "uregtest1a",
+            "transparent_zatoshi": 50_000_000,
+            "ironwood_zatoshi": 500_000_000,
+        })
+    );
+}
+
+#[test]
+fn balances_require_a_ready_wallet_before_reading_accounts() {
+    let (url, requests) = serve(vec![
+        (
+            "200 OK",
+            r#"{"wallet_sync":{"state":"ready","error":null}}"#,
+        ),
+        (
+            "200 OK",
+            r#"[{"id":1,"unified_address":"uregtest1a","transparent_address":"tm1a","transparent_zatoshi":50000000,"ironwood_zatoshi":500000000}]"#,
+        ),
+    ]);
+
+    let accounts =
+        account_balances(&url, &reqwest::blocking::Client::new(), &name("alpha")).unwrap();
+
+    assert_eq!(accounts.len(), 1);
+    assert_eq!(requests.try_iter().count(), 2);
+}
+
+#[test]
+fn balances_reject_syncing_and_failed_wallets_before_reading_accounts() {
+    for (status, expected) in [
+        (
+            r#"{"wallet_sync":{"state":"syncing","error":null}}"#,
+            "wallet for environment alpha is still syncing; try again later",
+        ),
+        (
+            r#"{"wallet_sync":{"state":"error","error":"lightwalletd is unavailable"}}"#,
+            "wallet synchronization failed for environment alpha: lightwalletd is unavailable",
+        ),
+    ] {
+        let (url, requests) = serve(vec![("200 OK", status)]);
+
+        let error =
+            account_balances(&url, &reqwest::blocking::Client::new(), &name("alpha")).unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(requests.try_iter().count(), 1);
+    }
+}

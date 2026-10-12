@@ -386,3 +386,44 @@ fn app_identity_capture_does_not_fall_back_to_a_replacement_on_docker_errors() {
     let error = allocate_replaced_app(&docker).unwrap_err();
     assert!(error.to_string().contains("Docker is unreachable"));
 }
+
+#[test]
+fn docker_errors_are_not_reported_as_missing_resources() {
+    with_unreachable_docker(|| {
+        assert!(container_running("ths-alpha-app").is_err());
+        assert!(owned_resource(&DockerCli, "volume", "ths-alpha-chain", &name("alpha")).is_err());
+        assert!(owned_resource(&DockerCli, "network", "ths-alpha", &name("alpha")).is_err());
+        assert!(DockerEvents::default().exists("0123abcd").is_err());
+    });
+}
+
+#[test]
+fn deleting_keeps_metadata_while_docker_is_unreachable() {
+    let runtime = Runtime {
+        root: std::env::temp_dir().join(format!("ths-unreachable-{}", std::process::id())),
+    };
+    let name = name("alpha");
+    fs::create_dir_all(runtime.instance_dir(&name)).unwrap();
+    runtime
+        .write_instance(&name, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    let err = with_unreachable_docker(|| runtime.stop(&name)).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("container ths-alpha-app"),
+        "container missing from {message}"
+    );
+    assert!(runtime.read_instance(&name).is_ok(), "metadata was deleted");
+    fs::remove_dir_all(&runtime.root).unwrap();
+}
+
+#[test]
+fn commands_report_docker_errors_instead_of_a_stopped_environment() {
+    let runtime = runtime_for_tests();
+    let name = name("alpha");
+    let err = with_unreachable_docker(|| runtime.mine(&name, 1, false)).unwrap_err();
+    assert!(
+        !err.to_string().contains("is not running"),
+        "reported a Docker error as a stopped environment: {err}"
+    );
+}

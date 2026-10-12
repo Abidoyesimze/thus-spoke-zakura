@@ -7,7 +7,7 @@ use std::{
 
 pub(crate) struct FaucetJournal {
     path: PathBuf,
-    _lock: File,
+    pub(crate) lock: File,
 }
 
 impl FaucetJournal {
@@ -30,7 +30,7 @@ impl FaucetJournal {
         }
         Ok(Self {
             path: instance_dir.join("faucet-intents.json"),
-            _lock: lock,
+            lock: lock,
         })
     }
 
@@ -103,5 +103,17 @@ impl FaucetJournal {
             entries.remove(*intent);
         }
         self.write(&entries)
+    }
+}
+
+impl Drop for FaucetJournal {
+    fn drop(&mut self) {
+        // Closing the file releases this flock only after every inherited copy
+        // is closed too. A child forked while the guard is alive can hold that
+        // copy until exec, so a following faucet command would still see the
+        // journal as busy. Unlocking releases every copy of this descriptor.
+        if let Err(error) = self.lock.unlock() {
+            eprintln!("could not release the faucet intent lock: {error}");
+        }
     }
 }

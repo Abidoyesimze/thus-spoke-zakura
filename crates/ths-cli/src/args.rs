@@ -112,6 +112,8 @@ pub(crate) enum Command {
 
 #[derive(Subcommand)]
 pub(crate) enum WalletCommand {
+    /// Show current account addresses and spendable balances.
+    Balances,
     /// Send faucet funds from the treasury to one or more accounts.
     Faucet {
         /// Account indices to fund (1-5), e.g. --accounts 1,2,3,5.

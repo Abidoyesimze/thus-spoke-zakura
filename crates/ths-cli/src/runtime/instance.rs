@@ -46,6 +46,9 @@ pub(crate) struct Instance {
     pub(super) name: String,
     pub(super) version: u32,
     pub(crate) endpoints: Endpoints,
+    /// unix seconds; missing for environments created before it was recorded.
+    #[serde(default)]
+    pub(super) created_at: Option<u64>,
 }
 
 impl Runtime {
@@ -54,7 +57,7 @@ impl Runtime {
             .read_instance(name)
             .map(|i| i.endpoints)
             .or_else(|_| inspect_endpoints(&prefix(name)))?;
-        let running = container_running(&format!("{}-app", prefix(name))).unwrap_or(false);
+        let running = container_running(&format!("{}-app", prefix(name)))?;
         if json {
             println!(
                 "{}",
@@ -79,23 +82,13 @@ impl Runtime {
     }
 
     pub fn list(&self, json: bool) -> Result<()> {
-        let mut instances = Vec::new();
-        if self.root.exists() {
-            for entry in fs::read_dir(&self.root)? {
-                let path = entry?.path().join("instance.json");
-                if path.exists() {
-                    instances.push(serde_json::from_slice::<Instance>(&fs::read(path)?)?);
-                }
-            }
-        }
+        let environments = self.environments(&DockerCli)?;
         if json {
-            println!("{}", serde_json::to_string_pretty(&instances)?);
-        } else if instances.is_empty() {
+            println!("{}", serde_json::to_string_pretty(&environments)?);
+        } else if environments.is_empty() {
             println!("No environments yet.");
         } else {
-            for i in instances {
-                println!("{:<20} {}", i.name, i.endpoints.dashboard);
-            }
+            print!("{}", render_list(&environments, now_unix()?));
         }
         Ok(())
     }
@@ -109,6 +102,7 @@ impl Runtime {
             name: name.to_string(),
             version: 1,
             endpoints: endpoints.clone(),
+            created_at: Some(now_unix()?),
         };
         fs::write(
             self.instance_dir(name).join("instance.json"),
@@ -228,4 +222,222 @@ impl Runtime {
             Err(TryLockError::Error(error)) => Err(error).context("locking environment"),
         }
     }
+}
+
+impl Runtime {
+    pub(super) fn environments(
+        &self,
+        docker: &impl DockerResourceCommands,
+    ) -> Result<Vec<EnvironmentStatus>> {
+        let mut environments = Vec::new();
+        if self.root.exists() {
+            for entry in fs::read_dir(&self.root)? {
+                let path = entry?.path().join("instance.json");
+                if path.exists() {
+                    let instance = serde_json::from_slice::<Instance>(&fs::read(&path)?)?;
+                    let name = instance.name.parse()?;
+                    let containers = SERVICES
+                        .into_iter()
+                        .map(|service| container_status(docker, &name, service))
+                        .collect::<Result<Vec<_>>>();
+                    environments.push(environment_status(instance, containers));
+                }
+            }
+        }
+        environments.sort_by(|left, right| left.instance.name.cmp(&right.instance.name));
+        Ok(environments)
+    }
+}
+
+/// one container's docker state (`running`, `paused`, `exited`, ...), `missing`, or `foreign`
+/// when a container this instance doesn't own holds its name, with its unix-second creation and
+/// start times.
+#[derive(Debug, Serialize)]
+pub(super) struct ContainerStatus {
+    pub(super) service: &'static str,
+    pub(super) state: String,
+    pub(super) created_at: Option<u64>,
+    pub(super) started_at: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct EnvironmentStatus {
+    #[serde(flatten)]
+    pub(super) instance: Instance,
+    /// `running`, `paused` (every service up, some paused), `degraded` (some services up),
+    /// `stopped`, `conflict` when another owner holds one of its container names, or `unknown`
+    /// when docker can't be read.
+    pub(super) state: &'static str,
+    pub(super) containers: Vec<ContainerStatus>,
+}
+
+pub(super) const SERVICES: [&str; 4] = ["app", "zakura", "lightwalletd", "init"];
+
+/// keeps an environment whose containers can't be read, such as while docker is stopped, with
+/// its live status unknown.
+pub(super) fn environment_status(
+    instance: Instance,
+    containers: Result<Vec<ContainerStatus>>,
+) -> EnvironmentStatus {
+    let (state, containers) = match containers {
+        Ok(containers) => (environment_state(&containers), containers),
+        Err(_) => ("unknown", Vec::new()),
+    };
+    EnvironmentStatus {
+        state,
+        instance,
+        containers,
+    }
+}
+
+/// an environment's state from its long-running services; `init` is not one of them. a paused
+/// service is still up, so it never makes an environment stopped.
+pub(super) fn environment_state(containers: &[ContainerStatus]) -> &'static str {
+    if containers.iter().any(|c| c.state == "foreign") {
+        return "conflict";
+    }
+    let services: Vec<_> = containers.iter().filter(|c| c.service != "init").collect();
+    let up = services
+        .iter()
+        .filter(|c| c.state == "running" || c.state == "paused")
+        .count();
+    match up {
+        0 => "stopped",
+        n if n < services.len() => "degraded",
+        _ if services.iter().any(|c| c.state == "paused") => "paused",
+        _ => "running",
+    }
+}
+
+pub(super) fn container_status(
+    docker: &impl DockerResourceCommands,
+    name: &InstanceName,
+    service: &'static str,
+) -> Result<ContainerStatus> {
+    let container = format!("{}-{service}", prefix(name));
+    let unread = |state: &str| ContainerStatus {
+        service,
+        state: state.into(),
+        created_at: None,
+        started_at: None,
+    };
+    let id = match owned_resource(docker, "container", &container, name) {
+        Ok(Some(id)) => id,
+        Ok(None) => return Ok(unread("missing")),
+        Err(error) if error.to_string().contains("is not owned by") => {
+            return Ok(unread("foreign"));
+        }
+        Err(error) => return Err(error),
+    };
+    let output = docker.output(&[
+        "container",
+        "inspect",
+        "--format",
+        "{{.State.Status}} {{.Created}} {{.State.StartedAt}}",
+        &id,
+    ])?;
+    let mut fields = output.split_whitespace();
+    Ok(ContainerStatus {
+        service,
+        state: fields.next().unwrap_or("unknown").to_owned(),
+        created_at: fields.next().and_then(parse_docker_time),
+        started_at: fields.next().and_then(parse_docker_time),
+    })
+}
+
+/// unix seconds from docker's utc rfc 3339 timestamps. docker reports a container that never
+/// started as started in year one, which gives nothing.
+pub(super) fn parse_docker_time(value: &str) -> Option<u64> {
+    let (date, time) = value.split_once('T')?;
+    let mut date = date.splitn(3, '-').map(str::parse::<i64>);
+    let (year, month, day) = (date.next()?.ok()?, date.next()?.ok()?, date.next()?.ok()?);
+    let time = time.strip_suffix('Z')?;
+    let mut time = time.split(['.', ':']).map(str::parse::<i64>);
+    let (hour, minute, second) = (time.next()?.ok()?, time.next()?.ok()?, time.next()?.ok()?);
+    if year < 1970 {
+        return None;
+    }
+    // days since the epoch for a proleptic gregorian date.
+    let (y, m) = if month <= 2 {
+        (year - 1, month + 9)
+    } else {
+        (year, month - 3)
+    };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hour * 3_600 + minute * 60 + second).ok()
+}
+
+pub(super) fn now_unix() -> Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before 1970")?
+        .as_secs())
+}
+
+pub(super) fn ago(now: u64, then: u64) -> String {
+    let seconds = now.saturating_sub(then);
+    match seconds {
+        0..60 => format!("{seconds}s ago"),
+        60..3_600 => format!("{}m ago", seconds / 60),
+        3_600..86_400 => format!("{}h ago", seconds / 3_600),
+        _ => format!("{}d ago", seconds / 86_400),
+    }
+}
+
+pub(super) fn render_list(environments: &[EnvironmentStatus], now: u64) -> String {
+    let (unknown, known): (Vec<_>, Vec<_>) =
+        environments.iter().partition(|e| e.state == "unknown");
+    let (conflict, known): (Vec<_>, Vec<_>) =
+        known.into_iter().partition(|e| e.state == "conflict");
+    let (active, inactive): (Vec<_>, Vec<_>) =
+        known.into_iter().partition(|e| e.state != "stopped");
+    let has_inactive = !inactive.is_empty();
+    let mut out = String::new();
+    for (title, section) in [
+        ("ACTIVE", active),
+        ("CONFLICT", conflict),
+        ("UNKNOWN", unknown),
+        ("INACTIVE", inactive),
+    ] {
+        if section.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(title);
+        out.push('\n');
+        for e in section {
+            let mut line = format!(
+                "{:<16} {:<26} {:<8}",
+                e.instance.name, e.instance.endpoints.dashboard, e.state
+            );
+            if let Some(created) = e.instance.created_at {
+                line.push_str(&format!("   created {}", ago(now, created)));
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+            for c in &e.containers {
+                let mut line = format!("  {:<13} {:<9}", c.service, c.state);
+                if let Some(created) = c.created_at {
+                    line.push_str(&format!(" created {:<9}", ago(now, created)));
+                }
+                if let Some(started) = c.started_at {
+                    line.push_str(&format!(" started {}", ago(now, started)));
+                }
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+        }
+    }
+    if has_inactive {
+        out.push_str(
+            "\nRemove an inactive environment and all of its data with:\n  ths --name <name> stop\n",
+        );
+    }
+    out
 }

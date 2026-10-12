@@ -108,3 +108,265 @@ fn endpoints_json_without_network_fields_still_deserializes() {
     assert_eq!(parsed.network, "regtest");
     assert!(!parsed.tls);
 }
+
+fn environment(name: &str, states: [&str; 4]) -> EnvironmentStatus {
+    let containers = SERVICES
+        .into_iter()
+        .zip(states)
+        .map(|(service, state)| ContainerStatus {
+            service,
+            state: state.into(),
+            created_at: (state != "missing").then_some(1_000),
+            started_at: (state == "running" || state == "exited").then_some(1_060),
+        })
+        .collect::<Vec<_>>();
+    EnvironmentStatus {
+        instance: Instance {
+            name: name.into(),
+            version: 1,
+            endpoints: endpoints_for(&HostPorts {
+                dashboard: 8080,
+                rpc: 18232,
+                lightwalletd: 9067,
+                p2p: 18233,
+            }),
+            created_at: Some(1_000),
+        },
+        state: environment_state(&containers),
+        containers,
+    }
+}
+
+#[test]
+fn environments_are_classified_by_their_long_running_services() {
+    let state = |states| environment("e", states).state;
+    assert_eq!(
+        state(["running", "running", "running", "exited"]),
+        "running"
+    );
+    assert_eq!(
+        state(["exited", "running", "running", "exited"]),
+        "degraded"
+    );
+    assert_eq!(
+        state(["missing", "running", "missing", "missing"]),
+        "degraded"
+    );
+    assert_eq!(state(["exited", "exited", "exited", "exited"]), "stopped");
+    assert_eq!(
+        state(["missing", "missing", "missing", "missing"]),
+        "stopped"
+    );
+    // init is one-shot: running or not, it does not decide the state.
+    assert_eq!(state(["exited", "exited", "exited", "running"]), "stopped");
+    // a paused service is still up.
+    assert_eq!(state(["paused", "paused", "paused", "exited"]), "paused");
+    assert_eq!(state(["paused", "running", "running", "exited"]), "paused");
+    assert_eq!(state(["paused", "exited", "running", "exited"]), "degraded");
+    // any container under its names that it doesn't own, init included.
+    assert_eq!(
+        state(["foreign", "foreign", "foreign", "missing"]),
+        "conflict"
+    );
+    assert_eq!(
+        state(["running", "running", "running", "foreign"]),
+        "conflict"
+    );
+}
+
+#[test]
+fn the_list_groups_active_before_inactive_and_hints_only_for_inactive() {
+    let active = environment("default", ["running", "running", "running", "exited"]);
+    let degraded = environment("partial", ["exited", "running", "running", "exited"]);
+    let stopped = environment("old", ["missing", "missing", "missing", "missing"]);
+    let rendered = render_list(&[stopped, active, degraded], 1_000 + 7_200);
+    assert_eq!(
+        rendered,
+        concat!(
+            "ACTIVE\n",
+            "default          http://127.0.0.1:8080      running    created 2h ago\n",
+            "  app           running   created 2h ago    started 1h ago\n",
+            "  zakura        running   created 2h ago    started 1h ago\n",
+            "  lightwalletd  running   created 2h ago    started 1h ago\n",
+            "  init          exited    created 2h ago    started 1h ago\n",
+            "partial          http://127.0.0.1:8080      degraded   created 2h ago\n",
+            "  app           exited    created 2h ago    started 1h ago\n",
+            "  zakura        running   created 2h ago    started 1h ago\n",
+            "  lightwalletd  running   created 2h ago    started 1h ago\n",
+            "  init          exited    created 2h ago    started 1h ago\n",
+            "\n",
+            "INACTIVE\n",
+            "old              http://127.0.0.1:8080      stopped    created 2h ago\n",
+            "  app           missing\n",
+            "  zakura        missing\n",
+            "  lightwalletd  missing\n",
+            "  init          missing\n",
+            "\n",
+            "Remove an inactive environment and all of its data with:\n",
+            "  ths --name <name> stop\n",
+        )
+    );
+    // no inactive environment: no empty section and no hint.
+    let only_active = render_list(
+        &[environment(
+            "default",
+            ["running", "running", "running", "exited"],
+        )],
+        1_000,
+    );
+    assert!(!only_active.contains("INACTIVE") && !only_active.contains("ths --name"));
+    let only_inactive = render_list(
+        &[environment("old", ["exited", "exited", "exited", "exited"])],
+        1_000,
+    );
+    assert!(only_inactive.starts_with("INACTIVE\n") && only_inactive.contains("ths --name"));
+}
+
+#[test]
+fn the_json_list_keeps_its_fields_and_adds_absolute_status() {
+    let json = serde_json::to_value(environment(
+        "default",
+        ["running", "exited", "missing", "exited"],
+    ))
+    .unwrap();
+    assert_eq!(json["name"], "default");
+    assert_eq!(json["version"], 1);
+    assert_eq!(json["endpoints"]["dashboard"], "http://127.0.0.1:8080");
+    assert_eq!(json["state"], "degraded");
+    assert_eq!(json["created_at"], 1_000);
+    assert_eq!(json["containers"][0]["service"], "app");
+    assert_eq!(json["containers"][0]["started_at"], 1_060);
+    assert_eq!(json["containers"][2]["state"], "missing");
+    assert!(json["containers"][2]["created_at"].is_null());
+}
+
+#[test]
+fn environments_recorded_before_creation_times_still_list() {
+    let mut old = environment("old", ["missing", "missing", "missing", "missing"]);
+    let mut legacy = serde_json::to_value(&old.instance).unwrap();
+    legacy.as_object_mut().unwrap().remove("created_at");
+    old.instance = serde_json::from_value(legacy).unwrap();
+    assert_eq!(old.instance.created_at, None);
+    assert!(
+        render_list(&[old], 1_000)
+            .starts_with("INACTIVE\nold              http://127.0.0.1:8080      stopped\n")
+    );
+}
+
+#[test]
+fn environments_still_list_when_docker_is_unavailable() {
+    let saved = environment("default", ["running", "running", "running", "exited"]).instance;
+    let unknown = environment_status(saved, Err(anyhow!("Cannot connect to the Docker daemon")));
+    let json = serde_json::to_value(&unknown).unwrap();
+    assert_eq!(json["name"], "default");
+    assert_eq!(json["endpoints"]["dashboard"], "http://127.0.0.1:8080");
+    assert_eq!(json["created_at"], 1_000);
+    assert_eq!(json["state"], "unknown");
+    assert_eq!(json["containers"], serde_json::json!([]));
+    assert_eq!(
+        render_list(&[unknown], 1_000 + 7_200),
+        "UNKNOWN\ndefault          http://127.0.0.1:8080      unknown    created 2h ago\n"
+    );
+}
+
+/// docker holding alpha's service containers, each with an optional owner label and a status.
+fn docker_holding(containers: &[(&str, Option<&str>, &str)]) -> RecordingDocker {
+    let names: Vec<_> = containers
+        .iter()
+        .map(|(service, ..)| format!("ths-alpha-{service}"))
+        .collect();
+    let mut docker = RecordingDocker::new(&names.join("\n"), "", "");
+    for (service, owner, status) in containers {
+        let labels = owner.map_or("{}".to_owned(), |owner| {
+            format!(r#"{{"{INSTANCE_LABEL}":"{owner}"}}"#)
+        });
+        docker.inspect(
+            "container",
+            &format!("ths-alpha-{service}"),
+            &format!(r#"[{{"Id":"{service}-id","Config":{{"Labels":{labels}}}}}]"#),
+        );
+        docker.extra_output.insert(
+            format!(
+                "container inspect --format {{{{.State.Status}}}} {{{{.Created}}}} {{{{.State.StartedAt}}}} {service}-id"
+            ),
+            format!("{status} 2026-10-09T10:00:00Z 2026-10-09T10:01:00Z"),
+        );
+    }
+    docker
+}
+
+#[test]
+fn listing_checks_container_ownership_and_reports_paused_stacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    fs::create_dir_all(runtime.instance_dir(&name("alpha"))).unwrap();
+    runtime
+        .write_instance(&name("alpha"), &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    let listed = |docker: &RecordingDocker| {
+        let environments = runtime.environments(docker).unwrap();
+        let containers: Vec<_> = environments[0]
+            .containers
+            .iter()
+            .map(|c| c.state.clone())
+            .collect();
+        let rendered = render_list(&environments, now_unix().unwrap());
+        (environments[0].state, containers, rendered)
+    };
+
+    // stale metadata over unrelated, unlabeled containers holding the service names.
+    let (state, containers, rendered) = listed(&docker_holding(&[
+        ("app", None, "running"),
+        ("zakura", None, "running"),
+        ("lightwalletd", None, "running"),
+    ]));
+    assert_eq!(state, "conflict");
+    assert_eq!(containers, ["foreign", "foreign", "foreign", "missing"]);
+    assert!(
+        rendered.starts_with("CONFLICT\nalpha") && !rendered.contains("ths --name"),
+        "{rendered}"
+    );
+    // a container another instance owns is foreign too.
+    let (state, ..) = listed(&docker_holding(&[
+        ("app", Some("other"), "running"),
+        ("zakura", Some("alpha"), "running"),
+        ("lightwalletd", Some("alpha"), "running"),
+    ]));
+    assert_eq!(state, "conflict");
+
+    for (statuses, expected) in [
+        (["running", "running", "running"], "running"),
+        (["paused", "paused", "paused"], "paused"),
+        (["paused", "running", "running"], "paused"),
+    ] {
+        let (state, containers, rendered) = listed(&docker_holding(&[
+            ("app", Some("alpha"), statuses[0]),
+            ("zakura", Some("alpha"), statuses[1]),
+            ("lightwalletd", Some("alpha"), statuses[2]),
+        ]));
+        assert_eq!(state, expected);
+        assert_eq!(containers[..3], statuses);
+        assert!(
+            rendered.starts_with("ACTIVE\nalpha") && !rendered.contains("ths --name"),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn docker_timestamps_parse_to_unix_seconds() {
+    assert_eq!(parse_docker_time("1970-01-01T00:00:00Z"), Some(0));
+    assert_eq!(
+        parse_docker_time("2026-10-02T21:58:53.061174304Z"),
+        Some(1_790_978_333)
+    );
+    assert_eq!(
+        parse_docker_time("2024-02-29T12:00:00Z"),
+        Some(1_709_208_000)
+    );
+    // docker's zero time for a container that never started.
+    assert_eq!(parse_docker_time("0001-01-01T00:00:00Z"), None);
+    assert_eq!(parse_docker_time("not a time"), None);
+}

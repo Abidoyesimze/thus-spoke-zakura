@@ -43,7 +43,7 @@ struct Activity {
 impl Runtime {
     fn instance_client(&self, name: &InstanceName) -> Result<(String, reqwest::blocking::Client)> {
         let app_container = format!("{}-app", prefix(name));
-        if !container_running(&app_container).unwrap_or(false) {
+        if !container_running(&app_container)? {
             bail!("environment {name} is not running; start it with `ths --name {name}`");
         }
         let dashboard = self.read_instance(name)?.endpoints.dashboard;
@@ -299,4 +299,86 @@ fn format_zec(zatoshi: u64) -> String {
             .trim_end_matches('0')
             .to_owned()
     }
+}
+
+impl Runtime {
+    pub fn wallet_balances(&self, name: &InstanceName, json: bool) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        let accounts = account_balances(&dashboard, &client, name)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&accounts)?);
+        } else {
+            println!("{}", balance_lines(&accounts));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Account {
+    pub(crate) id: u8,
+    pub(crate) transparent_address: String,
+    pub(crate) unified_address: String,
+    pub(crate) transparent_zatoshi: u64,
+    pub(crate) ironwood_zatoshi: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerStatus {
+    wallet_sync: WalletSyncStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletSyncStatus {
+    state: String,
+    error: Option<String>,
+}
+
+pub(crate) fn account_balances(
+    dashboard: &str,
+    client: &reqwest::blocking::Client,
+    name: &InstanceName,
+) -> Result<Vec<Account>> {
+    let status: ServerStatus = client
+        .get(format!("{dashboard}/api/v1/status"))
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("checking wallet sync for environment {name}"))?;
+    match status.wallet_sync.state.as_str() {
+        "ready" => {}
+        "syncing" => bail!("wallet for environment {name} is still syncing; try again later"),
+        "error" => bail!(
+            "wallet synchronization failed for environment {name}: {}",
+            status
+                .wallet_sync
+                .error
+                .as_deref()
+                .unwrap_or("no error detail was provided")
+        ),
+        state => bail!("wallet for environment {name} has unknown sync state `{state}`"),
+    }
+    client
+        .get(format!("{dashboard}/api/v1/accounts"))
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("asking environment {name} for account balances"))
+}
+
+pub(crate) fn balance_lines(accounts: &[Account]) -> String {
+    accounts
+        .iter()
+        .map(|account| {
+            format!(
+                "Account {}\n  Transparent  {} ZEC  {}\n  Ironwood     {} ZEC  {}",
+                account.id,
+                format_zec(account.transparent_zatoshi),
+                account.transparent_address,
+                format_zec(account.ironwood_zatoshi),
+                account.unified_address
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
