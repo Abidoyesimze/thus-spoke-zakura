@@ -1,12 +1,12 @@
 use super::{
     confirmation::confirm_address_after_mining,
-    execution::execute_payment,
+    execution::{execute_payment, record_prepared_payment},
     submission::{AddressSubmission, submit_address_prepared},
 };
 use crate::rpc::ChainCheckpoint;
 use crate::state::AppState;
 use crate::{
-    db::{Account, Activity, AddressFaucet, TREASURY_ACCOUNT_ID, ZATOSHIS_PER_ZEC},
+    db::{Account, Activity, AddressFaucet, Store, TREASURY_ACCOUNT_ID, ZATOSHIS_PER_ZEC},
     sync::mine_and_sync,
     wallet::{PaymentError, PreparedPayment, WALLET_BIRTHDAY_HEIGHT},
 };
@@ -52,6 +52,7 @@ pub(crate) async fn fund_address_from_treasury(
                         &treasury,
                         address,
                         amount_zatoshi,
+                        record_prepared_address_payment(&state.0.store, &pending.id),
                     )
                     .await
                 }
@@ -110,6 +111,7 @@ pub(crate) async fn fund_from_treasury(
             &treasury,
             &address,
             amount_zatoshi,
+            record_prepared_payment(&state.0.store, &activity_id),
         )
         .await
     })
@@ -118,13 +120,16 @@ pub(crate) async fn fund_from_treasury(
 
 #[async_trait::async_trait]
 trait FaucetRuntime: Sync {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment>;
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static;
     async fn chain_height(&self) -> anyhow::Result<u64>;
     async fn block_hash(&self, height: u32) -> anyhow::Result<String>;
     async fn synchronize_latest(&self) -> anyhow::Result<()>;
@@ -162,13 +167,17 @@ trait FaucetRuntime: Sync {
 
 #[async_trait::async_trait]
 impl FaucetRuntime for AppState {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment> {
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+    {
         self.0
             .wallet
             .prepare(
@@ -179,6 +188,7 @@ impl FaucetRuntime for AppState {
                 destination,
                 amount_zatoshi,
                 None,
+                record,
             )
             .await
     }
@@ -327,18 +337,29 @@ async fn discover_reward(
     Ok(next)
 }
 
-async fn prepare_with_replenishment<R: FaucetRuntime>(
+async fn prepare_with_replenishment<R, F>(
     runtime: &R,
     activity_id: Option<&str>,
     seed: &str,
     treasury: &Account,
     destination: &str,
     amount_zatoshi: u64,
-) -> anyhow::Result<PreparedPayment> {
+    record: F,
+) -> anyhow::Result<PreparedPayment>
+where
+    R: FaucetRuntime,
+    F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static,
+{
     let mut reconciled_after_scan_required = false;
     loop {
         match runtime
-            .prepare_payment(activity_id, seed, destination, amount_zatoshi)
+            .prepare_payment(
+                activity_id,
+                seed,
+                destination,
+                amount_zatoshi,
+                record.clone(),
+            )
             .await
         {
             Ok(prepared) => return Ok(prepared),
@@ -529,3 +550,20 @@ pub(crate) async fn provision_initial_balance(state: &AppState) -> anyhow::Resul
 #[cfg(test)]
 #[path = "../../tests/unit/payments/treasury/tests.rs"]
 pub(crate) mod tests;
+
+fn record_prepared_address_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_address_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
+    }
+}

@@ -5,7 +5,7 @@ use crate::{
     mining::validate_idempotency_key,
     network::regtest_network,
     payments::{
-        execution::execute_payment,
+        execution::{execute_payment, record_prepared_payment},
         treasury::{fund_address_from_treasury, fund_from_treasury},
     },
     wallet::{PaymentError, SendQuote},
@@ -64,6 +64,7 @@ pub(crate) async fn send(
                         &address,
                         req.amount_zatoshi,
                         memo,
+                        record_prepared_payment(&state.0.store, &activity_id),
                     )
                     .await
             }

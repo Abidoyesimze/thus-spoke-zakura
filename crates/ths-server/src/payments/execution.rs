@@ -2,7 +2,11 @@ use super::{
     confirmation::confirm_after_mining,
     submission::{PreparedSubmission, submit_prepared},
 };
-use crate::{db::Activity, state::AppState, wallet::PreparedPayment};
+use crate::{
+    db::{Activity, Store},
+    state::AppState,
+    wallet::PreparedPayment,
+};
 use std::future::Future;
 #[async_trait::async_trait]
 pub(crate) trait PaymentLifecycle: Sync {
@@ -80,3 +84,20 @@ async fn discard_unprepared_claim(state: &AppState, id: &str) -> anyhow::Result<
 #[cfg(test)]
 #[path = "../../tests/unit/payments/execution/tests.rs"]
 pub(crate) mod tests;
+
+pub(crate) fn record_prepared_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
+    }
+}

@@ -29,16 +29,20 @@ impl Default for RecordingFaucetRuntime {
 
 #[async_trait::async_trait]
 impl FaucetRuntime for RecordingFaucetRuntime {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         _activity_id: Option<&str>,
         _seed: &str,
         _destination: &str,
         _amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment> {
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+    {
         self.events.lock().unwrap().push("prepare".into());
         if self.funds_available.load(Ordering::SeqCst) {
-            Ok(PreparedPayment {
+            record(PreparedPayment {
                 txid: "recovered-txid".into(),
                 raw_transaction: b"recovered transaction".to_vec(),
                 expiry_height: 240,
@@ -134,6 +138,7 @@ async fn insufficient_funds_discovers_only_the_needed_mature_reward_and_retries(
         &treasury,
         "uregtest-recipient",
         100_000_000,
+        Ok,
     )
     .await
     .unwrap();

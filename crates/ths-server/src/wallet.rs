@@ -231,8 +231,8 @@ impl RealWallet {
         T: Send + 'static,
         F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
     {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || operation(&mut db.blocking_lock()))
+        let mut db = Arc::clone(&self.db).lock_owned().await;
+        tokio::task::spawn_blocking(move || operation(&mut db))
             .await
             .context("wallet worker stopped")?
     }

@@ -138,15 +138,14 @@ impl RealWallet {
     }
 
     fn send_input(
-        &self,
+        account_ids: &[AccountUuid],
         from_account: u8,
         destination: &str,
     ) -> Result<(u8, AccountUuid, LocalNetwork, Address)> {
         let account_index = from_account
             .checked_sub(1)
             .context("invalid source account")?;
-        let account_id = *self
-            .account_ids
+        let account_id = *account_ids
             .get(account_index as usize)
             .context("source account does not exist")?;
         let params = regtest_network();
@@ -200,7 +199,7 @@ impl RealWallet {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn prepare(
+    pub async fn prepare<T, F>(
         &self,
         activity_id: Option<&str>,
         seed_hex: &str,
@@ -209,10 +208,48 @@ impl RealWallet {
         destination: &str,
         amount: u64,
         memo: Option<MemoBytes>,
+        record: F,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(PreparedPayment) -> Result<T> + Send + 'static,
+    {
+        let activity_id = activity_id.map(str::to_owned);
+        let seed_hex = seed_hex.to_owned();
+        let source_pool = source_pool.to_owned();
+        let destination = destination.to_owned();
+        let account_ids = self.account_ids.clone();
+        self.with_db(move |db| {
+            let prepared = Self::prepare_in(
+                db,
+                &account_ids,
+                activity_id.as_deref(),
+                &seed_hex,
+                from_account,
+                &source_pool,
+                &destination,
+                amount,
+                memo,
+            )?;
+            record(prepared)
+        })
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_in(
+        db: &mut Db,
+        account_ids: &[AccountUuid],
+        activity_id: Option<&str>,
+        seed_hex: &str,
+        from_account: u8,
+        source_pool: &str,
+        destination: &str,
+        amount: u64,
+        memo: Option<MemoBytes>,
     ) -> Result<PreparedPayment> {
-        let mut db = self.db.lock().await;
         if let Some(activity_id) = activity_id
-            && let Some(prepared) = prepared_payment(&mut db, activity_id)?
+            && let Some(prepared) = prepared_payment(db, activity_id)?
             && (prepared.expiry_height == 0
                 || db
                     .chain_height()?
@@ -221,7 +258,7 @@ impl RealWallet {
             return Ok(prepared);
         }
         let (account_index, account_id, params, recipient) =
-            self.send_input(from_account, destination)?;
+            Self::send_input(account_ids, from_account, destination)?;
         if memo.is_some() && matches!(recipient, Address::Transparent(_) | Address::Tex(_)) {
             return Err(PaymentError::TransparentMemo.into());
         }
@@ -279,9 +316,11 @@ impl RealWallet {
         source_pool: &str,
         destination: &str,
     ) -> Result<SendQuote> {
-        let (_, account_id, params, recipient) = self.send_input(from_account, destination)?;
-        let mut db = self.db.lock().await;
-        Self::quote(&mut *db, &params, account_id, source_pool, &recipient)
+        let (_, account_id, params, recipient) =
+            Self::send_input(&self.account_ids, from_account, destination)?;
+        let source_pool = source_pool.to_owned();
+        self.with_db(move |db| Self::quote(db, &params, account_id, &source_pool, &recipient))
+            .await
     }
 
     fn quote<DbT>(

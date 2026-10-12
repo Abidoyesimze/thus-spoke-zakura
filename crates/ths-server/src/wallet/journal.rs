@@ -63,17 +63,20 @@ pub struct PreparedPayment {
 
 impl RealWallet {
     pub async fn has_prepared(&self, activity_id: &str) -> Result<bool> {
-        let mut db = self.db.lock().await;
-        Ok(prepared_payment(&mut db, activity_id)?.is_some())
+        let activity_id = activity_id.to_owned();
+        self.with_db(move |db| Ok(prepared_payment(db, &activity_id)?.is_some()))
+            .await
     }
 
     pub async fn recover_prepared(&self, txid: &str) -> Result<Option<PreparedPayment>> {
         let txid = TxId::from_hex(txid).context("invalid wallet transaction id")?;
-        let db = self.db.lock().await;
-        let Some(transaction) = db.get_transaction(txid)? else {
-            return Ok(None);
-        };
-        Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+        self.with_db(move |db| {
+            let Some(transaction) = db.get_transaction(txid)? else {
+                return Ok(None);
+            };
+            Ok(Some(Self::serialize_transaction(txid, &transaction)?))
+        })
+        .await
     }
 }
 

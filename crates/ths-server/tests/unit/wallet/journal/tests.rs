@@ -27,6 +27,7 @@ async fn prepared_payment_journal_survives_reopen() {
             "invalid address",
             0,
             None,
+            Ok,
         )
         .await
         .unwrap();
