@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { renderWithProviders, requestUrl } from '@/test/utils';
@@ -18,7 +18,7 @@ function json(body: unknown): Promise<Response> {
   );
 }
 
-function mockWalletApis() {
+function mockWalletApis(status = 'confirmed') {
   vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
     const url = requestUrl(input);
     if (url.includes('/accounts')) {
@@ -51,9 +51,15 @@ function mockWalletApis() {
           source_pool: 'ironwood',
           destination_pool: 'ironwood',
           amount_zatoshi: 500_000_000,
-          txid: TXID,
+          txid: status === 'failed' ? '' : TXID,
           block_hash: 'cd'.repeat(32),
-          status: 'confirmed',
+          status,
+          last_error:
+            status === 'failed'
+              ? 'Insufficient funds'
+              : status === 'broadcast'
+                ? 'Lightwalletd unavailable'
+                : null,
           created_at: '2026-09-18 10:00:00',
         },
       ]);
@@ -89,8 +95,8 @@ function mockWalletApis() {
   });
 }
 
-function renderWallet() {
-  mockWalletApis();
+function renderWallet(status = 'confirmed') {
+  mockWalletApis(status);
   return renderWithProviders(
     <MemoryRouter>
       <WalletActionsProvider>
@@ -165,8 +171,29 @@ describe('WalletPage', () => {
     expect(tx.textContent?.includes('…')).toBe(true);
   });
 
-  it('counts a single activity row in the singular', async () => {
-    renderWallet();
-    expect(await screen.findByText('1 event')).toBeInTheDocument();
-  });
+  it.each(['failed', 'broadcast'])(
+    'describes %s payment errors and links only prepared transactions',
+    async (status) => {
+      renderWallet(status);
+      expect(await screen.findByText('1 event')).toBeInTheDocument();
+      const transfer = screen.getByRole('cell', { name: 'Faucet → Account 1' });
+      const row = transfer.closest('tr')!;
+      const detail = row.nextElementSibling as HTMLElement;
+      const message =
+        status === 'failed'
+          ? 'Failed: Insufficient funds'
+          : 'Latest execution error: Lightwalletd unavailable';
+      expect(within(detail).getByText(message)).toBeInTheDocument();
+      expect(transfer).toHaveAccessibleDescription(message);
+      expect(within(detail).queryByRole('link')).not.toBeInTheDocument();
+      if (status === 'failed') {
+        expect(within(row).getByText('Not prepared')).toBeInTheDocument();
+        expect(within(row).queryByRole('link')).not.toBeInTheDocument();
+      } else {
+        const link = within(transfer).getByRole('link');
+        expect(link).toHaveAccessibleDescription(message);
+        expect(link).toHaveAttribute('href', `/explorer/tx/${TXID}`);
+      }
+    },
+  );
 });
