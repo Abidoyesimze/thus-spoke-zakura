@@ -32,5 +32,5 @@ export const testAccounts: Account[] = [1, 2, 3, 4, 5].map((id) => ({
   unified_address: `uregtest1account${id}`,
   transparent_address: `tmAccount${id}`,
   transparent_zatoshi: 0n,
-  orchard_zatoshi: id === 1 ? 500_000_000n : 0n,
+  ironwood_zatoshi: id === 1 ? 500_000_000n : 0n,
 }));

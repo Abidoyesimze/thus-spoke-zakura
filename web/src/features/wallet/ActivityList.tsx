@@ -3,7 +3,7 @@ import { ArrowDownToLine, ArrowRight } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { absoluteTime, shortHash, timeAgo } from '@/lib/format';
 import { formatZecAmount } from '@/lib/money';
-import type { Activity } from '@/lib/api';
+import { errorMessage, type Activity } from '@/lib/api';
 import { EmptyState, ErrorState } from '@/components/ui/StateBlock';
 import { SkeletonRows } from '@/components/ui/Skeleton';
 import { Badge } from '@/components/ui/Badge';
@@ -26,12 +26,17 @@ function PoolLabel({ pool }: { pool: Activity['source_pool'] }) {
     <span
       className={cn(
         'text-[11px] font-bold tracking-[0.04em] uppercase',
-        pool === 'orchard' ? 'text-accent' : 'text-ink-muted',
+        pool === 'ironwood' ? 'text-accent' : 'text-ink-muted',
       )}
     >
       {pool}
     </span>
   );
+}
+
+function recipientLabel(activity: Activity): string {
+  if (activity.to_account !== null) return `Account ${activity.to_account}`;
+  return shortHash(activity.to_address ?? '', 14, 6);
 }
 
 function ActivityRow({ activity, index }: { activity: Activity; index: number }) {
@@ -56,8 +61,8 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
           >
             <span className="block truncate">
               {isFaucet
-                ? `Faucet → Account ${activity.to_account}`
-                : `Account ${activity.from_account ?? '?'} → Account ${activity.to_account}`}
+                ? `Faucet → ${recipientLabel(activity)}`
+                : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`}
             </span>
           </Link>
         </div>
@@ -113,13 +118,7 @@ export function ActivityList({
       }
     >
       {activity.isPending && <SkeletonRows rows={4} />}
-      {activity.isError && (
-        <ErrorState
-          message={
-            activity.error instanceof Error ? activity.error.message : 'Could not load activity.'
-          }
-        />
-      )}
+      {activity.isError && <ErrorState message={errorMessage(activity.error)} />}
       {activity.data &&
         (count === 0 ? (
           <EmptyState message="No transactions yet. Use the faucet to create your first activity." />

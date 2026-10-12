@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { accountSchema, statusSchema } from './schemas';
+import { accountSchema, miningJobSchema, miningJobResponseSchema, statusSchema } from './schemas';
 
 const baseStatus = {
   instance: 'default',
@@ -38,7 +38,7 @@ describe('accountSchema', () => {
     unified_address: 'account-unified-address',
     transparent_address: 'account-transparent-address',
     transparent_zatoshi: 123,
-    orchard_zatoshi: 456,
+    ironwood_zatoshi: 456,
   };
 
   it('retains the optional viewing key supplied by the server', () => {
@@ -47,12 +47,40 @@ describe('accountSchema', () => {
       unified_full_viewing_key: 'opaque-viewing-key-for-schema-test',
     });
     expect(account.unified_full_viewing_key).toBe('opaque-viewing-key-for-schema-test');
-    expect(account.orchard_zatoshi).toBe(456n);
+    expect(account.ironwood_zatoshi).toBe(456n);
   });
 
   it('accepts packaged 0.2.1 accounts without a viewing key', () => {
     const account = accountSchema.parse(legacyAccount);
     expect(account.unified_full_viewing_key).toBeUndefined();
     expect(account.transparent_zatoshi).toBe(123n);
+  });
+});
+
+const job = {
+  id: '588e9911-20b6-4c4a-a9ae-5f6c1abae953',
+  requested_blocks: 10,
+  completed_blocks: 2,
+  state: 'mining',
+  error: null,
+  progress_uncertain: false,
+};
+
+describe('miningJobSchema', () => {
+  it('accepts job snapshots and an empty latest job', () => {
+    expect(miningJobSchema.parse(job)).toEqual(job);
+    expect(miningJobResponseSchema.parse({ job: null })).toEqual({ job: null });
+  });
+  it.each([
+    { state: 'unknown' },
+    { completed_blocks: -1 },
+    { completed_blocks: 11 },
+    { requested_blocks: 0 },
+    { requested_blocks: 10001 },
+    { id: 'bad' },
+    { error: undefined },
+    { progress_uncertain: undefined },
+  ])('rejects malformed snapshots: %j', (change) => {
+    expect(miningJobSchema.safeParse({ ...job, ...change }).success).toBe(false);
   });
 });

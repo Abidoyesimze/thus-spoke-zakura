@@ -18,16 +18,6 @@ export class ApiError extends Error {
  * original text stays available on `ApiError.raw` for bug reports.
  */
 const TRANSLATIONS: Array<[RegExp, string]> = [
-  // The node reports a missing block/transaction as a 500 with an RPC error
-  // object. To a reader it is simply "not here", not a server fault.
-  [
-    /block height not in best chain|Block not found/i,
-    'No block at that height or hash on this chain.',
-  ],
-  [
-    /Transaction not found/i,
-    'No transaction with that ID on this chain. It may not have been mined yet.',
-  ],
   [
     /invalid Bech32|parse error|invalid address/i,
     'That does not look like a valid transparent address for this network.',

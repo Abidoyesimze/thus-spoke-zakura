@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { poolSchema } from '@/lib/api';
 import { parseZec, ZATOSHIS_PER_ZEC } from '@/lib/money';
 
 /** Server-side faucet ceiling (`api.rs`: `5 * ZATOSHIS_PER_ZEC`). */
@@ -7,8 +8,6 @@ export const FAUCET_MAX_ZATOSHI = 5n * ZATOSHIS_PER_ZEC;
 /** Server-side mining bounds (`api.rs`: `(1..=10_000)`). */
 export const MINE_MIN_BLOCKS = 1;
 export const MINE_MAX_BLOCKS = 10_000;
-
-const poolField = z.enum(['transparent', 'orchard']);
 
 /** Selects and inputs hand back strings; the schema owns the conversion. */
 const accountIdField = z
@@ -36,6 +35,9 @@ const amountField = z
     return zatoshi;
   });
 
+/** The destination select's value for "send to `to_address`" rather than an account. */
+export const ADDRESS_DESTINATION = 'address';
+
 /** ZIP-302 memo size; the limit is in UTF-8 bytes, not characters. */
 export const MEMO_MAX_BYTES = 512;
 
@@ -55,18 +57,27 @@ const memoField = z
 export const sendSchema = z
   .object({
     from_account: accountIdField,
-    to_account: accountIdField,
-    source_pool: poolField,
-    destination_pool: poolField,
+    to_account: z.union([accountIdField, z.literal(ADDRESS_DESTINATION)]),
+    to_address: z.string().trim().default(''),
+    source_pool: poolSchema,
+    destination_pool: poolSchema,
     amount: amountField,
     memo: memoField,
   })
-  .refine((values) => values.from_account !== values.to_account, {
-    message: 'Pick a different account — sending to yourself only costs the fee.',
-    path: ['to_account'],
+  .refine(
+    (values) =>
+      values.from_account !== values.to_account || values.source_pool !== values.destination_pool,
+    {
+      message: 'Choose a different account or a different destination pool.',
+      path: ['to_account'],
+    },
+  )
+  .refine((values) => values.to_account !== ADDRESS_DESTINATION || values.to_address !== '', {
+    message: 'Enter a Regtest address.',
+    path: ['to_address'],
   })
-  .refine((values) => values.memo === '' || values.destination_pool === 'orchard', {
-    message: 'Transparent outputs cannot carry a memo. Choose the orchard pool.',
+  .refine((values) => values.memo === '' || values.destination_pool === 'ironwood', {
+    message: 'Transparent outputs cannot carry a memo. Choose the ironwood pool.',
     path: ['memo'],
   });
 export type SendInput = z.input<typeof sendSchema>;
@@ -74,7 +85,7 @@ export type SendValues = z.output<typeof sendSchema>;
 
 export const faucetSchema = z.object({
   account_id: accountIdField,
-  pool: poolField,
+  pool: poolSchema,
   amount: amountField.refine(
     (zatoshi) => zatoshi <= FAUCET_MAX_ZATOSHI,
     'The faucet is limited to 5 ZEC per request.',

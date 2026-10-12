@@ -28,10 +28,10 @@ export function AccountCard({ account, index = 0 }: { account: Account; index?: 
 
       <dl className="my-4 grid grid-cols-2 gap-3">
         <div>
-          <dt className="text-accent text-[11px] font-bold tracking-[0.1em] uppercase">Orchard</dt>
+          <dt className="text-accent text-[11px] font-bold tracking-[0.1em] uppercase">Ironwood</dt>
           <dd className="mt-0.5">
             <ZecAmount
-              zatoshi={account.orchard_zatoshi}
+              zatoshi={account.ironwood_zatoshi}
               className="text-accent-strong text-[13px] font-bold"
             />
           </dd>

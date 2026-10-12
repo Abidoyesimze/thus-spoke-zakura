@@ -4,8 +4,8 @@ import { sendSchema } from './schemas';
 const base = {
   from_account: '1',
   to_account: '2',
-  source_pool: 'orchard' as const,
-  destination_pool: 'orchard' as const,
+  source_pool: 'ironwood' as const,
+  destination_pool: 'ironwood' as const,
   amount: '1',
   memo: '',
 };
@@ -18,14 +18,77 @@ const memoIssue = (input: Record<string, unknown>) => {
 };
 
 describe('sendSchema', () => {
-  it('rejects a send to the same account', () => {
-    // The dialog used to default both sides to the account it was opened from,
-    // so this was reachable with two clicks and cost a fee to discover.
-    const result = sendSchema.safeParse({ ...base, from_account: '3', to_account: '3' });
+  it.each([
+    ['1', 'ironwood', 'ironwood', false],
+    ['1', 'transparent', 'transparent', false],
+    ['1', 'ironwood', 'transparent', true],
+    ['1', 'transparent', 'ironwood', true],
+    ['2', 'ironwood', 'ironwood', true],
+    ['2', 'transparent', 'transparent', true],
+    ['2', 'ironwood', 'transparent', true],
+    ['2', 'transparent', 'ironwood', true],
+  ] as const)('validates destination %s and route %s → %s', (to, source, destination, valid) => {
+    const result = sendSchema.safeParse({
+      ...base,
+      to_account: to,
+      source_pool: source,
+      destination_pool: destination,
+    });
+    expect(result.success).toBe(valid);
+    if (!result.success) {
+      expect(result.error.issues.find((issue) => issue.path[0] === 'to_account')?.message).toBe(
+        'Choose a different account or a different destination pool.',
+      );
+    }
+  });
+
+  it('keeps memo restrictions for same-account pool transfers', () => {
+    expect(
+      sendSchema.safeParse({
+        ...base,
+        to_account: '1',
+        source_pool: 'transparent',
+        memo: 'private note',
+      }).success,
+    ).toBe(true);
+    expect(
+      memoIssue({
+        ...base,
+        to_account: '1',
+        destination_pool: 'transparent',
+        memo: 'hi',
+      }),
+    ).toMatch(/transparent outputs cannot carry a memo/i);
+  });
+
+  it('requires an address when sending outside the development accounts', () => {
+    const result = sendSchema.safeParse({ ...base, to_account: 'address', to_address: '  ' });
     expect(result.success).toBe(false);
     if (!result.success) {
-      const issue = result.error.issues.find((candidate) => candidate.path[0] === 'to_account');
-      expect(issue?.message).toMatch(/different account/i);
+      expect(result.error.issues[0]?.path).toEqual(['to_address']);
+    }
+  });
+
+  it('accepts a send to an address', () => {
+    const result = sendSchema.safeParse({
+      ...base,
+      to_account: 'address',
+      to_address: ' uregtest1external ',
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.to_account).toBe('address');
+      expect(result.data.to_address).toBe('uregtest1external');
+    }
+  });
+
+  it('limits memos to 512 bytes, counting multi-byte characters', () => {
+    expect(sendSchema.safeParse({ ...base, memo: 'a'.repeat(512) }).success).toBe(true);
+    // 'é' is two bytes in UTF-8, so 257 of them exceed the limit at 257 characters.
+    const result = sendSchema.safeParse({ ...base, memo: 'é'.repeat(257) });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.path).toEqual(['memo']);
     }
   });
 
@@ -37,7 +100,7 @@ describe('sendSchema', () => {
     }
   });
 
-  it('accepts a memo to an orchard destination', () => {
+  it('accepts a memo to an ironwood destination', () => {
     expect(memoIssue({ ...base, memo: 'rent for October' })).toBeUndefined();
     expect(sendSchema.safeParse({ ...base, memo: 'rent for October' }).success).toBe(true);
   });

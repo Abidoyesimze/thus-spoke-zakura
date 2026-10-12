@@ -4,9 +4,10 @@ import { Pickaxe } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
-import { useToast } from '@/components/ui/toast-context';
 import { errorMessage } from '@/lib/api';
-import { useMine } from '@/hooks/mutations';
+import { useStartMining } from '@/hooks/mutations';
+import { useMiningJob } from '@/hooks/queries';
+import { MiningStatus } from './MiningStatus';
 import { mineSchema, type MineInput, type MineValues } from './schemas';
 import { controlStyles } from '@/components/ui/control-styles';
 
@@ -17,8 +18,11 @@ export function MineDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const toast = useToast();
-  const mine = useMine();
+  const mine = useStartMining();
+  const mining = useMiningJob();
+  const job = mining.data?.job;
+  const active = job?.state === 'mining' || job?.state === 'syncing';
+  const disabled = mining.isPending || mining.isError || active || mine.isPending;
 
   const form = useForm<MineInput, unknown, MineValues>({
     resolver: zodResolver(mineSchema),
@@ -26,16 +30,8 @@ export function MineDialog({
   });
 
   const submit = form.handleSubmit((values) => {
-    mine.mutate(values.blocks, {
-      onSuccess: (result) => {
-        toast.success(
-          `Mined ${result.blocks.toLocaleString()} block${result.blocks === 1 ? '' : 's'}`,
-        );
-        onOpenChange(false);
-        form.reset();
-      },
-      onError: (error) => toast.error('Mining failed', errorMessage(error)),
-    });
+    if (disabled) return;
+    mine.mutate(values.blocks);
   });
 
   return (
@@ -46,6 +42,18 @@ export function MineDialog({
       title="Mine blocks"
       description="Regtest mines on demand, with no proof-of-work delay."
     >
+      {job && <MiningStatus job={job} />}
+      {mining.isPending && <p className="text-ink-muted text-[13px]">Checking mining status…</p>}
+      {mining.isError && (
+        <p role="alert" className="text-negative text-[13px]">
+          Unable to check mining status: {errorMessage(mining.error)}
+        </p>
+      )}
+      {mine.isError && (
+        <p role="alert" className="text-negative text-[13px]">
+          Unable to start mining: {errorMessage(mine.error)}
+        </p>
+      )}
       <form onSubmit={(event) => void submit(event)} noValidate>
         <Field
           label="Number of blocks"
@@ -56,6 +64,7 @@ export function MineDialog({
             <input
               {...aria}
               {...form.register('blocks')}
+              disabled={disabled}
               inputMode="numeric"
               autoComplete="off"
               className={controlStyles}
@@ -63,9 +72,19 @@ export function MineDialog({
           )}
         </Field>
 
-        <Button type="submit" variant="primary" size="block" loading={mine.isPending}>
+        <Button
+          type="submit"
+          variant="primary"
+          size="block"
+          loading={mine.isPending || active}
+          disabled={disabled}
+        >
           <Pickaxe />
-          {mine.isPending ? 'Mining…' : 'Mine blocks'}
+          {job?.state === 'syncing'
+            ? 'Synchronizing…'
+            : mine.isPending || active
+              ? 'Mining…'
+              : 'Mine blocks'}
         </Button>
       </form>
     </Dialog>

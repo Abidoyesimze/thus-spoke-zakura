@@ -2,7 +2,7 @@
 set -eu
 
 repo="zcashlabs/thus-spoke-zakura"
-requested_version="${TSZ_VERSION:-latest}"
+requested_version="${THS_VERSION:-latest}"
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
   Linux-aarch64|Linux-arm64) target="aarch64-unknown-linux-gnu" ;;
@@ -22,7 +22,7 @@ else
   release_url="https://github.com/$repo/releases/download/$tag"
 fi
 
-destination="${TSZ_INSTALL_DIR:-$HOME/.local/bin}"
+destination="${THS_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$destination"
 stage="$(mktemp -d "$destination/.ths.XXXXXX")"
 trap 'rm -rf "$stage"' EXIT HUP INT TERM
@@ -63,7 +63,7 @@ if [ "$requested_version" != "latest" ]; then
   }
 fi
 
-if [ "${TSZ_SKIP_IMAGE_PULL:-0}" != "1" ]; then
+if [ "${THS_SKIP_IMAGE_PULL:-0}" != "1" ]; then
   "$stage/ths" pull
 fi
 

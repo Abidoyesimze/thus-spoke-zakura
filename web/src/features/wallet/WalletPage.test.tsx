@@ -27,7 +27,7 @@ function mockWalletApis() {
           unified_address: 'uregtest1account1verylongunifiedaddressfortruncation',
           transparent_address: 'tmAccount1',
           transparent_zatoshi: 0,
-          orchard_zatoshi: 500_000_000,
+          ironwood_zatoshi: 500_000_000,
         },
       ]);
     }
@@ -38,8 +38,8 @@ function mockWalletApis() {
           kind: 'faucet',
           from_account: null,
           to_account: 1,
-          source_pool: 'orchard',
-          destination_pool: 'orchard',
+          source_pool: 'ironwood',
+          destination_pool: 'ironwood',
           amount_zatoshi: 500_000_000,
           txid: TXID,
           block_hash: 'cd'.repeat(32),
