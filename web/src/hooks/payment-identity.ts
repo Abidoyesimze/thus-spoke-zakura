@@ -181,7 +181,8 @@ function decodeIdentity(kind: PaymentKind, name: string, key: string): PaymentId
 
 function retainedPayments(
   kind: PaymentKind,
-  areas = [localStorage, sessionStorage],
+  // Forms resume the first match, so this tab's keys must precede shared work.
+  areas = [sessionStorage, localStorage],
 ): PaymentIdentity[] {
   const identities = new Map<string, PaymentIdentity>();
   for (const storage of areas) {

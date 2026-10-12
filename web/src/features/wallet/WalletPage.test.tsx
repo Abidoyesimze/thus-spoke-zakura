@@ -201,6 +201,81 @@ describe('WalletPage', () => {
     },
   );
 
+  it.each(['send', 'faucet'] as const)(
+    "prefers this tab's %s key when matching saved payments have different keys",
+    async (kind) => {
+      mockWalletApis();
+      vi.spyOn(api, 'sendQuote').mockResolvedValue({
+        available_zatoshi: 500_000_000n,
+        fee_zatoshi: 10_000n,
+        max_zatoshi: 499_990_000n,
+      });
+      const name =
+        kind === 'send'
+          ? 'ths:send:[1,2,"ironwood","ironwood","100000000",""]'
+          : 'ths:faucet:1:ironwood:100000000';
+      const ownKey = 'current-tab-key';
+      const otherKey = 'other-tab-key';
+      // The shared records put the other tab first; this tab retains its own key.
+      for (const key of [otherKey, ownKey])
+        localStorage.setItem(`ths:${kind}:retained:${key}`, name);
+      localStorage.setItem(name, otherKey);
+      sessionStorage.setItem(`${name}:tab`, ownKey);
+      const payment = (key: string): Activity => ({
+        id: key,
+        kind,
+        from_account: kind === 'send' ? 1 : null,
+        to_account: kind === 'send' ? 2 : 1,
+        to_address: null,
+        source_pool: 'ironwood',
+        destination_pool: 'ironwood',
+        amount_zatoshi: 100_000_000n,
+        txid: key === ownKey ? TXID : '',
+        block_hash: null,
+        status: key === ownKey ? 'prepared' : 'preparing',
+        last_error: null,
+        created_at: '2026-10-12 00:00:00',
+      });
+      vi.spyOn(api, 'payment').mockImplementation((key) => Promise.resolve(payment(key)));
+      const post = vi.spyOn(api, kind).mockResolvedValue(payment(ownKey));
+      renderWithWalletActions(<WalletPage />);
+      await userEvent.click(
+        screen.getByRole('button', {
+          name: kind === 'send' ? 'Send from Account 1' : 'Fund Account 1',
+        }),
+      );
+      const feedback = await screen.findByText(
+        /saved payment has these details \((preparing|prepared)\)/,
+      );
+      const shownStatus = feedback.textContent;
+      expect(post).not.toHaveBeenCalled();
+      await userEvent.click(screen.getByRole('button', { name: 'Resume payment' }));
+      await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+      expect(post).toHaveBeenCalledWith(
+        kind === 'send'
+          ? {
+              from_account: 1,
+              to_account: 2,
+              source_pool: 'ironwood',
+              destination_pool: 'ironwood',
+              amount_zatoshi: 100_000_000n,
+              memo: '',
+              idempotency_key: ownKey,
+            }
+          : {
+              account_id: 1,
+              pool: 'ironwood',
+              amount_zatoshi: 100_000_000n,
+              idempotency_key: ownKey,
+            },
+      );
+      expect(shownStatus).toContain('(prepared)');
+      expect(sessionStorage.getItem(`${name}:tab`)).toBe(ownKey);
+      expect(localStorage.getItem(name)).toBe(otherKey);
+      expect(localStorage.getItem(`ths:${kind}:retained:${otherKey}`)).toBe(name);
+    },
+  );
+
   it('filters results without stopping hidden checks or clearing hidden results', async () => {
     mockWalletApis();
     const payments = new Map([
