@@ -28,14 +28,16 @@ remaining `instance.json` so the instance can be identified. Do not delete
 those files by hand, retry a create whose result is unknown, or prune shared
 Docker state.
 
-A failed `docker start` with a known original container ID can be recovered:
-cleanup validates ownership, removes that ID, proves its absence, and persists
-the start's resolution before deleting its wallet volumes and network. A later
-start can allocate fresh resources under the same instance name. Cleanup does
-not retry the failed start or turn the original launch error into success.
-An unacknowledged create, or a start without a trustworthy original ID, remains
-uncertain and keeps its dependencies and recovery state. Same-name replacements
-are not adopted; shared unresolved dependencies remain protected.
+A failed `docker start`, or a failed inspection after `docker create` returns
+an original container ID, can be recovered: cleanup validates ownership, removes
+that ID, proves its absence, and persists the create or start's resolution before
+deleting its wallet volumes and network. A later start can allocate fresh
+resources under the same instance name. Cleanup does not retry the failed
+mutation or turn the original launch error into success. A create or start
+without a trustworthy original ID remains uncertain and keeps its dependencies
+and recovery state. Same-name replacements are not adopted; shared unresolved
+dependencies remain protected. Existing recovery journals with a known container
+ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
 allocation identities. It does not lock an instance name or coordinate separate

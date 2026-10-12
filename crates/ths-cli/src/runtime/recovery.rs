@@ -189,22 +189,16 @@ impl RecoveryJournal {
         &self.record
     }
 
-    pub(super) fn reconcile_absent_starts(&mut self, container: &ResourceRef) -> Result<()> {
+    pub(super) fn reconcile_absent_allocations(&mut self, container: &ResourceRef) -> Result<()> {
         if container.kind != ResourceKind::Container
             || container.identity.as_deref().is_none_or(str::is_empty)
         {
-            bail!("start reconciliation requires an original container identity");
+            bail!("allocation reconciliation requires an original container identity");
         }
         let mut updated = self.record.clone();
         let mut changed = false;
         for mutation in &mut updated.mutations {
-            if mutation.operation == MutationOperation::Start
-                && mutation.resource == *container
-                && matches!(
-                    mutation.outcome,
-                    MutationOutcome::Pending | MutationOutcome::Uncertain(_)
-                )
-            {
+            if super::unresolved_allocation(mutation) && mutation.resource == *container {
                 if let MutationOutcome::Uncertain(reason) = &mutation.outcome {
                     updated.failures.push(reason.clone());
                 }
