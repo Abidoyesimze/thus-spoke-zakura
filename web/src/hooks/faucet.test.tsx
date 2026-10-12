@@ -23,6 +23,7 @@ function confirmed(id: string): Activity {
     txid: id,
     block_hash: 'b'.repeat(64),
     status: 'confirmed',
+    last_error: null,
     created_at: '2026-10-06 00:00:00',
   };
 }
