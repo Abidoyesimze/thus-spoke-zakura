@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useState } from 'react';
 import { renderWithProviders, requestUrl, testAccounts } from '@/test/utils';
 import { SendDialog } from './SendDialog';
 
@@ -445,6 +446,98 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
   }
 
+  it.each([
+    ['changed', 'success'],
+    ['cleared', 'success'],
+    ['restored', 'success'],
+    ['changed', 'error'],
+    ['cleared', 'error'],
+    ['restored', 'error'],
+  ] as const)('ignores a stale parse after the URI is %s (%s response)', async (edit, outcome) => {
+    const uriA = 'zcash:uregtest1requestA?amount=0.25';
+    const uriB = 'zcash:uregtest1requestB?amount=0.75';
+    const parsedB = {
+      address: 'uregtest1requestB',
+      destination_pool: 'ironwood',
+      to_account: null,
+      amount_zatoshi: 75_000_000,
+      memo: 'request B',
+    };
+    let finishParsing!: (response: Response) => void;
+    const parsing = new Promise<Response>((resolve) => {
+      finishParsing = resolve;
+    });
+    fetchMock.mockImplementation((input, init) => {
+      if (requestUrl(input).endsWith('/zip321/parse')) {
+        const raw = typeof init?.body === 'string' ? init.body : '{}';
+        const { uri } = JSON.parse(raw) as { uri: string };
+        if (uri === uriA) return parsing;
+      }
+      return sendImpl(QUOTE, parsedB)(input, init);
+    });
+    await applyPaymentUri(uriA);
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute('aria-busy', 'true'),
+    );
+
+    const uriField = screen.getByLabelText('Payment request (optional)');
+    await userEvent.clear(uriField);
+    if (edit !== 'cleared') await userEvent.type(uriField, uriB);
+    if (edit === 'restored') {
+      await userEvent.clear(uriField);
+      await userEvent.type(uriField, uriA);
+    }
+    await waitFor(() => expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeEnabled());
+    expect(screen.getByRole('button', { name: 'Apply' })).not.toHaveAttribute('aria-busy', 'true');
+
+    await act(async () => {
+      finishParsing(
+        new Response(
+          JSON.stringify(
+            outcome === 'success'
+              ? {
+                  address: 'uregtest1requestA',
+                  destination_pool: 'ironwood',
+                  to_account: null,
+                  amount_zatoshi: 25_000_000,
+                  memo: 'request A',
+                }
+              : { error: { message: 'Obsolete URI error', status: 400 } },
+          ),
+          {
+            status: outcome === 'success' ? 200 : 400,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
+      );
+      await parsing;
+    });
+
+    await waitFor(() => expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeEnabled());
+    expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
+    expect(screen.queryByLabelText('Destination address')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
+    expect(screen.getByLabelText('Memo (optional)')).toHaveValue('');
+    expect(screen.queryByText('Obsolete URI error')).not.toBeInTheDocument();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
+
+    await userEvent.clear(uriField);
+    await userEvent.type(uriField, uriB);
+    await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(await screen.findByLabelText('Destination address')).toHaveValue('uregtest1requestB');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock)).toMatchObject({
+      from_account: 1,
+      to_address: 'uregtest1requestB',
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
+      amount_zatoshi: 75_000_000,
+      memo: 'request B',
+    });
+    expect(body(fetchMock)).not.toHaveProperty('to_account');
+  });
+
   it.each(['button', 'form'] as const)(
     'blocks %s submission while a payment URI is parsing',
     async (submission) => {
@@ -505,6 +598,180 @@ describe('SendDialog', () => {
     },
   );
 
+  it.each([
+    ['older first', 'success', 'success'],
+    ['newer first', 'success', 'success'],
+    ['older first', 'error', 'success'],
+    ['newer first', 'error', 'success'],
+    ['older first', 'success', 'error'],
+    ['newer first', 'success', 'error'],
+  ] as const)(
+    'keeps the current URI when responses finish %s (%s old, %s current)',
+    async (order, outcome, currentOutcome) => {
+      const uriA = 'zcash:uregtest1requestA?amount=0.25';
+      const uriB = 'zcash:uregtest1requestB?amount=0.75';
+      const parsedB = {
+        address: 'uregtest1requestB',
+        destination_pool: 'ironwood',
+        to_account: null,
+        amount_zatoshi: 75_000_000,
+        memo: 'request B',
+      };
+      let finishA!: (response: Response) => void;
+      let finishB!: (response: Response) => void;
+      const parsingA = new Promise<Response>((resolve) => {
+        finishA = resolve;
+      });
+      const parsingB = new Promise<Response>((resolve) => {
+        finishB = resolve;
+      });
+      fetchMock.mockImplementation((input, init) => {
+        if (requestUrl(input).endsWith('/zip321/parse')) {
+          const raw = typeof init?.body === 'string' ? init.body : '{}';
+          const { uri } = JSON.parse(raw) as { uri: string };
+          return uri === uriA ? parsingA : parsingB;
+        }
+        return sendImpl(QUOTE)(input, init);
+      });
+      await applyPaymentUri(uriA);
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute('aria-busy', 'true'),
+      );
+      const uriField = screen.getByLabelText('Payment request (optional)');
+      await userEvent.clear(uriField);
+      await userEvent.type(uriField, uriB);
+      await userEvent.keyboard('{Enter}');
+      const parseCalls = () =>
+        fetchMock.mock.calls.filter(([input]) => requestUrl(input).endsWith('/zip321/parse'));
+      await waitFor(() => expect(parseCalls()).toHaveLength(2));
+      const sendButton = screen.getByRole('button', { name: /Send ZEC/i });
+      expect(sendButton).toBeDisabled();
+
+      const resolveA = async () => {
+        await act(async () => {
+          finishA(
+            new Response(
+              JSON.stringify(
+                outcome === 'success'
+                  ? {
+                      address: 'uregtest1requestA',
+                      destination_pool: 'ironwood',
+                      to_account: null,
+                      amount_zatoshi: 25_000_000,
+                      memo: 'request A',
+                    }
+                  : { error: { message: 'Obsolete URI error', status: 400 } },
+              ),
+              {
+                status: outcome === 'success' ? 200 : 400,
+                headers: { 'content-type': 'application/json' },
+              },
+            ),
+          );
+          await parsingA;
+        });
+      };
+      if (order === 'older first') {
+        await resolveA();
+        expect(sendButton).toBeDisabled();
+        expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
+        expect(screen.queryByText('Obsolete URI error')).not.toBeInTheDocument();
+      }
+      await act(async () => {
+        finishB(
+          new Response(
+            JSON.stringify(
+              currentOutcome === 'success'
+                ? parsedB
+                : { error: { message: 'Current URI error', status: 400 } },
+            ),
+            {
+              status: currentOutcome === 'success' ? 200 : 400,
+              headers: { 'content-type': 'application/json' },
+            },
+          ),
+        );
+        await parsingB;
+      });
+      await waitFor(() => expect(sendButton).toBeEnabled());
+      if (order === 'newer first') await resolveA();
+      if (currentOutcome === 'error') {
+        expect(screen.getByText('Current URI error')).toBeInTheDocument();
+        expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
+        expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
+        expect(screen.getByLabelText('Memo (optional)')).toHaveValue('');
+        expect(sendCalls(fetchMock)).toHaveLength(0);
+        fetchMock.mockImplementation(sendImpl(QUOTE, parsedB));
+        await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+        expect(await screen.findByLabelText('Destination address')).toHaveValue(
+          'uregtest1requestB',
+        );
+      }
+      expect(screen.getByLabelText('Destination address')).toHaveValue('uregtest1requestB');
+      expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('0.75');
+      expect(screen.getByLabelText('Memo (optional)')).toHaveValue('request B');
+      expect(screen.queryByText('Obsolete URI error')).not.toBeInTheDocument();
+      await userEvent.click(sendButton);
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      expect(body(fetchMock)).toMatchObject({
+        to_address: 'uregtest1requestB',
+        amount_zatoshi: 75_000_000,
+        memo: 'request B',
+      });
+    },
+  );
+
+  it('does not apply a pending URI to a reopened dialog', async () => {
+    let finishParsing!: (response: Response) => void;
+    const parsing = new Promise<Response>((resolve) => {
+      finishParsing = resolve;
+    });
+    fetchMock.mockImplementation((input, init) =>
+      requestUrl(input).endsWith('/zip321/parse') ? parsing : sendImpl(QUOTE)(input, init),
+    );
+    // Closing in WalletActionsProvider unmounts SendDialog but retains the query provider.
+    function ReopenableDialog() {
+      const [open, setOpen] = useState(true);
+      return open ? (
+        <SendDialog open onOpenChange={setOpen} accounts={testAccounts} />
+      ) : (
+        <button onClick={() => setOpen(true)}>Reopen Send</button>
+      );
+    }
+    renderWithProviders(<ReopenableDialog />);
+    await userEvent.type(
+      screen.getByLabelText('Payment request (optional)'),
+      'zcash:uregtest1requestA?amount=0.25',
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute('aria-busy', 'true'),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Reopen Send' }));
+    await act(async () => {
+      finishParsing(
+        new Response(
+          JSON.stringify({
+            address: 'uregtest1requestA',
+            destination_pool: 'ironwood',
+            to_account: null,
+            amount_zatoshi: 25_000_000,
+            memo: 'request A',
+          }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
+      );
+      await parsing;
+    });
+    expect(screen.getByLabelText('Payment request (optional)')).toHaveValue('');
+    expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
+    expect(screen.getByLabelText('Memo (optional)')).toHaveValue('');
+    expect(screen.queryByLabelText('Destination address')).not.toBeInTheDocument();
+    expect(sendCalls(fetchMock)).toHaveLength(0);
+  });
+
   it('fills the form from a pasted zcash: URI and sends to its address with the memo', async () => {
     fetchMock.mockRestore();
     fetchMock = mockSend(QUOTE, {
@@ -529,6 +796,51 @@ describe('SendDialog', () => {
       memo: 'coffee',
     });
     expect(body(fetchMock).to_account).toBeUndefined();
+  });
+
+  it('cancels a waiting send when the payment URI is edited without applying it', async () => {
+    let finishQuote!: (response: Response) => void;
+    const quoting = new Promise<Response>((resolve) => {
+      finishQuote = resolve;
+    });
+    const parsed = {
+      address: 'uregtest1requestB',
+      destination_pool: 'ironwood',
+      to_account: null,
+      amount_zatoshi: 75_000_000,
+      memo: 'request B',
+    };
+    fetchMock.mockImplementation((input, init) =>
+      requestUrl(input).endsWith('/send/quote') ? quoting : sendImpl(QUOTE, parsed)(input, init),
+    );
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await userEvent.type(
+      screen.getByLabelText('Payment request (optional)'),
+      'zcash:uregtest1requestB?amount=0.75',
+    );
+    await act(async () => {
+      finishQuote(
+        new Response(JSON.stringify(QUOTE), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      await quoting;
+    });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Max' })).toBeEnabled());
+    expect(sendCalls(fetchMock)).toHaveLength(0);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+    expect(await screen.findByLabelText('Destination address')).toHaveValue('uregtest1requestB');
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock)).toMatchObject({
+      to_address: 'uregtest1requestB',
+      amount_zatoshi: 75_000_000,
+      memo: 'request B',
+    });
+    expect(body(fetchMock)).not.toHaveProperty('to_account');
   });
 
   it.each([false, true])(

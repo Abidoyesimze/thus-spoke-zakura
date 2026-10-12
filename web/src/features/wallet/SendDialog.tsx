@@ -108,7 +108,12 @@ export function SendDialog({
   const submitPaymentUri = () => {
     if (paymentUri.trim() === '') return;
     paymentUriRevision.current += 1;
-    parseUri.mutate(paymentUri, { onSuccess: applyPaymentUri });
+    const uriRevision = paymentUriRevision.current;
+    parseUri.mutate(paymentUri, {
+      onSuccess: (parsed) => {
+        if (uriRevision === paymentUriRevision.current) applyPaymentUri(parsed);
+      },
+    });
   };
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -183,7 +188,11 @@ export function SendDialog({
             <input
               {...aria}
               value={paymentUri}
-              onChange={(event) => setPaymentUri(event.target.value)}
+              onChange={(event) => {
+                paymentUriRevision.current += 1;
+                setPaymentUri(event.target.value);
+                parseUri.reset();
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter') {
                   event.preventDefault();
