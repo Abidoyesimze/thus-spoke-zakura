@@ -3,8 +3,9 @@ use crate::mining::MiningRuntime;
 use crate::{
     db::{Account, Store},
     mining::MiningCoordinator,
-    rpc::NodeRpc,
+    rpc::{ChainCheckpoint, NodeRpc},
     wallet::RealWallet,
+    wallet::WALLET_BIRTHDAY_HEIGHT,
 };
 use serde::Serialize;
 use std::{
@@ -99,3 +100,13 @@ pub(crate) fn notify(state: &AppState, topic: &str) {
 #[cfg(test)]
 #[path = "../tests/unit/state/tests.rs"]
 pub(crate) mod tests;
+
+pub(crate) fn wallet_matches_tip(wallet: &WalletSyncStatus, tip: &ChainCheckpoint) -> bool {
+    wallet.state == "ready"
+        && ((wallet.fully_scanned_height == Some(tip.height)
+            && wallet.fully_scanned_hash.as_deref() == Some(&tip.hash))
+            || (tip.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
+                && wallet.fully_scanned_height.is_none()
+                && wallet.observed_height == Some(tip.height)
+                && wallet.observed_hash.as_deref() == Some(&tip.hash)))
+}

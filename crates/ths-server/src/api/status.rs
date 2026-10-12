@@ -2,8 +2,9 @@ use super::error::{ApiError, ApiResult};
 use crate::state::AppState;
 use crate::{
     db::{Account, Activity, USER_ACCOUNT_COUNT},
+    rpc::ChainCheckpoint,
     rpc::ChainInfo,
-    state::WalletSyncStatus,
+    state::{WalletSyncStatus, wallet_matches_tip},
 };
 use axum::{
     Json,
@@ -28,6 +29,49 @@ pub(crate) async fn health(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+struct SettlementStatus {
+    node_height: Option<u64>,
+    lightwalletd_height: Option<u64>,
+    wallet_scanned_height: Option<u64>,
+    wallet_sync_state: &'static str,
+    settled: bool,
+    settlement_blocker: Option<&'static str>,
+}
+
+fn settlement_status(
+    node: Option<&ChainCheckpoint>,
+    lightwalletd: Option<&ChainCheckpoint>,
+    wallet: &WalletSyncStatus,
+) -> SettlementStatus {
+    let settlement_blocker = if node.is_none() {
+        Some("node_unavailable")
+    } else if lightwalletd.is_none() {
+        Some("lightwalletd_unavailable")
+    } else if wallet.state == "error" {
+        Some("wallet_error")
+    } else if wallet.state != "ready" {
+        Some("wallet_syncing")
+    } else if node.map(|tip| tip.height) != lightwalletd.map(|tip| tip.height) {
+        Some("height_mismatch")
+    } else if node != lightwalletd {
+        Some("chain_mismatch")
+    } else if !node.is_some_and(|tip| wallet_matches_tip(wallet, tip)) {
+        Some("wallet_behind")
+    } else {
+        None
+    };
+
+    SettlementStatus {
+        node_height: node.map(|tip| tip.height),
+        lightwalletd_height: lightwalletd.map(|tip| tip.height),
+        wallet_scanned_height: wallet.fully_scanned_height,
+        wallet_sync_state: wallet.state,
+        settled: settlement_blocker.is_none(),
+        settlement_blocker,
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct Status {
     instance: String,
@@ -37,6 +81,8 @@ pub(crate) struct Status {
     network: &'static str,
     endpoints: PublicEndpoints,
     wallet_sync: WalletSyncStatus,
+    #[serde(flatten)]
+    settlement: SettlementStatus,
 }
 
 #[derive(Serialize)]
@@ -55,9 +101,19 @@ pub(crate) async fn status(
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("127.0.0.1:8080");
+    let (node, lightwalletd) =
+        tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
+    let node = node.ok();
+    let lightwalletd = lightwalletd.ok();
+    let wallet_sync = state.wallet_sync_status().await;
+    let node_tip = node.as_ref().map(|chain| ChainCheckpoint {
+        height: chain.blocks,
+        hash: chain.bestblockhash.clone(),
+    });
+    let settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
     Ok(Json(Status {
         instance: state.0.instance.clone(),
-        node: state.0.rpc.chain_info().await.ok(),
+        node,
         account_count: usize::from(USER_ACCOUNT_COUNT),
         auto_mine: true,
         network: "Regtest",
@@ -69,7 +125,8 @@ pub(crate) async fn status(
                 .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
             p2p: std::env::var("THS_PUBLIC_P2P").unwrap_or_else(|_| "127.0.0.1:18233".into()),
         },
-        wallet_sync: state.wallet_sync_status().await,
+        wallet_sync,
+        settlement,
     }))
 }
 pub(crate) async fn accounts(State(state): State<AppState>) -> ApiResult<Json<Vec<Account>>> {

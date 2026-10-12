@@ -1,7 +1,7 @@
 use crate::state::{AppState, notify};
 use crate::{
     rpc::ChainCheckpoint,
-    state::{WalletSyncStatus, now_unix},
+    state::{WalletSyncStatus, now_unix, wallet_matches_tip},
     wallet::WALLET_BIRTHDAY_HEIGHT,
 };
 use anyhow::Context;
@@ -101,13 +101,7 @@ impl AppState {
     pub(crate) async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
         let observed = self.0.rpc.checkpoint().await?;
         let status = self.0.wallet_snapshot.read().await.status.clone();
-        let settled = status.state == "ready"
-            && ((status.fully_scanned_height == Some(observed.height)
-                && status.fully_scanned_hash.as_deref() == Some(&observed.hash))
-                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
-                    && status.fully_scanned_height.is_none()
-                    && status.observed_height == Some(observed.height)
-                    && status.observed_hash.as_deref() == Some(&observed.hash)));
+        let settled = wallet_matches_tip(&status, &observed);
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
             snapshot.status.observed_height = Some(observed.height);
