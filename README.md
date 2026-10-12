@@ -129,6 +129,14 @@ The same transfer from a terminal:
 ths wallet send --from 1 --to 2 --amount 1 --memo "rent for October"
 ```
 
+`ths wallet send`, `ths wallet faucet`, and `ths faucet` save an idempotency key
+for each request before they submit it, then wait up to 30 seconds for
+confirmation. If a payment is still pending, its status is unknown, or you press
+Ctrl+C, the command exits with an error and keeps the key. The environment keeps
+processing the payment. Run the same command to check that payment again; it
+does not create a second one. After the command reports a confirmed or failed
+payment, the next identical command makes a new payment.
+
 ### Mine blocks
 
 Select **Mine** from any dashboard page and enter the number of blocks. This is
@@ -272,12 +280,12 @@ Running `ths` with no command starts the default environment.
 | `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
 | `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
-| `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address |
+| `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address; repeat the same command to check a pending payment |
 | `ths faucet <ADDRESS> --amount 2.5` | Send a custom amount of up to 5 disposable ZEC |
 | `ths wallet balances` | Print each development account's balances and addresses |
-| `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury |
-| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo |
-| `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address |
+| `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury; repeat the same command to check pending payments |
+| `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo; repeat the same command to check a pending payment |
+| `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address; repeat the same command to check a pending payment |
 | `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
