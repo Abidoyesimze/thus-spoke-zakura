@@ -7,6 +7,7 @@ import { WalletActionsProvider } from './WalletActions';
 import { WalletPage } from './WalletPage';
 
 const TXID = 'ab'.repeat(32);
+const PAYMENT_URI = 'zcash:uregtest1account2?amount=1.23456789&memo=cmVudCBmb3IgT2N0b2Jlcg';
 
 function json(body: unknown): Promise<Response> {
   return Promise.resolve(
@@ -18,7 +19,7 @@ function json(body: unknown): Promise<Response> {
 }
 
 function mockWalletApis() {
-  vi.spyOn(globalThis, 'fetch').mockImplementation((input) => {
+  vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) => {
     const url = requestUrl(input);
     if (url.includes('/accounts')) {
       return json([
@@ -29,6 +30,14 @@ function mockWalletApis() {
           transparent_address: 'tmAccount1',
           transparent_zatoshi: 0,
           ironwood_zatoshi: 500_000_000,
+        },
+        {
+          id: 2,
+          name: 'Account 2',
+          unified_address: 'uregtest1account2',
+          transparent_address: 'tmAccount2',
+          transparent_zatoshi: 0,
+          ironwood_zatoshi: 0,
         },
       ]);
     }
@@ -48,6 +57,27 @@ function mockWalletApis() {
           created_at: '2026-09-18 10:00:00',
         },
       ]);
+    }
+    if (url.endsWith('/zip321/request')) return json({ uri: PAYMENT_URI });
+    if (url.endsWith('/zip321/parse')) {
+      const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
+        uri?: string;
+      };
+      if (body.uri !== PAYMENT_URI) throw new Error(`Unexpected payment URI: ${body.uri}`);
+      return json({
+        address: 'uregtest1account2',
+        destination_pool: 'ironwood',
+        to_account: 2,
+        amount_zatoshi: 123_456_789,
+        memo: 'rent for October',
+      });
+    }
+    if (url.endsWith('/send/quote')) {
+      return json({
+        available_zatoshi: 500_000_000,
+        fee_zatoshi: 10_000,
+        max_zatoshi: 499_990_000,
+      });
     }
     return json({
       instance: 'default',
@@ -91,6 +121,41 @@ describe('WalletPage', () => {
 
     await userEvent.click(request);
     expect(screen.getByRole('dialog', { name: 'Request ZEC' })).toBeInTheDocument();
+  });
+
+  it('fills Send from a generated payment request', async () => {
+    Object.assign(Element.prototype, {
+      hasPointerCapture: () => false,
+      releasePointerCapture: () => undefined,
+      scrollIntoView: () => undefined,
+    });
+    renderWallet();
+    await screen.findByText('Account 2');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Request' }));
+    await userEvent.click(screen.getByLabelText('Receiving account'));
+    await userEvent.click(await screen.findByRole('option', { name: 'Account 2' }));
+    await userEvent.type(screen.getByLabelText('Amount (ZEC, optional)'), '1.23456789');
+    await userEvent.type(screen.getByLabelText('Memo (optional)'), 'rent for October');
+    await userEvent.click(screen.getByRole('button', { name: 'Generate request' }));
+    expect(
+      (await screen.findByRole('region', { name: 'Generated payment request' })).querySelector(
+        'code',
+      ),
+    ).toHaveTextContent(PAYMENT_URI);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Send ZEC' }));
+    const uri = screen.getByLabelText('Payment request (optional)');
+    await userEvent.click(uri);
+    await userEvent.paste(PAYMENT_URI);
+    await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2'),
+    );
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1.23456789');
+    expect(screen.getByLabelText('Memo (optional)')).toHaveValue('rent for October');
   });
 
   it('does not dump a full transaction id into the activity table', async () => {
