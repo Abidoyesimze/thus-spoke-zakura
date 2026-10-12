@@ -83,6 +83,19 @@ export const sendSchema = z
 export type SendInput = z.input<typeof sendSchema>;
 export type SendValues = z.output<typeof sendSchema>;
 
+const optionalAmountField = z
+  .string()
+  .transform((value) => (value.trim() === '' ? undefined : value))
+  .pipe(amountField.optional());
+
+export const requestSchema = z.object({
+  account_id: accountIdField,
+  amount: optionalAmountField,
+  memo: memoField,
+});
+export type RequestInput = z.input<typeof requestSchema>;
+export type RequestValues = z.output<typeof requestSchema>;
+
 export const faucetSchema = z.object({
   account_id: accountIdField,
   pool: poolSchema,

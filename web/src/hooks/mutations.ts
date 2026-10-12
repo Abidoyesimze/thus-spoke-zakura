@@ -5,6 +5,7 @@ import {
   idempotencyKey,
   type Activity,
   type MiningJob,
+  type PaymentRequest,
   type PaymentUri,
   type Pool,
 } from '@/lib/api';
@@ -101,6 +102,20 @@ export function useSend(): UseMutationResult<Activity, Error, SendVariables> {
 /** Resolves a pasted `zcash:` URI; it moves no funds, so nothing is invalidated. */
 export function useParsePaymentUri(): UseMutationResult<PaymentUri, Error, string> {
   return useMutation({ mutationFn: (uri: string) => api.parsePaymentUri(uri) });
+}
+
+export interface PaymentRequestVariables {
+  account_id: number;
+  amount_zatoshi?: bigint;
+  memo?: string;
+}
+
+export function usePaymentRequest(): UseMutationResult<
+  PaymentRequest,
+  Error,
+  PaymentRequestVariables
+> {
+  return useMutation({ mutationFn: (variables) => api.paymentRequest(variables) });
 }
 
 export interface FaucetVariables {

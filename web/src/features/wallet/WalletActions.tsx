@@ -2,12 +2,13 @@ import { useMemo, useState, type ReactNode } from 'react';
 import { WalletActionsContext, type WalletActionsApi } from './wallet-actions-context';
 import { useAccounts, useMiningJob } from '@/hooks/queries';
 import { SendDialog } from './SendDialog';
+import { RequestDialog } from './RequestDialog';
 import { FaucetDialog } from './FaucetDialog';
 import { MineDialog } from './MineDialog';
 import { MiningStatus } from './MiningStatus';
 import { Button } from '@/components/ui/Button';
 
-type OpenDialog = 'send' | 'faucet' | 'mine' | null;
+type OpenDialog = 'send' | 'request' | 'faucet' | 'mine' | null;
 
 /**
  * Owns the transaction dialogs so the header and the account cards can trigger
@@ -27,6 +28,7 @@ export function WalletActionsProvider({ children }: { children: ReactNode }) {
         setSendAccount(accountId);
         setDialog('send');
       },
+      openRequest: () => setDialog('request'),
       openFaucet: (accountId) => {
         setFaucetAccount(accountId);
         setDialog('faucet');
@@ -63,6 +65,9 @@ export function WalletActionsProvider({ children }: { children: ReactNode }) {
           accounts={accounts}
           {...(sendAccount === undefined ? {} : { defaultAccountId: sendAccount })}
         />
+      )}
+      {dialog === 'request' && (
+        <RequestDialog key="request" open onOpenChange={close} accounts={accounts} />
       )}
       {dialog === 'faucet' && (
         <FaucetDialog
