@@ -5,7 +5,7 @@ pub(super) const INSTANCE_LABEL: &str = "com.zakura.ths.instance";
 pub(super) struct AllocatedInstance {
     pub(super) endpoints: Endpoints,
     pub(super) resources: Vec<recovery::ResourceRef>,
-    pub(super) app_container_id: String,
+    pub(super) app_container: WatchedContainer,
     pub(super) zakura_container_id: String,
 }
 
@@ -336,7 +336,7 @@ pub(super) fn ensure_app(
     journal: &mut recovery::RecoveryJournal,
     deadline: Deadline,
     mut dependencies: Vec<recovery::ResourceRef>,
-) -> Result<String> {
+) -> Result<WatchedContainer> {
     dependencies.push(volume_dependency(journal, &format!("{prefix}-wallet"))?);
 
     let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
@@ -349,7 +349,7 @@ pub(super) fn ensure_app(
     let public_rpc_env = format!("THS_PUBLIC_ZAKURA_RPC={public_rpc}");
     let public_lightwalletd_env = format!("THS_PUBLIC_LIGHTWALLETD={public_lightwalletd}");
     let public_p2p_env = format!("THS_PUBLIC_P2P={public_p2p}");
-    create_container(
+    let id = create_container(
         &target,
         name,
         docker,
@@ -387,7 +387,16 @@ pub(super) fn ensure_app(
             "--data-dir",
             "/data",
         ],
-    )
+    )?;
+    if id.is_empty() {
+        bail!("Docker returned no ID for app container {target}");
+    }
+    // Read the replay cursor by allocated ID so a replacement cannot become the watched app.
+    let created = docker.output(&["container", "inspect", "--format", "{{.Created}}", &id])?;
+    if created.is_empty() {
+        bail!("Docker returned no creation time for app container {id}");
+    }
+    Ok(WatchedContainer { id, created })
 }
 
 pub(super) fn create_container(
@@ -556,4 +565,10 @@ pub(super) fn published_port_with(
         ])?
         .parse()
         .context("Docker returned an invalid published port")
+}
+
+/// `docker inspect` fails the same way for a missing object and an unreachable daemon, so
+/// existence comes from a filtered listing: empty means absent, failure stays an error.
+pub(super) fn docker_listed<const N: usize>(args: [&str; N]) -> Result<bool> {
+    Ok(!docker_output(args)?.is_empty())
 }

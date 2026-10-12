@@ -46,14 +46,13 @@ fn shutdown_during_an_active_http_attempt_is_observed() {
     ] {
         let mut fixture = HttpFixture::new(mode);
         let policy = short_policy();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let shutdown = Shutdown::from_receiver(receiver);
+        let (sender, shutdown) = Shutdown::channel();
         let requested = || shutdown.try_interrupted();
         let started = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 fixture.wait_active(Duration::from_secs(2));
-                sender.send(()).unwrap();
+                sender.send(Ended::Interrupted).unwrap();
             });
             assert!(
                 probe_once(
@@ -147,8 +146,7 @@ fn cancellation_before_send_does_not_open_a_probe() {
 fn shutdown_during_retry_uses_the_original_readiness_deadline() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     let url = fixture.url();
     let started = Instant::now();
     let sender = sender;
@@ -157,7 +155,7 @@ fn shutdown_during_retry_uses_the_original_readiness_deadline() {
         while waiting.elapsed() < Duration::from_secs(2) && fixture.request_count() == 0 {
             std::thread::sleep(Duration::from_millis(5));
         }
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
         fixture.finish();
     });
     let docker = RunningDocker;
@@ -183,8 +181,7 @@ fn repeated_probes_share_one_phase_deadline() {
     let mut policy = short_policy();
     policy.readiness = Duration::from_millis(900);
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = RunningDocker;
     let started = Instant::now();
     let failure = wait_ready(
@@ -286,8 +283,7 @@ fn zakura_tip_accepts_a_string_result_and_rejects_malformed_bodies() {
 fn failed_or_malformed_inspection_is_not_reported_as_stopped() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = ScriptedDocker {
         running: Err("inspect boom".into()),
         logs: Ok("unused".into()),
@@ -331,8 +327,7 @@ fn failed_or_malformed_inspection_is_not_reported_as_stopped() {
 fn stopped_container_keeps_log_failures_with_the_readiness_error() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Rpc(r#"{"result":1}"#.into()));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let docker = ScriptedDocker {
         running: Ok("false".into()),
         logs: Err("logs unavailable".into()),
@@ -357,8 +352,7 @@ fn stopped_container_keeps_log_failures_with_the_readiness_error() {
 fn hanging_diagnostic_logs_expire_on_the_readiness_budget() {
     let policy = short_policy();
     let mut fixture = HttpFixture::new(HttpMode::Health(503));
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let context = LifecycleContext::new(policy);
     let script = hanging_log_script();
     let docker = LifecycleDocker {

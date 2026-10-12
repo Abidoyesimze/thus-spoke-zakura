@@ -200,3 +200,32 @@ pub(super) fn endpoint_lines(e: &Endpoints) -> String {
         e.dashboard, e.rpc, e.lightwalletd, e.network, e.tls, e.p2p
     )
 }
+
+pub(super) struct InstanceLock(File);
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            eprintln!("could not release the instance lock: {error}");
+        }
+    }
+}
+
+impl Runtime {
+    pub(super) fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
+        let lock_dir = self.root.join(".locks");
+        fs::create_dir_all(&lock_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_dir.join(format!("{name}.lock")))?;
+        match file.try_lock() {
+            Ok(()) => Ok(InstanceLock(file)),
+            Err(TryLockError::WouldBlock) => {
+                bail!("environment {name} is already in use by another command")
+            }
+            Err(TryLockError::Error(error)) => Err(error).context("locking environment"),
+        }
+    }
+}

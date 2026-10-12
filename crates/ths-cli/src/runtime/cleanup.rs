@@ -25,6 +25,7 @@ impl Runtime {
     }
 
     pub(super) fn verified_cleanup(&self, name: &InstanceName) -> Result<CleanupReport> {
+        let _lock = self.lock_instance(name)?;
         let policy = LifecyclePolicy::default();
         let context = LifecycleContext::new(policy);
         let deadline = Deadline::after(policy.cleanup);
@@ -94,27 +95,10 @@ impl Runtime {
             }
         };
         let mut journal = loaded;
-        let mut kept = std::collections::HashSet::new();
-        if let Some(existing) = &journal {
-            for mutation in &existing.record().mutations {
-                let outcome = recovery::loaded_outcome(&mutation.outcome);
-                let unresolved = matches!(outcome, recovery::MutationOutcome::Uncertain(_));
-                if unresolved
-                    && matches!(
-                        mutation.operation,
-                        recovery::MutationOperation::Create | recovery::MutationOperation::Start
-                    )
-                {
-                    kept.insert((
-                        mutation.resource.kind.clone(),
-                        mutation.resource.name.clone(),
-                    ));
-                    for dependency in &mutation.dependencies {
-                        kept.insert((dependency.kind.clone(), dependency.name.clone()));
-                    }
-                }
-            }
-        }
+        let kept = journal
+            .as_ref()
+            .map(|existing| retained_mutation_resources(existing.record(), false))
+            .unwrap_or_default();
         let work_deadline = deadline.saturating_sub(context.policy.termination_reserve);
         let prefix = prefix(name);
         let mut failures = Vec::new();
@@ -134,6 +118,7 @@ impl Runtime {
             ));
         }
         let mut targets: Vec<(String, String, String)> = Vec::new();
+        let mut absent_containers = Vec::new();
         let mut consider = |kind: &str, target: &str| -> Result<()> {
             if kept.contains(&(resource_kind(kind), target.to_owned())) {
                 let present = match resource_absent(docker, kind, target) {
@@ -165,33 +150,43 @@ impl Runtime {
             if let Some(id) = journal.as_ref().and_then(|existing| {
                 existing
                     .record()
-                    .resources
+                    .mutations
                     .iter()
-                    .find(|resource| {
-                        resource.kind == resource_kind(kind) && resource.name == target
+                    .find(|mutation| {
+                        unresolved_allocation(mutation)
+                            && mutation.resource.kind == resource_kind(kind)
+                            && mutation.resource.name == target
                     })
-                    .and_then(|resource| resource.identity.clone())
+                    .and_then(|mutation| mutation.resource.identity.clone())
+                    .or_else(|| {
+                        existing
+                            .record()
+                            .resources
+                            .iter()
+                            .find(|resource| {
+                                resource.kind == resource_kind(kind) && resource.name == target
+                            })
+                            .and_then(|resource| resource.identity.clone())
+                    })
             }) {
-                match docker.output(&[kind, "inspect", &id]) {
+                let absent = match docker.output(&[kind, "inspect", &id]) {
                     Ok(details) if !details.trim().is_empty() => {
                         let recorded = recovery::ResourceRef {
-                            kind: match kind {
-                                "container" => recovery::ResourceKind::Container,
-                                "volume" => recovery::ResourceKind::Volume,
-                                _ => recovery::ResourceKind::Network,
-                            },
+                            kind: resource_kind(kind),
                             name: target.to_owned(),
                             identity: Some(id.clone()),
                         };
                         match inspected_resource_identity(kind, target, name, &details) {
                             Ok(observed) if recovery::identity_matches(&recorded, &observed) => {
                                 targets.push((kind.to_owned(), id, target.to_owned()));
+                                return Ok(());
                             }
                             Ok(observed) => {
                                 uncertain = true;
                                 failures.push(format!(
                                     "recorded {kind} {target} ({id}) does not match {observed}; refusing to adopt it"
                                 ));
+                                false
                             }
                             Err(error) => prove_recorded_absence(
                                 docker,
@@ -222,6 +217,13 @@ impl Runtime {
                         &mut uncertain,
                         &mut failures,
                     ),
+                };
+                if absent && kind == "container" {
+                    absent_containers.push(recovery::ResourceRef {
+                        kind: recovery::ResourceKind::Container,
+                        name: target.to_owned(),
+                        identity: Some(id),
+                    });
                 }
                 return Ok(());
             }
@@ -258,7 +260,37 @@ impl Runtime {
             failures.push(format!("{error:#}"));
             uncertain = true;
         } else {
+            for resource in absent_containers {
+                if work_deadline.expired() {
+                    uncertain = true;
+                    failures.push(format!(
+                        "cleanup deadline expired before reconciling {}",
+                        resource.name
+                    ));
+                    break;
+                }
+                if let Some(existing) = &mut journal
+                    && let Err(error) = reconcile_absent_container(existing, docker, &resource)
+                {
+                    uncertain = true;
+                    failures.push(format!("reconciling absent {}: {error:#}", resource.name));
+                }
+            }
             for (kind, id, label) in targets {
+                // Ownership preflight includes dependencies, but deletion waits for
+                // every referencing create or start to be durably reconciled.
+                if kind != "container"
+                    && journal.as_ref().is_some_and(|existing| {
+                        retained_mutation_resources(existing.record(), true)
+                            .contains(&(resource_kind(&kind), label.clone()))
+                    })
+                {
+                    uncertain = true;
+                    failures.push(format!(
+                        "kept {kind} {label}: unresolved mutation dependencies"
+                    ));
+                    continue;
+                }
                 if work_deadline.expired() {
                     uncertain = true;
                     failures.push(format!("cleanup deadline expired before removing {label}"));
@@ -266,11 +298,7 @@ impl Runtime {
                 }
                 if let Some(existing) = &mut journal {
                     let resource = recovery::ResourceRef {
-                        kind: match kind.as_str() {
-                            "container" => recovery::ResourceKind::Container,
-                            "volume" => recovery::ResourceKind::Volume,
-                            _ => recovery::ResourceKind::Network,
-                        },
+                        kind: resource_kind(&kind),
                         name: label.clone(),
                         identity: Some(id.clone()),
                     };
@@ -290,7 +318,20 @@ impl Runtime {
                     _ => docker.run(&["network", "rm", &id]),
                 };
                 let mut reconciled_diagnostic = None;
-                let outcome = match resource_absent(docker, &kind, &label) {
+                let recovering_container = kind == "container"
+                    && journal.as_ref().is_some_and(|existing| {
+                        existing.record().mutations.iter().any(|mutation| {
+                            unresolved_allocation(mutation)
+                                && mutation.resource.name == label
+                                && mutation.resource.identity.as_deref() == Some(id.as_str())
+                        })
+                    });
+                let absence = if recovering_container {
+                    recorded_identity_absent(docker, &kind, &id)
+                } else {
+                    resource_absent(docker, &kind, &label)
+                };
+                let outcome = match absence {
                     Ok(true) => {
                         if let Err(error) = &removal {
                             reconciled_diagnostic = Some(format!(
@@ -305,7 +346,10 @@ impl Runtime {
                             )
                             .is_some()
                         });
-                        let outcome = recovery::reconcile_acknowledged_removal(true, unresolved);
+                        let outcome = recovery::reconcile_acknowledged_removal(
+                            true,
+                            unresolved && !recovering_container,
+                        );
                         if let recovery::MutationOutcome::Uncertain(reason) = &outcome {
                             uncertain = true;
                             failures.push(format!("{label}: {reason}"));
@@ -345,12 +389,32 @@ impl Runtime {
                             "recording reconciled removal of {label}: {error:#}"
                         ));
                     }
-                    if let Err(error) = existing.finish(index, outcome, Some(id)) {
+                    let absent = outcome == recovery::MutationOutcome::ReconciledAbsent;
+                    if let Err(error) = existing.finish(index, outcome, Some(id.clone())) {
                         uncertain = true;
                         failures.push(format!("recording removal of {label}: {error:#}"));
+                    } else if absent
+                        && kind == "container"
+                        && let Err(error) = reconcile_absent_container(
+                            existing,
+                            docker,
+                            &recovery::ResourceRef {
+                                kind: recovery::ResourceKind::Container,
+                                name: label.clone(),
+                                identity: Some(id),
+                            },
+                        )
+                    {
+                        uncertain = true;
+                        failures.push(format!("reconciling absent {label}: {error:#}"));
                     }
                 }
             }
+        }
+        if journal.as_ref().is_some_and(|existing| {
+            !retained_mutation_resources(existing.record(), true).is_empty()
+        }) {
+            uncertain = true;
         }
         for failure in context.finish_helpers(deadline) {
             uncertain = true;
@@ -458,18 +522,20 @@ pub(super) fn prove_recorded_absence(
     reason: &str,
     uncertain: &mut bool,
     failures: &mut Vec<String>,
-) {
+) -> bool {
     match recorded_identity_absent(docker, kind, id) {
-        Ok(true) => {}
+        Ok(true) => true,
         Ok(false) => {
             *uncertain = true;
             failures.push(format!("recorded {kind} {target} ({id}) {reason}"));
+            false
         }
         Err(error) => {
             *uncertain = true;
             failures.push(format!(
                 "recorded {kind} {target} ({id}) {reason}; identity listing failed: {error:#}"
             ));
+            false
         }
     }
 }
@@ -504,4 +570,71 @@ pub(super) fn resource_absent(
         _ => unreachable!("resource kind is fixed by the caller"),
     };
     Ok(!names.lines().any(|candidate| candidate.trim() == name))
+}
+
+pub(super) fn unresolved_allocation(mutation: &recovery::MutationRecord) -> bool {
+    matches!(
+        mutation.operation,
+        recovery::MutationOperation::Create | recovery::MutationOperation::Start
+    ) && matches!(
+        mutation.outcome,
+        recovery::MutationOutcome::Pending | recovery::MutationOutcome::Uncertain(_)
+    )
+}
+
+pub(super) fn retained_mutation_resources(
+    record: &recovery::RecoveryRecord,
+    include_known_containers: bool,
+) -> std::collections::HashSet<(recovery::ResourceKind, String)> {
+    let mut kept = std::collections::HashSet::new();
+    for mutation in &record.mutations {
+        let resource = &mutation.resource;
+        let known_container = resource.kind == recovery::ResourceKind::Container
+            && resource
+                .identity
+                .as_deref()
+                .is_some_and(|id| !id.is_empty())
+            && !record.resources.iter().any(|other| {
+                other.kind == resource.kind
+                    && other.name == resource.name
+                    && other.identity.is_some()
+                    && other.identity != resource.identity
+            })
+            && !record.mutations.iter().any(|other| {
+                unresolved_allocation(other)
+                    && other.resource.kind == resource.kind
+                    && other.resource.name == resource.name
+                    && other.resource.identity != resource.identity
+            });
+        if unresolved_allocation(mutation) && (include_known_containers || !known_container) {
+            kept.insert((resource.kind.clone(), resource.name.clone()));
+            for dependency in &mutation.dependencies {
+                kept.insert((dependency.kind.clone(), dependency.name.clone()));
+            }
+        }
+    }
+    kept
+}
+
+pub(super) fn reconcile_absent_container(
+    journal: &mut recovery::RecoveryJournal,
+    docker: &impl DockerResourceCommands,
+    resource: &recovery::ResourceRef,
+) -> Result<()> {
+    if !journal
+        .record()
+        .mutations
+        .iter()
+        .any(|mutation| unresolved_allocation(mutation) && mutation.resource == *resource)
+    {
+        return Ok(());
+    }
+    // Do not release dependencies underneath a same-name replacement.
+    if !resource_absent(docker, "container", &resource.name)? {
+        bail!(
+            "same-name container {} remains; refusing to release allocation dependencies",
+            resource.name
+        );
+    }
+    journal.reconcile_absent_allocations(resource)
 }

@@ -25,6 +25,7 @@ struct RecordedResource {
 }
 
 struct RecordingDocker {
+    extra_output: BTreeMap<String, String>,
     containers: Mutex<Vec<RecordedResource>>,
     volumes: Mutex<Vec<RecordedResource>>,
     networks: Mutex<Vec<RecordedResource>>,
@@ -46,6 +47,7 @@ fn recorded_names(text: &str) -> Vec<RecordedResource> {
 impl RecordingDocker {
     fn new(containers: &str, volumes: &str, networks: &str) -> Self {
         Self {
+            extra_output: BTreeMap::new(),
             containers: Mutex::new(recorded_names(containers)),
             volumes: Mutex::new(recorded_names(volumes)),
             networks: Mutex::new(recorded_names(networks)),
@@ -83,6 +85,9 @@ fn resource_matches(resource: &RecordedResource, token: &str) -> bool {
 
 impl DockerResourceCommands for RecordingDocker {
     fn output(&self, args: &[&str]) -> Result<String> {
+        if let Some(output) = self.extra_output.get(&args.join(" ")) {
+            return Ok(output.clone());
+        }
         let listed = |resources: &Mutex<Vec<RecordedResource>>| {
             resources
                 .lock()
@@ -144,6 +149,8 @@ struct RecordingHost {
     open_url_result: Result<(), String>,
     interrupt_before_ready: bool,
     final_cleanup_failure: Option<String>,
+    deleted_elsewhere: bool,
+    allocate_delay: Duration,
 }
 
 impl RecordingHost {
@@ -158,6 +165,8 @@ impl RecordingHost {
                 open_url_result: Ok(()),
                 interrupt_before_ready: false,
                 final_cleanup_failure: None,
+                deleted_elsewhere: false,
+                allocate_delay: Duration::ZERO,
             },
             events,
         )
@@ -204,7 +213,7 @@ impl StartHost for RecordingHost {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event == "wait_for_shutdown")
+                .any(|event| event.starts_with("wait_for_shutdown"))
             && let Some(docker) = &self.shutdown_collision
         {
             return runtime.cleanup_with(name, docker, false, &context.policy);
@@ -252,6 +261,7 @@ impl StartHost for RecordingHost {
         _journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance> {
         self.push(&format!("allocate:{name}"));
+        std::thread::sleep(self.allocate_delay);
         shutdown.check()?;
         Ok(AllocatedInstance {
             endpoints: Endpoints {
@@ -263,7 +273,7 @@ impl StartHost for RecordingHost {
                 tls: false,
             },
             resources: Vec::new(),
-            app_container_id: "app-id".into(),
+            app_container: watched("app-1"),
             zakura_container_id: "zakura-id".into(),
         })
     }
@@ -293,13 +303,27 @@ impl StartHost for RecordingHost {
             .map_err(|e| anyhow!("{e}"))
     }
 
-    fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()> {
-        self.push("wait_for_shutdown");
+    fn wait_for_shutdown(
+        &self,
+        app_container: &WatchedContainer,
+        shutdown: &Shutdown,
+    ) -> Result<Ended> {
+        self.push(&format!("wait_for_shutdown:{}", app_container.id));
+        assert_eq!(app_container, &watched("app-1"));
         if self.shutdown_collision.is_some() {
-            Ok(())
-        } else {
-            shutdown.wait()
+            return Ok(Ended::Interrupted);
         }
+        let events = ScriptedEvents::default();
+        if self.deleted_elsewhere {
+            events.streams.lock().unwrap().push_back(Ok(true));
+        }
+        let _monitor = DeletionMonitor::spawn(
+            Arc::new(events),
+            app_container,
+            Duration::from_millis(1),
+            shutdown,
+        );
+        shutdown.wait()
     }
 }
 
@@ -379,4 +403,20 @@ impl DockerResourceCommands for IdleDocker {
     fn run(&self, args: &[&str]) -> Result<()> {
         bail!("unexpected Docker run: {args:?}")
     }
+}
+
+#[path = "tests/deletion.rs"]
+mod deletion;
+use deletion::{ScriptedEvents, watched};
+
+thread_local! {
+    /// Points this test thread's Docker commands at a daemon that does not exist.
+    pub(super) static DOCKER_UNREACHABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn with_unreachable_docker<T>(test: impl FnOnce() -> T) -> T {
+    DOCKER_UNREACHABLE.set(true);
+    let result = test();
+    DOCKER_UNREACHABLE.set(false);
+    result
 }

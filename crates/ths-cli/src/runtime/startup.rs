@@ -51,7 +51,6 @@ impl Runtime {
             &context,
         )
     }
-
     pub fn open(&self, name: &InstanceName) -> Result<()> {
         open_url(&self.read_instance(name)?.endpoints.dashboard)
     }
@@ -59,35 +58,72 @@ impl Runtime {
 
 pub(super) struct Shutdown {
     pub(super) flag: Arc<AtomicBool>,
-    pub(super) receiver: mpsc::Receiver<()>,
+    pub(super) signal: Arc<AtomicI32>,
+    /// Lets a `DeletionMonitor` end `wait` through the same channel as Ctrl+C.
+    pub(super) sender: mpsc::Sender<Ended>,
+    pub(super) receiver: mpsc::Receiver<Ended>,
 }
-
 impl Shutdown {
     #[cfg(test)]
-    pub(super) fn from_receiver(receiver: mpsc::Receiver<()>) -> Self {
-        Self {
+    pub(super) fn channel() -> (mpsc::Sender<Ended>, Self) {
+        let (sender, receiver) = mpsc::channel();
+        let shutdown = Self {
             flag: Arc::new(AtomicBool::new(false)),
+            signal: Arc::new(AtomicI32::new(0)),
+            sender: sender.clone(),
             receiver,
-        }
+        };
+        (sender, shutdown)
     }
 
     pub(super) fn install() -> Result<Self> {
         let (sender, receiver) = mpsc::channel();
         let flag = Arc::new(AtomicBool::new(false));
+        let signal = Arc::new(AtomicI32::new(0));
         let handler_flag = flag.clone();
-        ctrlc::set_handler(move || {
-            handler_flag.store(true, Ordering::SeqCst);
-            let _ = sender.send(());
+        let handler_signal = signal.clone();
+        let handler_sender = sender.clone();
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGINT,
+            signal_hook::consts::SIGTERM,
+        ])
+        .context("installing shutdown signal handlers")?;
+        thread::spawn(move || {
+            for received in signals.forever() {
+                handler_signal.store(received, Ordering::SeqCst);
+                handler_flag.store(true, Ordering::SeqCst);
+                if handler_sender.send(Ended::Interrupted).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            flag,
+            signal,
+            sender,
+            receiver,
         })
-        .context("installing the shutdown signal handler")?;
-        Ok(Self { flag, receiver })
     }
 
     pub(super) fn try_interrupted(&self) -> bool {
-        if self.receiver.try_recv().is_ok() {
+        // Deletion notices only arrive while `wait` runs, which receives them itself.
+        if matches!(self.receiver.try_recv(), Ok(Ended::Interrupted)) {
             self.flag.store(true, Ordering::SeqCst);
         }
         self.flag.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn received_signal(&self) -> Option<i32> {
+        if self.try_interrupted() {
+            let signal = self.signal.load(Ordering::SeqCst);
+            Some(if signal == 0 {
+                signal_hook::consts::SIGTERM
+            } else {
+                signal
+            })
+        } else {
+            None
+        }
     }
 
     pub(super) fn check(&self) -> Result<()> {
@@ -97,15 +133,21 @@ impl Shutdown {
         Ok(())
     }
 
-    pub(super) fn wait(&self) -> Result<()> {
-        if self.try_interrupted() {
-            return Ok(());
+    /// Waits for a shutdown signal, or for a `DeletionMonitor` to report that another command
+    /// (`ths stop` or `ths reset` from another shell) deleted the environment.
+    pub(super) fn wait(&self) -> Result<Ended> {
+        // Not `try_interrupted`: it would drop a deletion notice that is already queued.
+        if self.flag.load(Ordering::SeqCst) {
+            return Ok(Ended::Interrupted);
         }
-        self.receiver
+        let ended = self
+            .receiver
             .recv()
             .context("waiting for a shutdown signal")?;
-        self.flag.store(true, Ordering::SeqCst);
-        Ok(())
+        if ended == Ended::Interrupted {
+            self.flag.store(true, Ordering::SeqCst);
+        }
+        Ok(ended)
     }
 
     pub(super) fn wait_timeout(&self, timeout: Duration) -> Result<()> {
@@ -113,7 +155,7 @@ impl Shutdown {
             bail!("interrupted");
         }
         match self.receiver.recv_timeout(timeout) {
-            Ok(()) => {
+            Ok(_) => {
                 self.flag.store(true, Ordering::SeqCst);
                 bail!("interrupted");
             }
@@ -126,6 +168,15 @@ impl Shutdown {
             }
         }
     }
+}
+
+/// How a running environment's foreground `start` ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Ended {
+    /// Ctrl+C or a termination signal: `start` deletes the environment itself.
+    Interrupted,
+    /// Another command already deleted it.
+    DeletedElsewhere,
 }
 
 pub(super) trait StartHost {
@@ -161,7 +212,11 @@ pub(super) trait StartHost {
         context: &LifecycleContext,
     ) -> Result<()>;
     fn open_url(&self, url: &str, shutdown: &Shutdown, context: &LifecycleContext) -> Result<()>;
-    fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()>;
+    fn wait_for_shutdown(
+        &self,
+        app_container: &WatchedContainer,
+        shutdown: &Shutdown,
+    ) -> Result<Ended>;
 }
 
 pub(super) struct DockerHost;
@@ -201,7 +256,7 @@ impl StartHost for DockerHost {
         let requested = || shutdown.try_interrupted();
         let docker = LifecycleDocker::production(
             context,
-            None,
+            context.overall_deadline,
             context.policy.startup_docker,
             Cancellation::Observe(&requested),
         );
@@ -214,7 +269,7 @@ impl StartHost for DockerHost {
         require_free_loopback(ports.p2p)?;
         require_free_loopback(ports.lightwalletd)?;
         shutdown.check()?;
-        let network_budget = Deadline::after(context.policy.startup_docker);
+        let network_budget = context.startup_deadline(context.policy.startup_docker);
         let network = ensure_network_with(
             &prefix,
             name,
@@ -225,7 +280,7 @@ impl StartHost for DockerHost {
         shutdown.check()?;
         let mut volumes = Vec::new();
         for suffix in ["chain", "wallet", "lightwalletd", "config"] {
-            let budget = Deadline::after(context.policy.startup_docker);
+            let budget = context.startup_deadline(context.policy.startup_docker);
             volumes.push(ensure_volume_with(
                 &format!("{prefix}-{suffix}"),
                 name,
@@ -236,7 +291,7 @@ impl StartHost for DockerHost {
             shutdown.check()?;
         }
         let init_name = format!("{prefix}-init");
-        let init_budget = Deadline::after(context.policy.startup_docker);
+        let init_budget = context.startup_deadline(context.policy.startup_docker);
         let init_docker = docker.scoped(init_budget, context.policy.startup_docker);
         if owned_resource(&init_docker, "container", &init_name, name)?.is_none() {
             let app = app_image();
@@ -266,7 +321,7 @@ impl StartHost for DockerHost {
                 ],
             )?;
             shutdown.check()?;
-            let start_budget = Deadline::after(context.policy.initialization);
+            let start_budget = context.startup_deadline(context.policy.initialization);
             let starter = docker.scoped(start_budget, context.policy.initialization);
             let index = journal.begin(
                 recovery::ResourceRef {
@@ -287,7 +342,7 @@ impl StartHost for DockerHost {
             )?;
             shutdown.check()?;
         }
-        let zakura_budget = Deadline::after(context.policy.startup_docker);
+        let zakura_budget = context.startup_deadline(context.policy.startup_docker);
         let zakura_id = ensure_zakura(
             &prefix,
             name,
@@ -298,7 +353,7 @@ impl StartHost for DockerHost {
             vec![network.clone()],
         )?;
         shutdown.check()?;
-        let lightwalletd_budget = Deadline::after(context.policy.startup_docker);
+        let lightwalletd_budget = context.startup_deadline(context.policy.startup_docker);
         let lightwalletd_id = ensure_lightwalletd(
             &prefix,
             name,
@@ -309,7 +364,7 @@ impl StartHost for DockerHost {
             vec![network.clone()],
         )?;
         shutdown.check()?;
-        let zakura_start = Deadline::after(context.policy.startup_docker);
+        let zakura_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
             &zakura_id,
             &format!("{prefix}-zakura"),
@@ -326,7 +381,7 @@ impl StartHost for DockerHost {
                 "18232/tcp",
             )?
         );
-        let tip_deadline = Deadline::after(context.policy.readiness);
+        let tip_deadline = context.startup_deadline(context.policy.readiness);
         readiness::wait_for_zakura_tip(
             &zakura_rpc,
             &zakura_id,
@@ -335,7 +390,7 @@ impl StartHost for DockerHost {
             &context.policy,
             &docker.scoped(tip_deadline, context.policy.readiness_docker),
         )?;
-        let lightwalletd_start = Deadline::after(context.policy.startup_docker);
+        let lightwalletd_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
             &lightwalletd_id,
             &format!("{prefix}-lightwalletd"),
@@ -344,8 +399,8 @@ impl StartHost for DockerHost {
             lightwalletd_start,
         )?;
         shutdown.check()?;
-        let app_budget = Deadline::after(context.policy.startup_docker);
-        let app_id = ensure_app(
+        let app_budget = context.startup_deadline(context.policy.startup_docker);
+        let app_container = ensure_app(
             &prefix,
             name,
             &ports,
@@ -355,9 +410,9 @@ impl StartHost for DockerHost {
             vec![network],
         )?;
         shutdown.check()?;
-        let app_start = Deadline::after(context.policy.startup_docker);
+        let app_start = context.startup_deadline(context.policy.startup_docker);
         start_container(
-            &app_id,
+            &app_container.id,
             &format!("{prefix}-app"),
             &docker.scoped(app_start, context.policy.startup_docker),
             journal,
@@ -369,7 +424,7 @@ impl StartHost for DockerHost {
         Ok(AllocatedInstance {
             endpoints,
             resources: journal.record().resources.clone(),
-            app_container_id: app_id,
+            app_container,
             zakura_container_id: zakura_id,
         })
     }
@@ -381,7 +436,7 @@ impl StartHost for DockerHost {
         context: &LifecycleContext,
     ) -> Result<()> {
         let requested = || shutdown.try_interrupted();
-        let deadline = Deadline::after(context.policy.readiness);
+        let deadline = context.startup_deadline(context.policy.readiness);
         let docker = LifecycleDocker::production(
             context,
             Some(deadline),
@@ -390,7 +445,7 @@ impl StartHost for DockerHost {
         );
         readiness::wait_ready(
             &allocated.endpoints.dashboard,
-            &allocated.app_container_id,
+            &allocated.app_container.id,
             deadline,
             shutdown,
             &context.policy,
@@ -402,7 +457,17 @@ impl StartHost for DockerHost {
         open_url_with(url, shutdown, context)
     }
 
-    fn wait_for_shutdown(&self, shutdown: &Shutdown) -> Result<()> {
+    fn wait_for_shutdown(
+        &self,
+        app_container: &WatchedContainer,
+        shutdown: &Shutdown,
+    ) -> Result<Ended> {
+        let _monitor = DeletionMonitor::spawn(
+            Arc::new(DockerEvents::default()),
+            app_container,
+            DELETION_WATCH_RETRY,
+            shutdown,
+        );
         shutdown.wait()
     }
 }
@@ -450,7 +515,6 @@ impl Runtime {
         let context = LifecycleContext::new(LifecyclePolicy::default());
         self.start_with_policy(name, no_open, json, port_offset, host, shutdown, &context)
     }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn start_with_policy(
         &self,
@@ -463,6 +527,7 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<()> {
         host_ports(port_offset)?;
+        let mut lifecycle = Some(self.lock_instance(name)?);
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
@@ -507,10 +572,14 @@ impl Runtime {
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
             }
-            host.wait_for_shutdown(shutdown)?;
-            Ok(())
+            drop(lifecycle.take());
+            host.wait_for_shutdown(&allocated.app_container, shutdown)
         })();
         cleanup.state = CleanupGuard::Explicit;
+        if matches!(primary, Ok(Ended::DeletedElsewhere)) {
+            println!("\n{name} was stopped and deleted by another command.");
+            return Ok(());
+        }
         if primary.is_ok() {
             println!("\nStopping and deleting {name}…");
         }
@@ -519,12 +588,12 @@ impl Runtime {
             .delete_partial(self, name, context, final_deadline)
             .and_then(CleanupReport::into_result);
         match (primary, cleaned) {
-            (Ok(()), Ok(())) => {
+            (Ok(_), Ok(())) => {
                 println!("Deleted {name} and all of its development data.");
                 Ok(())
             }
             (Err(primary), Ok(())) => Err(primary),
-            (Ok(()), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
             (Err(primary), Err(error)) => Err(anyhow!("{primary:#}\n{error:#}")),
         }
     }

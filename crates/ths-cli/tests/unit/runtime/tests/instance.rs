@@ -12,13 +12,12 @@ fn validates_instance_names() {
 
 #[test]
 fn shutdown_reports_interrupt_from_channel() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     assert!(!shutdown.try_interrupted());
-    sender.send(()).unwrap();
+    sender.send(Ended::Interrupted).unwrap();
     assert!(shutdown.try_interrupted());
     assert!(shutdown.try_interrupted());
-    shutdown.wait().unwrap();
+    assert_eq!(shutdown.wait().unwrap(), Ended::Interrupted);
 }
 
 #[test]
@@ -67,8 +66,7 @@ fn port_offset_rejects_values_that_overflow_a_host_port() {
 fn invalid_port_offset_is_rejected_before_any_deletion_or_allocation() {
     let (mut host, events) = RecordingHost::new();
     host.initial_delete_error = true;
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
 
     let error = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 32740, &host, &shutdown)

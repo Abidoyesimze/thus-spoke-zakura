@@ -364,6 +364,224 @@ fn name_present(kind: &str, target: &str) -> Result<bool> {
     Ok(names.lines().any(|candidate| candidate.trim() == target))
 }
 
+struct LostStartReplyDocker<'a> {
+    inner: &'a LifecycleDocker<'a>,
+}
+
+impl DockerResourceCommands for LostStartReplyDocker<'_> {
+    fn output(&self, args: &[&str]) -> Result<String> {
+        self.inner.output(args)
+    }
+
+    fn run(&self, args: &[&str]) -> Result<()> {
+        self.inner.run(args)?;
+        if let ["start", _] = args {
+            bail!("synthetic timeout after docker {}", args.join(" "));
+        }
+        Ok(())
+    }
+}
+
+fn exercise_lost_start() -> Result<()> {
+    let instance = unique_name();
+    let network_name = prefix(&instance);
+    let volume_name = format!("{network_name}-wallet");
+    let container_name = format!("{network_name}-app");
+    let root = tempfile::tempdir()?;
+    let runtime = Runtime {
+        root: root.path().to_path_buf(),
+    };
+    let policy = LifecyclePolicy::default();
+    let context = LifecycleContext::new(policy);
+    let docker = LifecycleDocker::production(
+        &context,
+        Some(Deadline::after(policy.cleanup)),
+        policy.startup_docker,
+        Cancellation::Ignore,
+    );
+    let mut created = Vec::<ResourceRef>::new();
+    // Assertions return errors inside this closure so fixture cleanup also runs
+    // after a failed observation, not only after a successful production cleanup.
+    let result = (|| -> Result<()> {
+        let mut original_id = None;
+        for retry in [false, true] {
+            let network_id = docker.output(&[
+                "network",
+                "create",
+                "--label",
+                &label(&instance),
+                &network_name,
+            ])?;
+            let network = ResourceRef {
+                kind: ResourceKind::Network,
+                name: network_name.clone(),
+                identity: Some(network_id),
+            };
+            created.push(network.clone());
+            docker.run(&[
+                "volume",
+                "create",
+                "--label",
+                &label(&instance),
+                &volume_name,
+            ])?;
+            let volume = ResourceRef {
+                kind: ResourceKind::Volume,
+                name: volume_name.clone(),
+                identity: Some(volume_name.clone()),
+            };
+            created.push(volume.clone());
+            let mut journal = RecoveryJournal::create(runtime.recovery_path(&instance), &instance)?;
+            remember_acknowledged(&mut journal, network.clone())?;
+            remember_acknowledged(&mut journal, volume.clone())?;
+            let mount = format!("{volume_name}:/ths-wallet");
+            let id = create_container(
+                &container_name,
+                &instance,
+                &docker,
+                &mut journal,
+                Deadline::after(policy.startup_docker),
+                vec![network, volume],
+                &[
+                    "create",
+                    "--name",
+                    &container_name,
+                    "--network",
+                    &network_name,
+                    "--volume",
+                    &mount,
+                    "--label",
+                    &label(&instance),
+                    "--entrypoint",
+                    "/bin/sh",
+                    ZAKURA_IMAGE,
+                    "-c",
+                    "exit 0",
+                ],
+            )?;
+            created.push(ResourceRef {
+                kind: ResourceKind::Container,
+                name: container_name.clone(),
+                identity: Some(id.clone()),
+            });
+            if retry {
+                anyhow::ensure!(
+                    original_id.as_ref() != Some(&id),
+                    "retry reused the original ID"
+                );
+                start_container(
+                    &id,
+                    &container_name,
+                    &docker,
+                    &mut journal,
+                    Deadline::after(policy.startup_docker),
+                )?;
+            } else {
+                let error = start_container(
+                    &id,
+                    &container_name,
+                    &LostStartReplyDocker { inner: &docker },
+                    &mut journal,
+                    Deadline::after(policy.startup_docker),
+                );
+                let error = match error {
+                    Err(error) => error,
+                    Ok(()) => bail!("lost start reply unexpectedly succeeded"),
+                };
+                anyhow::ensure!(error.to_string().contains("synthetic timeout"), "{error:#}");
+                original_id = Some(id.clone());
+            }
+            drop(journal);
+            let report = runtime.cleanup_with(&instance, &docker, !retry, &policy)?;
+            anyhow::ensure!(report.verified(), "{report:?}");
+            anyhow::ensure!(
+                recorded_identity_absent(&docker, "container", &id)?,
+                "original container remains"
+            );
+            anyhow::ensure!(
+                resource_absent(&docker, "volume", &volume_name)?,
+                "wallet volume remains"
+            );
+            anyhow::ensure!(
+                resource_absent(&docker, "network", &network_name)?,
+                "network remains"
+            );
+            anyhow::ensure!(
+                !runtime.instance_dir(&instance).exists(),
+                "metadata remains"
+            );
+        }
+        Ok(())
+    })();
+    let cleanup_context = LifecycleContext::new(policy);
+    let cleanup = LifecycleDocker::production(
+        &cleanup_context,
+        Some(Deadline::after(policy.cleanup)),
+        policy.startup_docker,
+        Cancellation::Ignore,
+    );
+    let mut failures = Vec::new();
+    for kind in [
+        ResourceKind::Container,
+        ResourceKind::Volume,
+        ResourceKind::Network,
+    ] {
+        for resource in created
+            .iter()
+            .rev()
+            .filter(|resource| resource.kind == kind)
+        {
+            let id = resource
+                .identity
+                .as_deref()
+                .context("fixture identity missing")?;
+            let kind_name = match kind {
+                ResourceKind::Container => "container",
+                ResourceKind::Volume => "volume",
+                ResourceKind::Network => "network",
+            };
+            let removal = (|| -> Result<()> {
+                if !recorded_identity_absent(&cleanup, kind_name, id)? {
+                    let details = cleanup.output(&[kind_name, "inspect", id])?;
+                    let observed = inspected_resource_identity(
+                        kind_name,
+                        &resource.name,
+                        &instance,
+                        &details,
+                    )?;
+                    anyhow::ensure!(observed == id, "fixture identity changed");
+                    match kind {
+                        ResourceKind::Container => cleanup.run(&["rm", "-f", id])?,
+                        ResourceKind::Volume => cleanup.run(&["volume", "rm", id])?,
+                        ResourceKind::Network => cleanup.run(&["network", "rm", id])?,
+                    }
+                    anyhow::ensure!(
+                        recorded_identity_absent(&cleanup, kind_name, id)?,
+                        "fixture resource remains"
+                    );
+                }
+                Ok(())
+            })();
+            if let Err(error) = removal {
+                failures.push(format!("fixture cleanup {}: {error:#}", resource.name));
+            }
+        }
+    }
+    if !failures.is_empty() {
+        if let Err(error) = result {
+            failures.insert(0, format!("test failed: {error:#}"));
+        }
+        bail!("{}", failures.join("; "));
+    }
+    result
+}
+
+#[test]
+#[ignore = "requires a disposable Docker daemon and prepared runtime images"]
+fn lost_start_reply_is_cleaned_up_and_can_be_retried() {
+    exercise_lost_start().unwrap();
+}
+
 #[test]
 #[ignore = "requires a disposable Docker daemon and prepared runtime images"]
 fn lost_create_reply_retains_uncertainty_and_recovery() {

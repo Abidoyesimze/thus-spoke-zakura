@@ -257,8 +257,7 @@ fn volume_create_does_not_accept_a_racing_foreign_volume() {
 fn initial_cleanup_failure_does_not_retry_on_drop() {
     let (mut host, events) = RecordingHost::new();
     host.initial_delete_error = true;
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
 
     let error = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
@@ -272,8 +271,7 @@ fn initial_cleanup_failure_does_not_retry_on_drop() {
 fn readiness_failure_deletes_the_started_instance() {
     let (mut host, events) = RecordingHost::new();
     host.wait_ready_result = Err("dashboard did not become healthy".into());
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let err = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
         .unwrap_err();
@@ -294,5 +292,97 @@ fn readiness_failure_deletes_the_started_instance() {
             .iter()
             .any(|e| e.starts_with("delete:") && !e.ends_with("alpha"))
     );
-    assert!(!events.iter().any(|e| e == "wait_for_shutdown"));
+    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
+}
+
+fn allocate_replaced_app(docker: &ReplacedApp) -> Result<WatchedContainer> {
+    let dir = tempfile::tempdir()?;
+    let mut journal = recovery::RecoveryJournal::create(
+        dir.path().join("lifecycle-recovery.json"),
+        &name("alpha"),
+    )?;
+    let volume = journal.begin(
+        recovery::ResourceRef {
+            kind: recovery::ResourceKind::Volume,
+            name: "ths-alpha-wallet".into(),
+            identity: Some("ths-alpha-wallet".into()),
+        },
+        Vec::new(),
+        recovery::MutationOperation::Create,
+    )?;
+    journal.finish(
+        volume,
+        recovery::MutationOutcome::Acknowledged,
+        Some("ths-alpha-wallet".into()),
+    )?;
+    ensure_app(
+        "ths-alpha",
+        &name("alpha"),
+        &host_ports(0)?,
+        docker,
+        &mut journal,
+        Deadline::after(Duration::from_secs(5)),
+        Vec::new(),
+    )
+}
+
+struct ReplacedApp {
+    reuse: bool,
+    inspect_error: bool,
+}
+
+impl DockerResourceCommands for ReplacedApp {
+    fn output(&self, args: &[&str]) -> Result<String> {
+        match args {
+            ["container", "ls", "-a", "--format", "{{.Names}}"] => {
+                Ok(if self.reuse { "ths-alpha-app" } else { "" }.into())
+            }
+            ["container", "inspect", "ths-alpha-app" | "app-1"] => Ok(
+                r#"[{"Id":"app-1","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#
+                    .into(),
+            ),
+            ["create", ..] => Ok("app-1".into()),
+            ["container", "inspect", "--format", "{{.Created}}", "app-1"] => {
+                if self.inspect_error {
+                    bail!("Docker is unreachable");
+                }
+                Ok("2026-01-01T00:00:00Z".into())
+            }
+            // After creation (or ownership inspection), the name points to a replacement.
+            [
+                "container",
+                "inspect",
+                "--format",
+                "{{.Created}}",
+                "ths-alpha-app",
+            ] => Ok("2026-01-02T00:00:00Z".into()),
+            _ => bail!("unexpected Docker read: {}", args.join(" ")),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Result<()> {
+        bail!("unexpected Docker mutation: {}", args.join(" "))
+    }
+}
+
+#[test]
+fn app_allocation_captures_identity_before_a_name_replacement() {
+    for reuse in [false, true] {
+        let docker = ReplacedApp {
+            reuse,
+            inspect_error: false,
+        };
+        let app = allocate_replaced_app(&docker).unwrap();
+        assert_eq!(app, watched("app-1"));
+    }
+}
+
+#[test]
+fn app_identity_capture_does_not_fall_back_to_a_replacement_on_docker_errors() {
+    let docker = ReplacedApp {
+        reuse: false,
+        inspect_error: true,
+    };
+    let error = allocate_replaced_app(&docker).unwrap_err();
+    assert!(error.to_string().contains("Docker is unreachable"));
 }

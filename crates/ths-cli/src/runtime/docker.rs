@@ -22,6 +22,7 @@ impl DockerResourceCommands for DockerCli {
 pub(super) struct LifecycleContext {
     pub(super) policy: LifecyclePolicy,
     pub(super) helpers: RefCell<HelperSet>,
+    pub(super) overall_deadline: Option<Deadline>,
 }
 
 impl LifecycleContext {
@@ -29,7 +30,15 @@ impl LifecycleContext {
         Self {
             policy,
             helpers: RefCell::new(HelperSet::new()),
+            overall_deadline: None,
         }
+    }
+
+    pub(super) fn startup_deadline(&self, duration: Duration) -> Deadline {
+        self.overall_deadline.map_or_else(
+            || Deadline::after(duration),
+            |deadline| deadline.clipped(duration),
+        )
     }
 
     pub(super) fn finish_helpers(&self, deadline: Deadline) -> Vec<CommandFailure> {
@@ -180,12 +189,19 @@ pub(super) fn docker_output<const N: usize>(args: [&str; N]) -> Result<String> {
     docker_output_args(&args)
 }
 pub(super) fn docker_output_args(args: &[&str]) -> Result<String> {
-    let output = Command::new("docker")
-        .args(args)
-        .output()
-        .context("running Docker")?;
+    let output = docker_cli().args(args).output().context("running Docker")?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+pub(super) fn docker_cli() -> Command {
+    #[allow(unused_mut)]
+    let mut command = Command::new("docker");
+    #[cfg(test)]
+    if tests::DOCKER_UNREACHABLE.get() {
+        command.env("DOCKER_HOST", "unix:///nonexistent/ths-tests/docker.sock");
+    }
+    command
 }

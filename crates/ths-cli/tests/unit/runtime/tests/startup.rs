@@ -70,8 +70,7 @@ fn shutdown_collision_removes_owned_resources_and_preserves_foreign_container() 
     );
     let (mut host, events) = RecordingHost::new();
     host.shutdown_collision = Some(docker);
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
 
     let error = runtime_for_tests()
         .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
@@ -104,8 +103,7 @@ fn shutdown_collision_removes_owned_resources_and_preserves_foreign_container() 
 fn browser_open_failure_deletes_and_does_not_wait() {
     let (mut host, events) = RecordingHost::new();
     host.open_url_result = Err("opening http://127.0.0.1:1".into());
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let err = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
         .unwrap_err();
@@ -113,13 +111,13 @@ fn browser_open_failure_deletes_and_does_not_wait() {
     let events = events.lock().unwrap().clone();
     assert!(events.iter().any(|e| e.starts_with("open_url:")));
     assert!(events.iter().any(|e| e == "delete:alpha"));
-    assert!(!events.iter().any(|e| e == "wait_for_shutdown"));
+    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
 }
 
 #[test]
 fn no_open_skips_browser_and_waits_for_shutdown() {
     let (host, events) = RecordingHost::new();
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, shutdown) = Shutdown::channel();
     let watched = std::sync::Arc::clone(&events);
     std::thread::spawn(move || {
         let started = std::time::Instant::now();
@@ -128,21 +126,20 @@ fn no_open_skips_browser_and_waits_for_shutdown() {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| event == "wait_for_shutdown");
+                .any(|event| event.starts_with("wait_for_shutdown"));
             if waiting {
                 break;
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
     });
-    let shutdown = Shutdown::from_receiver(receiver);
     runtime_for_tests()
         .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
         .unwrap();
     let events = events.lock().unwrap().clone();
     assert!(!events.iter().any(|e| e.starts_with("open_url:")));
-    assert!(events.iter().any(|e| e == "wait_for_shutdown"));
+    assert!(events.iter().any(|e| e.starts_with("wait_for_shutdown")));
     assert!(events.iter().any(|e| e == "delete:alpha"));
 }
 
@@ -151,8 +148,7 @@ fn startup_and_cleanup_failures_are_both_reported_once() {
     let (mut host, events) = RecordingHost::new();
     host.wait_ready_result = Err("dashboard readiness timed out".into());
     host.final_cleanup_failure = Some("Docker inspection failed".into());
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let error = runtime_for_tests()
         .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
         .unwrap_err();
@@ -174,8 +170,7 @@ fn startup_and_cleanup_failures_are_both_reported_once() {
 fn interrupt_before_ready_deletes_the_started_instance() {
     let (mut host, events) = RecordingHost::new();
     host.interrupt_before_ready = true;
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     let err = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
         .unwrap_err();
@@ -183,15 +178,14 @@ fn interrupt_before_ready_deletes_the_started_instance() {
     let events = events.lock().unwrap().clone();
     assert!(events.iter().any(|e| e == "allocate:alpha"));
     assert!(events.iter().any(|e| e == "delete:alpha"));
-    assert!(!events.iter().any(|e| e == "wait_for_shutdown"));
+    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
 }
 
 #[test]
 fn interrupt_during_allocate_deletes_only_the_named_instance() {
     let (host, events) = RecordingHost::new();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    sender.send(()).unwrap();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
     let err = runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
         .unwrap_err();
@@ -203,10 +197,9 @@ fn interrupt_during_allocate_deletes_only_the_named_instance() {
 
 #[test]
 fn shutdown_check_bails_when_latched() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     shutdown.check().unwrap();
-    sender.send(()).unwrap();
+    sender.send(Ended::Interrupted).unwrap();
     let err = shutdown.check().unwrap_err();
     assert!(err.to_string().contains("interrupted"));
     let err = shutdown.check().unwrap_err();
@@ -215,11 +208,10 @@ fn shutdown_check_bails_when_latched() {
 
 #[test]
 fn shutdown_wait_timeout_wakes_on_signal() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(20));
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
     });
     let started = Instant::now();
     let err = shutdown.wait_timeout(Duration::from_secs(2)).unwrap_err();
@@ -229,24 +221,21 @@ fn shutdown_wait_timeout_wakes_on_signal() {
 
 #[test]
 fn shutdown_wait_timeout_returns_on_idle() {
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (_sender, shutdown) = Shutdown::channel();
     shutdown.wait_timeout(Duration::from_millis(20)).unwrap();
 }
 
 #[test]
 fn shutdown_wait_returns_after_signal() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
-    sender.send(()).unwrap();
-    shutdown.wait().unwrap();
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
+    assert_eq!(shutdown.wait().unwrap(), Ended::Interrupted);
 }
 
 #[test]
 fn wait_ready_aborts_when_shutdown_is_signaled() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
-    sender.send(()).unwrap();
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
     let err = readiness::wait_ready(
         "http://127.0.0.1:1",
         "missing-app",
@@ -261,9 +250,8 @@ fn wait_ready_aborts_when_shutdown_is_signaled() {
 
 #[test]
 fn wait_for_zakura_tip_aborts_when_shutdown_is_signaled() {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
-    sender.send(()).unwrap();
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
     let err = readiness::wait_for_zakura_tip(
         "http://127.0.0.1:1",
         "missing-zakura",
@@ -274,4 +262,38 @@ fn wait_for_zakura_tip_aborts_when_shutdown_is_signaled() {
     )
     .unwrap_err();
     assert!(err.to_string().contains("interrupted"));
+}
+
+#[test]
+fn deletion_elsewhere_ends_start_without_deleting_again() {
+    let (mut host, events) = RecordingHost::new();
+    host.deleted_elsewhere = true;
+    let (_sender, shutdown) = Shutdown::channel();
+    runtime_for_tests()
+        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .unwrap();
+    let events = events.lock().unwrap().clone();
+    let waited = events
+        .iter()
+        .position(|e| e == "wait_for_shutdown:app-1")
+        .expect("waited on the app container");
+    assert!(
+        !events[waited..].iter().any(|e| e.starts_with("delete:")),
+        "deleted again after another command deleted it: {events:?}"
+    );
+}
+#[test]
+fn shutdown_wait_returns_when_the_environment_is_gone() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+    assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
+    assert!(!shutdown.try_interrupted());
+}
+#[test]
+fn shutdown_wait_keeps_a_deletion_notice_that_arrived_first() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+    sender.send(Ended::Interrupted).unwrap();
+    assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
+    assert!(shutdown.try_interrupted());
 }

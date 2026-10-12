@@ -354,9 +354,8 @@ fn acknowledged_removal_without_verified_absence_is_incomplete() {
 #[test]
 fn fresh_cleanup_budget_ignores_a_latched_shutdown() {
     let (runtime, docker, _) = owned_cleanup_fixture();
-    let (sender, receiver) = std::sync::mpsc::channel();
-    sender.send(()).unwrap();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
     assert!(shutdown.try_interrupted());
     let context = LifecycleContext::new(short_policy());
     let expired = runtime

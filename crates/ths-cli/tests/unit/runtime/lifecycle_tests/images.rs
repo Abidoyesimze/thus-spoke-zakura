@@ -4,8 +4,7 @@ use super::*;
 fn cancelled_image_check_is_not_classified_as_a_missing_image() {
     let policy = short_policy();
     let context = LifecycleContext::new(policy);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let shutdown = Shutdown::from_receiver(receiver);
+    let (sender, shutdown) = Shutdown::channel();
     let requested = || shutdown.try_interrupted();
     let script = sleep_script();
     let docker = LifecycleDocker {
@@ -19,7 +18,7 @@ fn cancelled_image_check_is_not_classified_as_a_missing_image() {
     };
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(30));
-        sender.send(()).unwrap();
+        sender.send(Ended::Interrupted).unwrap();
     });
     let started = Instant::now();
     let error = startup_require_image(&docker, "example/image:missing").unwrap_err();
