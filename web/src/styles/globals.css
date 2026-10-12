@@ -271,12 +271,16 @@
   );
 }
 
+/* The accent face shades toward `accent-hover`, which sits further from
+   `accent-ink` than `accent` in both themes. Lightening the top instead put
+   the label below 4.5:1 on the light theme. */
 @utility xp-face-accent {
-  background: linear-gradient(
+  background-color: var(--color-accent);
+  background-image: linear-gradient(
     180deg,
-    color-mix(in srgb, var(--color-accent) 90%, var(--color-face-top)) 0%,
-    var(--color-accent) 70%,
-    color-mix(in srgb, var(--color-accent-hover) 88%, var(--color-ink)) 100%
+    var(--color-accent) 0%,
+    var(--color-accent) 62%,
+    var(--color-accent-hover) 100%
   );
 }
 
@@ -345,6 +349,13 @@
   html {
     /* Native scrollbars, form controls and browser chrome follow the theme. */
     color-scheme: light;
+  }
+
+  @media (width < 48rem) {
+    html {
+      /* Keep keyboard-focused content above the fixed mobile navigation. */
+      scroll-padding-bottom: 4rem;
+    }
   }
 
   [data-theme='dark'] {
