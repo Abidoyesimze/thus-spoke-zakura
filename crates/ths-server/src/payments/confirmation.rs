@@ -4,6 +4,8 @@ use crate::{
     sync::mine_and_sync,
 };
 use serde_json::Value;
+use std::{future::Future, time::Duration};
+use tokio::time::Instant;
 pub(crate) async fn confirm_address_after_mining(
     state: &AppState,
     pending: AddressFaucet,
@@ -92,11 +94,64 @@ async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Resu
     }
 }
 
-pub(crate) async fn reconcile_unconfirmed(state: &AppState) -> anyhow::Result<()> {
-    for activity in state.0.store.unconfirmed_activities()? {
-        confirm_from_chain(state, activity).await?;
+async fn reconcile_unconfirmed_with<F, Fut>(
+    store: &Store,
+    cursor: &mut Option<String>,
+    deadline: Instant,
+    mut lookup: F,
+) -> anyhow::Result<bool>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = anyhow::Result<Option<Value>>>,
+{
+    let mut activities = store.unconfirmed_activities()?;
+    if activities.is_empty() {
+        *cursor = None;
+        return Ok(false);
     }
-    Ok(())
+    // Stable ID ordering retains the resume point even if the last attempted
+    // record was confirmed and has disappeared from the unresolved set.
+    activities.sort_by(|left, right| left.id.cmp(&right.id));
+    let start = cursor.as_ref().map_or(0, |id| {
+        activities.partition_point(|activity| activity.id.as_str() <= id.as_str())
+            % activities.len()
+    });
+    let mut changed = false;
+    for offset in 0..activities.len() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let activity = &activities[(start + offset) % activities.len()];
+        // Advance even after an uncertain lookup, so an outage for one record
+        // cannot monopolize every subsequent bounded pass.
+        *cursor = Some(activity.id.clone());
+        let attempt_deadline = deadline.min(Instant::now() + PAYMENT_LOOKUP_TIMEOUT);
+        let result: anyhow::Result<bool> = async {
+            let transaction = crate::reconcile::within_deadline(
+                attempt_deadline,
+                "checking payment confirmation",
+                lookup(activity.txid.clone()),
+            )
+            .await?;
+            if let Some(transaction) = transaction {
+                let updated = apply_confirmation(store, activity, &transaction)?;
+                Ok(updated.status == "confirmed")
+            } else {
+                Ok(false)
+            }
+        }
+        .await;
+        match result {
+            Ok(confirmed) => changed |= confirmed,
+            Err(error) => tracing::warn!(
+                error = %format_args!("{error:#}"),
+                activity = %activity.id,
+                txid = %activity.txid,
+                "payment confirmation remains pending"
+            ),
+        }
+    }
+    Ok(changed)
 }
 
 pub(crate) async fn confirm_after_mining(
@@ -123,3 +178,30 @@ pub(crate) async fn confirm_after_mining(
 #[cfg(test)]
 #[path = "../../tests/unit/payments/confirmation/tests.rs"]
 pub(crate) mod tests;
+
+const PAYMENT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const PAYMENT_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
+const PAYMENT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub(crate) async fn payment_confirmation_loop(state: AppState) {
+    let mut cursor = None;
+    let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
+        let rpc = &state.0.rpc;
+        match reconcile_unconfirmed_with(&state.0.store, &mut cursor, deadline, |txid| async move {
+            rpc.lookup_transaction(&txid).await
+        })
+        .await
+        {
+            Ok(true) => notify(&state, "wallet"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background payment confirmation failed"
+            ),
+        }
+    }
+}

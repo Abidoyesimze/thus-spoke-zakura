@@ -1,6 +1,5 @@
 use crate::state::{AppState, notify};
 use crate::{
-    payments::confirmation::reconcile_unconfirmed,
     rpc::ChainCheckpoint,
     state::{WalletSyncStatus, now_unix},
     wallet::WALLET_BIRTHDAY_HEIGHT,
@@ -96,7 +95,6 @@ impl AppState {
         if changed {
             notify(self, "wallet");
         }
-        reconcile_unconfirmed(self).await?;
         Ok(())
     }
 

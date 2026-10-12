@@ -256,15 +256,14 @@ pub(super) async fn internal_address_faucet_recovers_after_auto_mine_failure() -
                 assert_eq!(row.block_hash, evidence.blockhash);
                 let accounts: Vec<FaucetAccount> =
                     fixture.recovery_read(deadline, "/api/v1/accounts").await?;
-                assert_eq!(
-                    accounts
-                        .iter()
-                        .find(|account| account.id == 2)
-                        .unwrap()
-                        .transparent_zatoshi,
-                    balance + 100_000_000
-                );
-                break;
+                let transparent_balance = accounts
+                    .iter()
+                    .find(|account| account.id == 2)
+                    .unwrap()
+                    .transparent_zatoshi;
+                if transparent_balance == balance + 100_000_000 {
+                    break;
+                }
             }
             anyhow::ensure!(
                 Instant::now() < deadline,

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use crate::{
     api,
     db::{Store, TREASURY_ACCOUNT_ID},
-    payments::treasury,
+    payments::{confirmation, treasury},
     state::AppState,
     sync, wallet,
 };
@@ -59,7 +59,9 @@ pub(super) async fn serve(data_dir: PathBuf) -> Result<()> {
     treasury::provision_initial_balance(&state)
         .await
         .context("provisioning Account 1 with 5 Ironwood ZEC")?;
-    tokio::spawn(sync::wallet_sync_loop(state.clone()));
+    let mut background = tokio::task::JoinSet::new();
+    background.spawn(sync::wallet_sync_loop(state.clone()));
+    background.spawn(confirmation::payment_confirmation_loop(state.clone()));
     let app = api::router(state);
     let address: SocketAddr = std::env::var("THS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
@@ -67,6 +69,26 @@ pub(super) async fn serve(data_dir: PathBuf) -> Result<()> {
         .context("invalid THS_LISTEN")?;
     tracing::info!(%address, "dashboard ready");
     let listener = tokio::net::TcpListener::bind(address).await?;
-    axum::serve(listener, app).await?;
+    serve_with_background(listener, app, background).await
+}
+
+async fn serve_with_background(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    mut background: tokio::task::JoinSet<()>,
+) -> Result<()> {
+    // A stopped or panicked recovery task must not leave HTTP serving as if
+    // server-owned background work were still supervised.
+    tokio::select! {
+        result = axum::serve(listener, app).into_future() => result?,
+        result = background.join_next() => {
+            result.context("background task set unexpectedly empty")??;
+            anyhow::bail!("server background task unexpectedly exited");
+        }
+    }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/bootstrap/tests.rs"]
+mod tests;
