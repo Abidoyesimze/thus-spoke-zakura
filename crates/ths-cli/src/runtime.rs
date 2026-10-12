@@ -702,12 +702,26 @@ impl Runtime {
                     job.id
                 );
             }
-            job = client
+            // A stalled poll must not itself delay Ctrl+C or the overall
+            // deadline, so each attempt is capped well under either: a
+            // timeout here just loops back to the shutdown and deadline
+            // checks above instead of blocking on one slow request.
+            let attempt_timeout = MINE_POLL_ATTEMPT_TIMEOUT.min(deadline.remaining());
+            match client
                 .get(format!("{dashboard}/api/v1/mining/jobs/{}", job.id))
+                .timeout(attempt_timeout)
                 .send()
-                .map_err(anyhow::Error::from)
-                .and_then(decode_response)
-                .with_context(|| format!("checking mining job {} on {name}", job.id))?;
+            {
+                Ok(response) => {
+                    job = decode_response(response)
+                        .with_context(|| format!("checking mining job {} on {name}", job.id))?;
+                }
+                Err(error) if error.is_timeout() => continue,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("checking mining job {} on {name}", job.id));
+                }
+            }
         }
 
         // The job reached a terminal state: replaying this key would only ever
@@ -1536,6 +1550,10 @@ fn decode_response<T: serde::de::DeserializeOwned>(
 /// endpoint's HTTP client timeout.
 const MINE_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const MINE_POLL_DEADLINE: Duration = Duration::from_secs(300);
+/// Caps one poll GET, matching the single-HTTP-attempt budget used for
+/// readiness probes elsewhere. A stalled request errors out on its own
+/// instead of blocking Ctrl+C or the overall deadline for up to 300 seconds.
+const MINE_POLL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// One retry: a lost response after the server already accepted the request
 /// must not submit a second mining operation with a different idempotency key.
 const MINE_SUBMIT_ATTEMPTS: u32 = 2;
@@ -1566,7 +1584,9 @@ fn submit_mining_job(
 }
 
 /// Wording mirrors the dashboard's `MiningStatus` component, so the CLI and
-/// the dashboard describe the same job the same way.
+/// the dashboard describe the same job the same way. The tip hash on
+/// completion and the job ID on failure restore what the legacy endpoint's
+/// text output showed, since the job itself is otherwise a bare count.
 fn mine_status_line(job: &MiningJob, name: &InstanceName) -> String {
     let count = format!(
         "{} of {} blocks confirmed on {name}",
@@ -1578,10 +1598,13 @@ fn mine_status_line(job: &MiningJob, name: &InstanceName) -> String {
         format!("{count}.")
     };
     let state = match job.state {
-        MiningJobState::Mining => "Mining blocks…",
-        MiningJobState::Syncing => "Synchronizing wallet…",
-        MiningJobState::Completed => "Mining completed. Wallet synchronized.",
-        MiningJobState::Failed => "Mining failed.",
+        MiningJobState::Mining => "Mining blocks…".to_owned(),
+        MiningJobState::Syncing => "Synchronizing wallet…".to_owned(),
+        MiningJobState::Completed => match job.hashes.as_ref().and_then(|hashes| hashes.last()) {
+            Some(tip) => format!("Mining completed. Wallet synchronized. New tip: {tip}"),
+            None => "Mining completed. Wallet synchronized.".to_owned(),
+        },
+        MiningJobState::Failed => format!("Mining job {} failed.", job.id),
     };
     format!("{progress} {state}")
 }
@@ -6090,13 +6113,22 @@ mod tests {
             "5 of 5 blocks confirmed on alpha. Synchronizing wallet…"
         );
 
-        let completed = MiningJob {
+        let completed_without_hashes = MiningJob {
             state: MiningJobState::Completed,
             ..syncing.clone()
         };
         assert_eq!(
-            mine_status_line(&completed, &name("alpha")),
+            mine_status_line(&completed_without_hashes, &name("alpha")),
             "5 of 5 blocks confirmed on alpha. Mining completed. Wallet synchronized."
+        );
+
+        let completed = MiningJob {
+            hashes: Some(vec!["aaa".into(), "the-tip".into()]),
+            ..completed_without_hashes
+        };
+        assert_eq!(
+            mine_status_line(&completed, &name("alpha")),
+            "5 of 5 blocks confirmed on alpha. Mining completed. Wallet synchronized. New tip: the-tip"
         );
 
         let uncertain_failure = MiningJob {
@@ -6107,7 +6139,7 @@ mod tests {
         };
         assert_eq!(
             mine_status_line(&uncertain_failure, &name("alpha")),
-            "At least 1 of 5 blocks confirmed on alpha; the last mining result is uncertain. Mining failed."
+            "At least 1 of 5 blocks confirmed on alpha; the last mining result is uncertain. Mining job job-1 failed."
         );
     }
 
@@ -6155,6 +6187,79 @@ mod tests {
         runtime
             .mine_with(&alpha, &url, &client, 1, true, &shutdown)
             .unwrap();
+    }
+
+    #[test]
+    fn a_stalled_poll_does_not_block_the_next_attempt() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        fn drain_request(stream: &mut std::net::TcpStream) {
+            let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+        }
+
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            drain_request(&mut stream);
+            let body = r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#;
+            write!(
+                stream,
+                "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+
+            // First poll: accept and read the request, then hold the
+            // connection open without responding until well past the
+            // per-attempt timeout, so reqwest's own timeout fires rather
+            // than a connection error.
+            let (mut stalled, _) = listener.accept().unwrap();
+            drain_request(&mut stalled);
+            thread::sleep(MINE_POLL_ATTEMPT_TIMEOUT + Duration::from_millis(500));
+            drop(stalled);
+
+            // Second poll: respond normally.
+            let (mut stream, _) = listener.accept().unwrap();
+            drain_request(&mut stream);
+            let body = r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let client = reqwest::blocking::Client::new();
+        let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+        let started = std::time::Instant::now();
+        runtime
+            .mine_with(&alpha, &url, &client, 1, false, &shutdown)
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "a single stalled poll must not wait anywhere close to the 300s deadline: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

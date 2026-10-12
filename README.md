@@ -163,15 +163,16 @@ existing-key replays remain available. Stopping the server cancels running work
 and discards the history; jobs are not recovered after restart.
 
 `ths mine` submits through this same job API, printing progress as it polls
-and reporting the confirmed count, job ID, and any error on completion or
-failure. The idempotency key is saved to the instance directory before the
-request goes out and only cleared once the job finishes, so a lost or
-undecodable response, an interruption, or a 300-second polling timeout all
+and reporting the confirmed count, the mined tip hash on completion, and the
+job ID on any error. The idempotency key is saved to the instance directory
+before the request goes out and only cleared once the job finishes, so a lost
+or undecodable response, an interruption, or a 300-second polling timeout all
 leave the key in place: the next `ths mine` with the same block count picks
 the same job back up instead of starting a second one. Once a job finishes,
 its key is forgotten, so repeating the command afterward starts a fresh job.
-`--json` keeps the `blocks` and `hashes` fields from the legacy endpoint
-alongside the job's id, state, and progress.
+Each poll is capped at 2 seconds, so a single stalled request cannot delay
+Ctrl+C or the overall deadline. `--json` keeps the `blocks` and `hashes`
+fields from the legacy endpoint alongside the job's id, state, and progress.
 
 ![Mine blocks on the local Regtest network](docs/images/mine.png)
 
