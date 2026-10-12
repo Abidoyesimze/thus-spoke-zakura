@@ -295,6 +295,7 @@ fn human_start_keeps_lifecycle_and_docker_output_on_stdout() {
             "missing {diagnostic}: {stdout}"
         );
     }
+    assert_eq!(stdout.matches("Docker test-docker").count(), 1);
     assert!(stderr.contains("init diagnostic"));
     assert!(!stderr.contains("Preparing a fresh"));
 }

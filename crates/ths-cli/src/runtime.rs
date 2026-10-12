@@ -381,7 +381,6 @@ impl Runtime {
     ) -> Result<()> {
         host_ports(port_offset)?;
         let shutdown = Shutdown::install()?;
-        self.doctor_with(false, json)?;
         let context = LifecycleContext::new_for_start(LifecyclePolicy::default(), json);
         let prepared = {
             let requested = || shutdown.try_interrupted();
