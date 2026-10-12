@@ -22,6 +22,9 @@ pub struct MiningJob {
     pub state: MiningState,
     pub error: Option<String>,
     pub progress_uncertain: bool,
+    /// Only set once the job reaches `Completed`: both mining and wallet
+    /// synchronization succeeded, so the mined hashes are final.
+    pub hashes: Option<Vec<String>>,
 }
 
 #[async_trait::async_trait]
@@ -153,6 +156,7 @@ impl MiningCoordinator {
             state: MiningState::Mining,
             error: None,
             progress_uncertain: false,
+            hashes: None,
         };
         let (sender, updates) = watch::channel(MiningUpdate {
             job: job.clone(),
@@ -272,6 +276,7 @@ impl MiningCoordinator {
         let hashes = match synchronization {
             Ok(()) => {
                 job.state = MiningState::Completed;
+                job.hashes = Some(hashes.clone());
                 Some(Arc::new(hashes))
             }
             Err(error) => {
@@ -379,7 +384,9 @@ mod tests {
         let update = terminal(observer).await;
         assert_eq!(update.job.state, MiningState::Completed);
         assert_eq!(update.hashes.unwrap().len(), 3);
-        assert_eq!(jobs.get(&id).await.unwrap().completed_blocks, 3);
+        let persisted = jobs.get(&id).await.unwrap();
+        assert_eq!(persisted.completed_blocks, 3);
+        assert_eq!(persisted.hashes.unwrap().len(), 3);
         assert_eq!(runtime.calls(), 3);
         assert_eq!(runtime.scans.load(Ordering::SeqCst), 1);
     }
@@ -547,6 +554,7 @@ mod tests {
         assert_eq!(failed.state, MiningState::Failed);
         assert_eq!(failed.completed_blocks, 2);
         assert!(!failed.progress_uncertain);
+        assert!(failed.hashes.is_none());
         assert!(
             failed
                 .error

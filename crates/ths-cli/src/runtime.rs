@@ -135,6 +135,23 @@ struct MiningJob {
     state: MiningJobState,
     error: Option<String>,
     progress_uncertain: bool,
+    // Older servers may omit this; treat it the same as "not completed yet".
+    #[serde(default)]
+    hashes: Option<Vec<String>>,
+}
+
+/// `--json` output for `mine`. Keeps the `blocks`/`hashes` fields and meaning
+/// from the legacy endpoint's successful output, alongside the job API's
+/// richer state so a partial or failed job is not just a bare error string.
+#[derive(Debug, Serialize)]
+struct MineOutput {
+    id: String,
+    blocks: u32,
+    requested_blocks: u32,
+    state: MiningJobState,
+    error: Option<String>,
+    progress_uncertain: bool,
+    hashes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -327,6 +344,91 @@ impl Drop for InstanceLock {
     fn drop(&mut self) {
         if let Err(error) = self.0.unlock() {
             eprintln!("could not release the instance lock: {error}");
+        }
+    }
+}
+
+/// Persists a mining idempotency key across CLI invocations, the same way
+/// `FaucetJournal` does for faucet intents. Without this, a submission whose
+/// response is lost or fails to decode loses the key in memory when the
+/// process exits, so a retry would mint a new key and could start a second
+/// mining job for the same request.
+struct MiningJournal {
+    path: PathBuf,
+    lock: File,
+}
+
+impl MiningJournal {
+    fn open(instance_dir: &std::path::Path) -> Result<Self> {
+        let lock = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(instance_dir.join("mining-intents.lock"))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                bail!(
+                    "another mine command is running for this environment; retry after it finishes"
+                )
+            }
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("locking mining intents");
+            }
+        }
+        Ok(Self {
+            path: instance_dir.join("mining-intents.json"),
+            lock,
+        })
+    }
+
+    fn read(&self) -> Result<BTreeMap<String, String>> {
+        match fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).context("invalid saved mining intents"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+            Err(error) => Err(error).context("reading saved mining intents"),
+        }
+    }
+
+    fn write(&self, entries: &BTreeMap<String, String>) -> Result<()> {
+        let temporary = self.path.with_extension("json.tmp");
+        let file = File::create(&temporary)?;
+        serde_json::to_writer(&file, entries)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &self.path)?;
+        File::open(
+            self.path
+                .parent()
+                .context("mining intent directory is missing")?,
+        )?
+        .sync_all()?;
+        Ok(())
+    }
+
+    fn key_for(&self, intent: &str) -> Result<String> {
+        let mut entries = self.read()?;
+        if let Some(key) = entries.get(intent) {
+            return Ok(key.clone());
+        }
+        let key = uuid::Uuid::new_v4().to_string();
+        entries.insert(intent.to_owned(), key.clone());
+        self.write(&entries)?;
+        Ok(key)
+    }
+
+    fn clear(&self, intents: &[&str]) -> Result<()> {
+        let mut entries = self.read()?;
+        for intent in intents {
+            entries.remove(*intent);
+        }
+        self.write(&entries)
+    }
+}
+
+impl Drop for MiningJournal {
+    fn drop(&mut self) {
+        if let Err(error) = self.lock.unlock() {
+            eprintln!("could not release the mining intent lock: {error}");
         }
     }
 }
@@ -564,12 +666,23 @@ impl Runtime {
         json: bool,
         shutdown: &Shutdown,
     ) -> Result<()> {
-        let idempotency_key = uuid::Uuid::new_v4().to_string();
+        let journal = MiningJournal::open(&self.instance_dir(name))?;
+        let intent = format!("mine:{blocks}");
+        let idempotency_key = journal.key_for(&intent)?;
+
         let mut job = submit_mining_job(client, dashboard, blocks, &idempotency_key)
             .with_context(|| format!("asking environment {name} to mine {blocks} blocks"))?;
 
+        let mut last_printed = None;
         let deadline = Deadline::after(MINE_POLL_DEADLINE);
         loop {
+            if !json {
+                let line = mine_status_line(&job, name);
+                if last_printed.as_ref() != Some(&line) {
+                    println!("{line}");
+                    last_printed = Some(line);
+                }
+            }
             match job.state {
                 MiningJobState::Completed | MiningJobState::Failed => break,
                 MiningJobState::Mining | MiningJobState::Syncing => {}
@@ -597,13 +710,27 @@ impl Runtime {
                 .with_context(|| format!("checking mining job {} on {name}", job.id))?;
         }
 
+        // The job reached a terminal state: replaying this key would only ever
+        // return this same frozen job, so forget it and let a future `mine`
+        // with the same block count start a fresh one.
+        journal.clear(&[&intent])?;
+
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&MineOutput {
+                    id: job.id.clone(),
+                    blocks: job.completed_blocks,
+                    requested_blocks: job.requested_blocks,
+                    state: job.state,
+                    error: job.error.clone(),
+                    progress_uncertain: job.progress_uncertain,
+                    hashes: job.hashes.clone(),
+                })?
+            );
+        }
         if job.state == MiningJobState::Failed {
             bail!(job.error.unwrap_or_else(|| "mining failed".to_owned()));
-        }
-        if json {
-            println!("{}", serde_json::to_string_pretty(&job)?);
-        } else {
-            println!("Mined {} blocks on {name}.", job.completed_blocks);
         }
         Ok(())
     }
@@ -1436,6 +1563,27 @@ fn submit_mining_job(
             Err(error) => return Err(error).context("submitting the mining job"),
         }
     }
+}
+
+/// Wording mirrors the dashboard's `MiningStatus` component, so the CLI and
+/// the dashboard describe the same job the same way.
+fn mine_status_line(job: &MiningJob, name: &InstanceName) -> String {
+    let count = format!(
+        "{} of {} blocks confirmed on {name}",
+        job.completed_blocks, job.requested_blocks
+    );
+    let progress = if job.progress_uncertain {
+        format!("At least {count}; the last mining result is uncertain.")
+    } else {
+        format!("{count}.")
+    };
+    let state = match job.state {
+        MiningJobState::Mining => "Mining blocks…",
+        MiningJobState::Syncing => "Synchronizing wallet…",
+        MiningJobState::Completed => "Mining completed. Wallet synchronized.",
+        MiningJobState::Failed => "Mining failed.",
+    };
+    format!("{progress} {state}")
 }
 
 fn format_zec(zatoshi: u64) -> String {
@@ -5796,6 +5944,17 @@ mod tests {
         assert!(malformed.starts_with("decoding response: "), "{malformed}");
     }
 
+    /// Mining journals do real file locking, so tests need an isolated root
+    /// instead of the one shared `runtime_for_tests()` uses.
+    fn runtime_with_instance_dir(instance: &InstanceName) -> (tempfile::TempDir, Runtime) {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            root: dir.path().to_path_buf(),
+        };
+        fs::create_dir_all(runtime.instance_dir(instance)).unwrap();
+        (dir, runtime)
+    }
+
     #[test]
     fn mine_polls_until_completion_and_reports_the_confirmed_count() {
         let (url, requests) = serve(vec![
@@ -5809,14 +5968,16 @@ mod tests {
             ),
             (
                 "200 OK",
-                r#"{"id":"job-1","requested_blocks":3,"completed_blocks":3,"state":"completed","error":null,"progress_uncertain":false}"#,
+                r#"{"id":"job-1","requested_blocks":3,"completed_blocks":3,"state":"completed","error":null,"progress_uncertain":false,"hashes":["a","b","c"]}"#,
             ),
         ]);
         let client = reqwest::blocking::Client::new();
         let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
 
-        runtime_for_tests()
-            .mine_with(&name("alpha"), &url, &client, 3, false, &shutdown)
+        runtime
+            .mine_with(&alpha, &url, &client, 3, false, &shutdown)
             .unwrap();
 
         // The POST carries a JSON body; the two GET polls that follow carry none.
@@ -5825,27 +5986,129 @@ mod tests {
         assert_eq!(post["blocks"], 3);
         assert!(post["idempotency_key"].is_string());
         assert_eq!(requests.count(), 2, "expected exactly two GET polls");
+
+        // A completed job's key is forgotten, so mining the same count again
+        // starts a fresh job rather than replaying this frozen one.
+        assert!(
+            MiningJournal::open(&runtime.instance_dir(&alpha))
+                .unwrap()
+                .read()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
-    fn mine_reports_the_servers_error_on_a_failed_job() {
+    fn mine_clears_the_journal_key_after_a_failed_job() {
         let (url, _requests) = serve(vec![
             (
                 "202 Accepted",
-                r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+                r#"{"id":"job-1","requested_blocks":5,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
             ),
             (
                 "200 OK",
-                r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"failed","error":"generate failed","progress_uncertain":false}"#,
+                r#"{"id":"job-1","requested_blocks":5,"completed_blocks":2,"state":"failed","error":"generate failed","progress_uncertain":true}"#,
             ),
         ]);
         let client = reqwest::blocking::Client::new();
         let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
 
-        let error = runtime_for_tests()
-            .mine_with(&name("alpha"), &url, &client, 1, false, &shutdown)
+        let error = runtime
+            .mine_with(&alpha, &url, &client, 5, true, &shutdown)
             .unwrap_err();
         assert_eq!(error.to_string(), "generate failed");
+
+        // A terminal job, failed or not, is forgotten the same way.
+        assert!(
+            MiningJournal::open(&runtime.instance_dir(&alpha))
+                .unwrap()
+                .read()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn mine_json_output_reports_partial_progress_on_failure() {
+        let job = MiningJob {
+            id: "job-1".into(),
+            requested_blocks: 5,
+            completed_blocks: 2,
+            state: MiningJobState::Failed,
+            error: Some("generate failed".into()),
+            progress_uncertain: true,
+            hashes: None,
+        };
+        let output = MineOutput {
+            id: job.id.clone(),
+            blocks: job.completed_blocks,
+            requested_blocks: job.requested_blocks,
+            state: job.state,
+            error: job.error.clone(),
+            progress_uncertain: job.progress_uncertain,
+            hashes: job.hashes.clone(),
+        };
+        assert_eq!(
+            serde_json::to_value(&output).unwrap(),
+            serde_json::json!({
+                "id": "job-1",
+                "blocks": 2,
+                "requested_blocks": 5,
+                "state": "failed",
+                "error": "generate failed",
+                "progress_uncertain": true,
+                "hashes": null,
+            })
+        );
+    }
+
+    #[test]
+    fn mine_status_line_reports_progress_for_every_state() {
+        let mining = MiningJob {
+            id: "job-1".into(),
+            requested_blocks: 5,
+            completed_blocks: 2,
+            state: MiningJobState::Mining,
+            error: None,
+            progress_uncertain: false,
+            hashes: None,
+        };
+        assert_eq!(
+            mine_status_line(&mining, &name("alpha")),
+            "2 of 5 blocks confirmed on alpha. Mining blocks…"
+        );
+
+        let syncing = MiningJob {
+            state: MiningJobState::Syncing,
+            completed_blocks: 5,
+            ..mining.clone()
+        };
+        assert_eq!(
+            mine_status_line(&syncing, &name("alpha")),
+            "5 of 5 blocks confirmed on alpha. Synchronizing wallet…"
+        );
+
+        let completed = MiningJob {
+            state: MiningJobState::Completed,
+            ..syncing.clone()
+        };
+        assert_eq!(
+            mine_status_line(&completed, &name("alpha")),
+            "5 of 5 blocks confirmed on alpha. Mining completed. Wallet synchronized."
+        );
+
+        let uncertain_failure = MiningJob {
+            state: MiningJobState::Failed,
+            completed_blocks: 1,
+            progress_uncertain: true,
+            ..mining
+        };
+        assert_eq!(
+            mine_status_line(&uncertain_failure, &name("alpha")),
+            "At least 1 of 5 blocks confirmed on alpha; the last mining result is uncertain. Mining failed."
+        );
     }
 
     #[test]
@@ -5860,27 +6123,74 @@ mod tests {
             std::thread::sleep(Duration::from_millis(50));
             sender.send(Ended::Interrupted).unwrap();
         });
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
 
-        let error = runtime_for_tests()
-            .mine_with(&name("alpha"), &url, &client, 5, false, &shutdown)
+        let error = runtime
+            .mine_with(&alpha, &url, &client, 5, false, &shutdown)
             .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("job-9"), "{message}");
         assert!(message.contains("interrupted"), "{message}");
+
+        // Interrupted before a terminal state: the key survives so a retry
+        // can pick the same job back up instead of starting a second one.
+        let journal = MiningJournal::open(&runtime.instance_dir(&alpha)).unwrap();
+        let saved = journal.read().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert!(saved.contains_key("mine:5"));
     }
 
     #[test]
     fn mine_prints_only_the_job_as_json() {
         let (url, _requests) = serve(vec![(
             "202 Accepted",
-            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false}"#,
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#,
         )]);
         let client = reqwest::blocking::Client::new();
         let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
 
-        runtime_for_tests()
-            .mine_with(&name("alpha"), &url, &client, 1, true, &shutdown)
+        runtime
+            .mine_with(&alpha, &url, &client, 1, true, &shutdown)
             .unwrap();
+    }
+
+    #[test]
+    fn an_unresolved_submission_key_survives_for_the_next_invocation() {
+        // Both attempts at the initial POST fail outright (no response at
+        // all), the failure mode the retry inside one invocation cannot
+        // paper over. The next `ths mine` with the same block count must
+        // still find and reuse the saved key rather than minting a new one.
+        let unreachable = "http://127.0.0.1:1";
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let (_sender, shutdown) = Shutdown::channel();
+        let alpha = name("alpha");
+        let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+        runtime
+            .mine_with(&alpha, unreachable, &client, 5, false, &shutdown)
+            .unwrap_err();
+
+        let journal = MiningJournal::open(&runtime.instance_dir(&alpha)).unwrap();
+        let first_attempt_key = journal.read().unwrap().get("mine:5").unwrap().clone();
+        drop(journal);
+
+        let (url, requests) = serve(vec![(
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":5,"completed_blocks":5,"state":"completed","error":null,"progress_uncertain":false,"hashes":["a"]}"#,
+        )]);
+        runtime
+            .mine_with(&alpha, &url, &client, 5, false, &shutdown)
+            .unwrap();
+
+        let post: serde_json::Value =
+            serde_json::from_str(&requests.try_iter().next().unwrap()).unwrap();
+        assert_eq!(post["idempotency_key"], first_attempt_key);
     }
 
     #[test]

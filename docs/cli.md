@@ -173,17 +173,22 @@ ths mine 10 --json
 
 The command submits to the mining-job API (`POST /api/v1/mining/jobs` with
 `{blocks, idempotency_key}`; acceptance returns HTTP 202) and polls
-`GET /api/v1/mining/jobs/{id}` until the job completes or fails, printing its
-confirmed block count. If the initial request's response is lost, it is
-retried with the same idempotency key rather than starting a second job.
-Mining belongs to the server and continues if the client disconnects, the
-command is interrupted, or its 300-second polling deadline expires; in any of
-those cases the command reports the job ID. Before issuing another mining
-command in that situation, inspect that job with `GET /api/v1/mining/jobs/{id}`
-at the dashboard endpoint shown by `ths endpoints`. Each invocation submits a
-fresh idempotency key, so repeating a completed command mines another set of
-blocks. A different manual request during mining or wallet synchronization is
-rejected with HTTP 409.
+`GET /api/v1/mining/jobs/{id}` until the job completes or fails, printing
+progress as it goes in human-readable mode and the final job as JSON with
+`--json`. The idempotency key for a given block count is saved to the
+instance directory before the request is sent and only cleared once the job
+reaches a terminal state, so a submission whose response is lost or fails to
+decode, or a command interrupted or timed out mid-poll, does not lose track
+of the job: the next `ths mine` with the same block count reuses the saved
+key and picks the same job back up instead of starting a second one. Once a
+job completes or fails, its key is forgotten, so repeating that command
+afterward starts a fresh job. A different manual request during mining or
+wallet synchronization is rejected with HTTP 409.
+
+`--json` output keeps the legacy endpoint's `blocks` (the confirmed count)
+and `hashes` fields, alongside the job's `id`, `requested_blocks`, `state`,
+`error`, and `progress_uncertain` — a failed job after partial progress still
+reports what it mined rather than only the error.
 
 Replaying an accepted key with the same count returns the same job, including
 after completion or failure. Reusing that key with a different count returns
