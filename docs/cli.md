@@ -281,9 +281,10 @@ ths wallet balances --json
 
 Prints recent activity recorded by the development wallet, newest first. The
 output distinguishes sends, shields, unshields, and faucet payments, and shows
-their status, route, amount, transaction ID, confirmation block (when present),
-and creation time. Faucet routes are labeled `faucet`; the hidden treasury
-account is never exposed as a user account.
+their status, route, amount, transaction ID and confirmation block (when
+available), creation time, and any retained payment error. External Regtest
+recipients are shown by their full address. Faucet routes are labeled `faucet`;
+the hidden treasury account is never exposed as a user account.
 
 Without `--limit`, the server's default of 30 entries is used. An explicit
 limit must be between 1 and 100. An environment with no activity prints a
