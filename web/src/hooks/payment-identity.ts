@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { z } from 'zod';
 import { idempotencyKey, poolSchema } from '@/lib/api';
+import { shortHash } from '@/lib/format';
 
 export interface SendVariables {
   from_account: number;
@@ -16,6 +17,13 @@ export interface FaucetVariables {
   account_id: number;
   pool: z.infer<typeof poolSchema>;
   amount_zatoshi: bigint;
+}
+
+export function paymentRecipient(variables: SendVariables | FaucetVariables) {
+  if ('account_id' in variables) return `Account ${variables.account_id}`;
+  return variables.to_account === undefined
+    ? shortHash(variables.to_address ?? '', 14, 6)
+    : `Account ${variables.to_account}`;
 }
 
 export type PaymentIdentity =

@@ -345,6 +345,30 @@
   }
 }
 
+/* Keep the payment list's scroll track visible on systems with overlay
+   scrollbars. This does not change scrolling elsewhere in the dashboard. */
+.payment-scroll-area {
+  scrollbar-gutter: stable;
+}
+
+.payment-scroll-area::-webkit-scrollbar {
+  width: 8px;
+}
+
+.payment-scroll-area::-webkit-scrollbar-track {
+  background: var(--color-raised);
+}
+
+.payment-scroll-area::-webkit-scrollbar-thumb {
+  border: 2px solid var(--color-raised);
+  border-radius: var(--radius-control);
+  background: var(--color-ink-muted);
+}
+
+.payment-scroll-area::-webkit-scrollbar-thumb:hover {
+  background: var(--color-accent-strong);
+}
+
 @layer base {
   html {
     /* Native scrollbars, form controls and browser chrome follow the theme. */

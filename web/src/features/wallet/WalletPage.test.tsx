@@ -1,8 +1,17 @@
-import { describe, expect, it, vi, afterEach } from 'vitest';
-import { screen, waitFor, within } from '@testing-library/react';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { renderWithProviders, requestUrl } from '@/test/utils';
+import { QueryClient } from '@tanstack/react-query';
+import {
+  renderWithProviders,
+  renderWithWalletActions,
+  requestUrl,
+  testAccounts,
+} from '@/test/utils';
+import { queryKeys } from '@/hooks/queries';
+import { api, type Activity } from '@/lib/api';
+import { PaymentUpdates } from './PaymentUpdates';
 import { WalletActionsProvider } from './WalletActions';
 import { WalletPage } from './WalletPage';
 
@@ -100,17 +109,298 @@ function renderWallet(status = 'confirmed') {
   return renderWithProviders(
     <MemoryRouter>
       <WalletActionsProvider>
+        <PaymentUpdates />
         <WalletPage />
       </WalletActionsProvider>
     </MemoryRouter>,
   );
 }
 
+function savedFaucet(
+  key: string,
+  account: number,
+  status: Activity['status'] | null,
+): Activity | null {
+  const name = `ths:faucet:${account}:ironwood:500000000`;
+  localStorage.setItem(name, key);
+  localStorage.setItem(`ths:faucet:retained:${key}`, name);
+  return status === null
+    ? null
+    : {
+        id: key,
+        kind: 'faucet',
+        from_account: null,
+        to_account: account,
+        to_address: null,
+        source_pool: 'ironwood',
+        destination_pool: 'ironwood',
+        amount_zatoshi: 500_000_000n,
+        txid: status === 'confirmed' ? TXID : '',
+        block_hash: null,
+        status,
+        last_error: status === 'failed' ? 'Insufficient funds' : null,
+        created_at: '2026-10-11 00:00:00',
+      };
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
 describe('WalletPage', () => {
+  it.each(['confirmed', 'failed', 'broadcast'])(
+    'restores %s outside the dialogs using GET only',
+    async (status) => {
+      const name = 'ths:faucet:1:ironwood:500000000';
+      const key = 'restored-faucet-key';
+      localStorage.setItem(name, key);
+      localStorage.setItem(`ths:faucet:retained:${key}`, name);
+      renderWallet(status);
+      const trigger = await screen.findByRole('button', { name: /View payments/ });
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      await waitFor(() =>
+        expect(trigger).toHaveAccessibleName(
+          status === 'broadcast' ? /1 unresolved/ : new RegExp(`1 ${status}`),
+        ),
+      );
+      // Cleanup happens while the panel is closed; opening it still shows the result.
+      if (status !== 'broadcast')
+        await waitFor(() => expect(localStorage.getItem(name)).toBeNull());
+      await userEvent.click(trigger);
+      const updates = await screen.findByRole('region', { name: 'Payment updates' });
+      expect(
+        await within(updates).findByText(
+          status === 'broadcast' ? 'Pending' : status === 'confirmed' ? 'Confirmed' : 'Failed',
+        ),
+      ).toBeInTheDocument();
+      expect(screen.queryByText('Funded Account 1')).not.toBeInTheDocument();
+      expect(screen.queryByText('Payment failed', { exact: true })).not.toBeInTheDocument();
+      expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+      expect(
+        vi
+          .mocked(fetch)
+          .mock.calls.some(([input]) => requestUrl(input).includes(`idempotency_key=${key}`)),
+      ).toBe(true);
+      if (status === 'broadcast') {
+        expect(within(updates).getByText('Waiting for confirmation')).toBeInTheDocument();
+        expect(localStorage.getItem(name)).toBe(key);
+        expect(within(updates).getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+      } else {
+        await waitFor(() => expect(localStorage.getItem(name)).toBeNull());
+        expect(updates).toBeInTheDocument();
+        await userEvent.click(screen.getByRole('button', { name: 'Clear finished' }));
+        expect(within(updates).queryByRole('heading')).not.toBeInTheDocument();
+        await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+        expect(screen.queryByRole('button', { name: /View payments/ })).not.toBeInTheDocument();
+      }
+    },
+  );
+
+  it('tracks a late POST after closing its dialog and preserves a newly opened draft', async () => {
+    vi.spyOn(api, 'accounts').mockResolvedValue(testAccounts);
+    vi.spyOn(api, 'sendQuote').mockResolvedValue({
+      available_zatoshi: 500_000_000n,
+      fee_zatoshi: 10_000n,
+      max_zatoshi: 499_990_000n,
+    });
+    let resolve!: (activity: Activity) => void;
+    let payment: Activity | null = null;
+    const response = new Promise<Activity>((done) => {
+      resolve = done;
+    });
+    const post = vi.spyOn(api, 'send').mockReturnValue(response);
+    vi.spyOn(api, 'payment').mockImplementation(() => Promise.resolve(payment));
+    renderWallet();
+    await waitFor(() =>
+      expect(screen.getAllByRole('heading', { name: /Account [1-5]/ })).toHaveLength(5),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Send ZEC' }));
+    await userEvent.click(
+      within(screen.getByRole('dialog')).getByRole('button', { name: 'Send ZEC' }),
+    );
+    await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /View payments/ })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Send ZEC' }));
+    await userEvent.clear(screen.getByLabelText('Amount (ZEC)'));
+    await userEvent.type(screen.getByLabelText('Amount (ZEC)'), '2');
+    await act(async () => {
+      payment = {
+        id: 'late-send',
+        kind: 'send',
+        from_account: 1,
+        to_account: 2,
+        to_address: null,
+        source_pool: 'ironwood',
+        destination_pool: 'ironwood',
+        amount_zatoshi: 100_000_000n,
+        status: 'confirmed',
+        txid: TXID,
+        block_hash: null,
+        last_error: null,
+        created_at: '2026-10-11 00:00:00',
+      };
+      resolve(payment);
+      await response;
+    });
+    await waitFor(() =>
+      expect(screen.getByText('Payments').closest('button')).toHaveAttribute(
+        'aria-label',
+        expect.stringMatching(/1 confirmed/),
+      ),
+    );
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('2');
+    expect(screen.getAllByText('Sent to Account 2')).toHaveLength(1);
+    expect(post).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['send', 'faucet'] as const)(
+    'links a late %s error and loads the selected failed payment',
+    async (kind) => {
+      Object.assign(Element.prototype, {
+        scrollIntoView: vi.fn(),
+        hasPointerCapture: () => false,
+        releasePointerCapture: () => undefined,
+      });
+      mockWalletApis();
+      vi.spyOn(api, 'accounts').mockResolvedValue(testAccounts);
+      const payments = new Map([
+        ['other-confirmed', savedFaucet('other-confirmed', 4, 'confirmed')],
+        ['other-failed', savedFaucet('other-failed', 5, 'failed')],
+      ]);
+      vi.spyOn(api, 'payment').mockImplementation((key) =>
+        Promise.resolve(payments.get(key) ?? null),
+      );
+      vi.spyOn(api, 'sendQuote').mockResolvedValue({
+        available_zatoshi: 500_000_000n,
+        fee_zatoshi: 10_000n,
+        max_zatoshi: 499_990_000n,
+      });
+      let reject!: (error: Error) => void;
+      const response = new Promise<Activity>((_resolve, fail) => {
+        reject = fail;
+      });
+      const post = vi.spyOn(api, kind).mockReturnValue(response);
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      renderWithWalletActions(<WalletPage />, client);
+      const trigger = await screen.findByRole('button', { name: /View payments/ });
+      await userEvent.click(trigger);
+      await userEvent.keyboard('{Escape}');
+      await userEvent.click(
+        screen.getByRole('button', {
+          name: kind === 'send' ? 'Send ZEC' : 'Fund Account 1',
+        }),
+      );
+      const submit = within(screen.getByRole('dialog')).getByRole('button', {
+        name: kind === 'send' ? 'Send ZEC' : 'Add funds',
+      });
+      await waitFor(() => expect(submit).toBeEnabled());
+      await userEvent.click(submit);
+      await waitFor(() => expect(post).toHaveBeenCalledTimes(1));
+      const key = post.mock.calls[0]![0].idempotency_key;
+      await userEvent.keyboard('{Escape}');
+      await act(async () => {
+        reject(new Error('Connection lost'));
+        await response.catch(() => undefined);
+      });
+      expect(await screen.findByText('Payment not confirmed')).toBeInTheDocument();
+      expect(
+        screen.getByText(`1 ZEC to Account ${kind === 'send' ? 2 : 1}. Connection lost`),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'View payment' }));
+      const updates = screen.getByRole('region', { name: 'Payment updates' });
+      const heading = within(updates).getByRole('heading', {
+        name: kind === 'send' ? 'Account 1 → Account 2 · 1 ZEC' : 'Faucet → Account 1 · 1 ZEC',
+      });
+      await waitFor(() => expect(heading).toHaveFocus());
+      expect(heading.closest('article')).toHaveAttribute('data-payment-key', key);
+      expect(within(updates).getByText('Unknown')).toBeInTheDocument();
+      expect(localStorage.getItem(`ths:${kind}:retained:${key}`)).not.toBeNull();
+      expect(post).toHaveBeenCalledTimes(1);
+      await userEvent.keyboard('{Escape}');
+      await waitFor(() => expect(trigger).toHaveFocus());
+
+      await userEvent.click(
+        screen.getByRole('button', {
+          name: kind === 'send' ? 'Send from Account 1' : 'Fund Account 1',
+        }),
+      );
+      await userEvent.clear(screen.getByLabelText('Amount (ZEC)'));
+      await userEvent.type(screen.getByLabelText('Amount (ZEC)'), '2');
+      if (kind === 'send')
+        await userEvent.type(screen.getByLabelText('Memo (optional)'), 'Keep this draft');
+      await userEvent.click(
+        within(screen.getByRole('dialog')).getByRole('button', {
+          name: kind === 'send' ? 'Send ZEC' : 'Add funds',
+        }),
+      );
+      await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
+      const viewFromDraft = await within(screen.getByRole('dialog')).findByRole('button', {
+        name: 'View payment',
+      });
+      payments.set(key, {
+        id: key,
+        kind,
+        from_account: kind === 'send' ? 1 : null,
+        to_account: kind === 'send' ? 2 : 1,
+        to_address: null,
+        source_pool: 'ironwood',
+        destination_pool: 'ironwood',
+        amount_zatoshi: 100_000_000n,
+        txid: '',
+        block_hash: null,
+        status: 'failed',
+        last_error: 'Insufficient funds',
+        created_at: '2026-10-12 00:00:00',
+      });
+      await act(() => client.refetchQueries({ queryKey: queryKeys.payment(key) }));
+      expect(await screen.findByText('Payment failed', { exact: true })).toBeInTheDocument();
+      const underlying = screen.getByRole('dialog');
+      await userEvent.click(viewFromDraft);
+      // Inspecting a failure alone must not discard the underlying draft.
+      expect(within(underlying).getByLabelText('Amount (ZEC)')).toHaveValue('2');
+
+      // Each explicit new-payment request replaces the draft, including a
+      // second selection of the same failed identity for the same account.
+      for (let selection = 0; selection < 2; selection++) {
+        if (selection === 1) {
+          await userEvent.clear(screen.getByLabelText('Amount (ZEC)'));
+          await userEvent.type(screen.getByLabelText('Amount (ZEC)'), '3');
+          await userEvent.click(
+            within(screen.getByRole('dialog')).getByRole('button', {
+              name: kind === 'send' ? 'Send ZEC' : 'Add funds',
+            }),
+          );
+          await waitFor(() => expect(post).toHaveBeenCalledTimes(3));
+          await userEvent.click(
+            await within(screen.getByRole('dialog')).findByRole('button', {
+              name: 'View payment',
+            }),
+          );
+        }
+        const failedHeading = within(
+          screen.getByRole('region', { name: 'Payment updates' }),
+        ).getByRole('heading', { name: heading.textContent });
+        await userEvent.click(
+          within(failedHeading.closest('article')!).getByRole('button', {
+            name: kind === 'send' ? 'New Send' : 'Request funds',
+          }),
+        );
+        await waitFor(() => expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1'));
+        if (kind === 'send') expect(screen.getByLabelText('Memo (optional)')).toHaveValue('');
+        expect(post).toHaveBeenCalledTimes(selection + 2);
+      }
+    },
+  );
+
   it('uses the wrapping page rhythm the explorer and network surfaces share', async () => {
     const { container } = renderWallet();
     await waitFor(() => expect(screen.getByText('Account 1')).toBeInTheDocument());
