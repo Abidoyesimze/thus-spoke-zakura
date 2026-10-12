@@ -3,11 +3,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { api, type Activity } from '@/lib/api';
-import { useFaucet } from './mutations';
+import { useFaucet, useSend } from './mutations';
+import { usePaymentStatus } from './queries';
+import { useRetainedPayments } from './payment-identity';
 
 const request = { account_id: 1, pool: 'ironwood' as const, amount_zatoshi: 100_000_000n };
-const storageKey = 'ths:faucet:1:ironwood:100000000';
-const tabStorageKey = `${storageKey}:tab`;
 const testLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')!;
 
 function confirmed(id: string): Activity {
@@ -32,12 +32,30 @@ function pending(id: string): Activity {
   return { ...confirmed(id), status: 'broadcast', block_hash: null };
 }
 
-function tab() {
+function paymentTab(kind: 'send' | 'faucet') {
   const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>{children}</QueryClientProvider>
   );
-  return renderHook(useFaucet, { wrapper });
+  return renderHook(
+    () => {
+      const faucet = useFaucet();
+      const send = useSend();
+      return {
+        submit: () =>
+          kind === 'faucet'
+            ? faucet.mutateAsync(request)
+            : send.mutateAsync({
+                from_account: 1,
+                to_account: 2,
+                source_pool: 'ironwood',
+                destination_pool: 'ironwood',
+                amount_zatoshi: request.amount_zatoshi,
+              }),
+      };
+    },
+    { wrapper },
+  );
 }
 
 beforeEach(() => {
@@ -46,14 +64,21 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
   Object.defineProperty(navigator, 'locks', testLocks);
 });
 
-describe('faucet operation ownership', () => {
+describe.each(['faucet', 'send'] as const)('%s operation ownership', (kind) => {
+  const storageKey =
+    kind === 'faucet'
+      ? 'ths:faucet:1:ironwood:100000000'
+      : 'ths:send:[1,2,"ironwood","ironwood","100000000",null]';
+  const tabStorageKey = `${storageKey}:tab`;
+  const tab = () => paymentTab(kind);
   it('a delayed confirmation cannot erase a newer payment in another tab', async () => {
     const replies: Array<(activity: Activity) => void> = [];
     const post = vi
-      .spyOn(api, 'faucet')
+      .spyOn(api, kind)
       .mockImplementation(() => new Promise<Activity>((resolve) => replies.push(resolve)));
     const first = tab();
     const second = tab();
@@ -61,8 +86,8 @@ describe('faucet operation ownership', () => {
     let firstResult!: Promise<unknown>;
     let secondResult!: Promise<unknown>;
     act(() => {
-      firstResult = first.result.current.mutateAsync(request);
-      secondResult = second.result.current.mutateAsync(request);
+      firstResult = first.result.current.submit();
+      secondResult = second.result.current.submit();
     });
     await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
     const originalKey = post.mock.calls[0]?.[0].idempotency_key;
@@ -76,7 +101,7 @@ describe('faucet operation ownership', () => {
 
     let nextResult!: Promise<unknown>;
     act(() => {
-      nextResult = second.result.current.mutateAsync(request);
+      nextResult = second.result.current.submit();
     });
     await waitFor(() => expect(post).toHaveBeenCalledTimes(3));
     const newKey = post.mock.calls[2]?.[0].idempotency_key;
@@ -99,15 +124,15 @@ describe('faucet operation ownership', () => {
   it('a pending tab retries its own key after another tab starts a new payment', async () => {
     const replies: Array<(activity: Activity) => void> = [];
     const post = vi
-      .spyOn(api, 'faucet')
+      .spyOn(api, kind)
       .mockImplementation(() => new Promise<Activity>((resolve) => replies.push(resolve)));
     const first = tab();
     const second = tab();
     let firstResult!: Promise<unknown>;
     let secondResult!: Promise<unknown>;
     act(() => {
-      firstResult = first.result.current.mutateAsync(request);
-      secondResult = second.result.current.mutateAsync(request);
+      firstResult = first.result.current.submit();
+      secondResult = second.result.current.submit();
     });
     await waitFor(() => expect(post).toHaveBeenCalledTimes(2));
     const originalKey = post.mock.calls[0]?.[0].idempotency_key;
@@ -123,7 +148,7 @@ describe('faucet operation ownership', () => {
 
     let nextResult!: Promise<unknown>;
     act(() => {
-      nextResult = second.result.current.mutateAsync(request);
+      nextResult = second.result.current.submit();
     });
     await waitFor(() => expect(post).toHaveBeenCalledTimes(3));
     const newKey = post.mock.calls[2]?.[0].idempotency_key;
@@ -131,7 +156,7 @@ describe('faucet operation ownership', () => {
 
     let retryResult!: Promise<unknown>;
     act(() => {
-      retryResult = first.result.current.mutateAsync(request);
+      retryResult = first.result.current.submit();
     });
     await waitFor(() => expect(post).toHaveBeenCalledTimes(4));
     expect(post.mock.calls[3]?.[0].idempotency_key).toBe(originalKey);
@@ -150,11 +175,11 @@ describe('faucet operation ownership', () => {
     const newKey = crypto.randomUUID();
     sessionStorage.setItem(tabStorageKey, pendingKey);
     localStorage.setItem(storageKey, newKey);
-    const post = vi.spyOn(api, 'faucet').mockResolvedValue(pending('first-payment'));
+    const post = vi.spyOn(api, kind).mockResolvedValue(pending('first-payment'));
     const hook = tab();
 
     await act(async () => {
-      await hook.result.current.mutateAsync(request);
+      await hook.result.current.submit();
     });
     expect(post.mock.calls[0]?.[0].idempotency_key).toBe(pendingKey);
     expect(localStorage.getItem(storageKey)).toBe(newKey);
@@ -164,14 +189,14 @@ describe('faucet operation ownership', () => {
     const legacyKey = crypto.randomUUID();
     sessionStorage.setItem(storageKey, legacyKey);
     const post = vi
-      .spyOn(api, 'faucet')
+      .spyOn(api, kind)
       .mockRejectedValueOnce(new TypeError('response lost'))
       .mockResolvedValueOnce(confirmed('legacy-payment'))
       .mockResolvedValueOnce(pending('new-payment'));
     const first = tab();
 
     await act(async () => {
-      await expect(first.result.current.mutateAsync(request)).rejects.toThrow('response lost');
+      await expect(first.result.current.submit()).rejects.toThrow('response lost');
     });
     expect(post.mock.calls[0]?.[0].idempotency_key).toBe(legacyKey);
     expect(localStorage.getItem(storageKey)).toBe(legacyKey);
@@ -184,13 +209,13 @@ describe('faucet operation ownership', () => {
     localStorage.removeItem(storageKey);
 
     await act(async () => {
-      await reloaded.result.current.mutateAsync(request);
+      await reloaded.result.current.submit();
     });
     expect(post.mock.calls[1]?.[0].idempotency_key).toBe(legacyKey);
     expect(sessionStorage.getItem(tabStorageKey)).toBeNull();
 
     await act(async () => {
-      await reloaded.result.current.mutateAsync(request);
+      await reloaded.result.current.submit();
     });
     expect(post.mock.calls[2]?.[0].idempotency_key).not.toBe(legacyKey);
   });
@@ -201,14 +226,14 @@ describe('faucet operation ownership', () => {
     sessionStorage.setItem(storageKey, legacyKey);
     localStorage.setItem(storageKey, sharedKey);
     const post = vi
-      .spyOn(api, 'faucet')
+      .spyOn(api, kind)
       .mockResolvedValueOnce(pending('legacy-payment'))
       .mockResolvedValueOnce(confirmed('legacy-payment'))
       .mockResolvedValueOnce(pending('shared-payment'));
     const hook = tab();
 
     await act(async () => {
-      await hook.result.current.mutateAsync(request);
+      await hook.result.current.submit();
     });
     expect(post.mock.calls[0]?.[0].idempotency_key).toBe(legacyKey);
     expect(sessionStorage.getItem(storageKey)).toBeNull();
@@ -216,14 +241,14 @@ describe('faucet operation ownership', () => {
     expect(localStorage.getItem(storageKey)).toBe(sharedKey);
 
     await act(async () => {
-      await hook.result.current.mutateAsync(request);
+      await hook.result.current.submit();
     });
     expect(post.mock.calls[1]?.[0].idempotency_key).toBe(legacyKey);
     expect(sessionStorage.getItem(tabStorageKey)).toBeNull();
     expect(localStorage.getItem(storageKey)).toBe(sharedKey);
 
     await act(async () => {
-      await hook.result.current.mutateAsync(request);
+      await hook.result.current.submit();
     });
     expect(post.mock.calls[2]?.[0].idempotency_key).toBe(sharedKey);
   });
@@ -251,15 +276,15 @@ describe('faucet operation ownership', () => {
       });
     });
     Object.defineProperty(navigator, 'locks', { configurable: true, value: { request: lock } });
-    const post = vi.spyOn(api, 'faucet').mockResolvedValue(pending('pending-payment'));
+    const post = vi.spyOn(api, kind).mockResolvedValue(pending('pending-payment'));
     const first = tab();
     const second = tab();
 
     let firstResult!: Promise<unknown>;
     let secondResult!: Promise<unknown>;
     act(() => {
-      firstResult = first.result.current.mutateAsync(request);
-      secondResult = second.result.current.mutateAsync(request);
+      firstResult = first.result.current.submit();
+      secondResult = second.result.current.submit();
     });
     await waitFor(() => expect(lock).toHaveBeenCalledTimes(2));
     expect(lock.mock.calls[0]?.[0]).toBe(storageKey);
@@ -275,17 +300,98 @@ describe('faucet operation ownership', () => {
     expect(localStorage.getItem(storageKey)).toBe(post.mock.calls[0]?.[0].idempotency_key);
   });
 
-  it('does not send a payment when cross-tab coordination is unavailable', async () => {
-    Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined });
-    const post = vi.spyOn(api, 'faucet');
+  it.each(['locks', 'storage'])('does not POST when %s is unavailable', async (unavailable) => {
+    if (unavailable === 'locks')
+      Object.defineProperty(navigator, 'locks', { configurable: true, value: undefined });
+    else
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+        throw new DOMException('Storage full', 'QuotaExceededError');
+      });
+    const post = vi.spyOn(api, kind);
     const hook = tab();
 
     await act(async () => {
-      await expect(hook.result.current.mutateAsync(request)).rejects.toThrow(
-        'cannot coordinate faucet payments',
+      await expect(hook.result.current.submit()).rejects.toThrow(
+        unavailable === 'locks' ? 'cannot coordinate payments' : 'Storage full',
       );
     });
     expect(post).not.toHaveBeenCalled();
     expect(localStorage.getItem(storageKey)).toBeNull();
+    hook.unmount();
+
+    if (unavailable === 'storage') {
+      vi.restoreAllMocks();
+      const setLocalItem = localStorage.setItem.bind(localStorage);
+      for (const existingKey of [null, 'existing-payment']) {
+        localStorage.clear();
+        sessionStorage.clear();
+        if (existingKey) {
+          localStorage.setItem(storageKey, existingKey);
+          localStorage.setItem(`ths:${kind}:retained:${existingKey}`, storageKey);
+        }
+        const before = { ...localStorage };
+        const storage = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (
+          this: Storage,
+          item,
+          value,
+        ) {
+          if (this === sessionStorage)
+            throw new DOMException('Tab storage blocked', 'SecurityError');
+          setLocalItem(item, value);
+        });
+        const submit = vi.spyOn(api, kind);
+        const failed = tab();
+        await act(async () => {
+          await expect(failed.result.current.submit()).rejects.toThrow('Tab storage blocked');
+        });
+        expect(submit).not.toHaveBeenCalled();
+        expect({ ...localStorage }).toEqual(before);
+        expect(sessionStorage.length).toBe(0);
+        failed.unmount();
+        storage.mockRestore();
+        submit.mockRestore();
+
+        const restored = renderHook(() => useRetainedPayments(kind));
+        await waitFor(() =>
+          expect(restored.result.current.retained.map((identity) => identity.key)).toEqual(
+            existingKey ? [existingKey] : [],
+          ),
+        );
+        restored.unmount();
+      }
+    }
   });
+});
+
+describe('payment status polling', () => {
+  it.each(['confirmed', 'failed'])(
+    'follows replacement txids by the retained key and stops at %s',
+    async (status) => {
+      vi.useFakeTimers();
+      const get = vi
+        .spyOn(api, 'payment')
+        .mockResolvedValueOnce({ ...pending('payment'), txid: 'old-tx' })
+        .mockResolvedValueOnce({ ...pending('payment'), txid: 'replacement-tx' })
+        .mockResolvedValue({ ...confirmed('payment'), status, txid: 'replacement-tx' });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const hook = renderHook(() => usePaymentStatus('original-key', true), { wrapper });
+      await act(() => vi.advanceTimersByTimeAsync(1));
+      expect(hook.result.current.data?.txid).toBe('old-tx');
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(hook.result.current.data?.txid).toBe('replacement-tx');
+      await act(() => vi.advanceTimersByTimeAsync(2_000));
+      expect(hook.result.current.data?.status).toBe(status);
+      await act(() => vi.advanceTimersByTimeAsync(8_000));
+      expect(get.mock.calls.map(([key]) => key)).toEqual([
+        'original-key',
+        'original-key',
+        'original-key',
+      ]);
+      hook.unmount();
+      client.clear();
+    },
+  );
 });

@@ -155,7 +155,8 @@ export function SendDialog({
           ...(values.memo === '' ? {} : { memo: values.memo }),
         },
         {
-          onSuccess: (activity) => {
+          onSuccess: ({ activity }) => {
+            if (activity.status !== 'confirmed') return;
             toast.success(
               activity.to_account === null
                 ? `Sent to ${shortHash(activity.to_address ?? '', 14, 6)}`
