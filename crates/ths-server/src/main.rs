@@ -174,6 +174,7 @@ pub(crate) enum ReadinessError {
 
 fn startup_retryable(error: &anyhow::Error) -> bool {
     if error.downcast_ref::<rpc::RpcUnavailable>().is_some()
+        || error.downcast_ref::<rpc::RpcTransport>().is_some()
         || error.downcast_ref::<ReadinessError>().is_some()
         || error
             .downcast_ref::<reconcile::ReconciliationDeadline>()
@@ -257,6 +258,218 @@ async fn serve_with_background(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TRUNCATED_RPC_RESPONSE: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 1024\r\nConnection: close\r\n\r\n{";
+
+    fn complete_rpc_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    async fn rpc_responses(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::watch::Receiver<usize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (sent, progress) = tokio::sync::watch::channel(0);
+        let server = tokio::spawn(async move {
+            for (index, response) in responses.into_iter().enumerate() {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    assert!(stream.read_buf(&mut request).await.unwrap() > 0);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        let length: usize = headers
+                            .lines()
+                            .filter_map(|line| line.split_once(':'))
+                            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                            .unwrap()
+                            .1
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.unwrap();
+                sent.send_replace(index + 1);
+            }
+        });
+        (endpoint, server, progress)
+    }
+
+    async fn assert_startup_recovers_from_rpc_disconnect(response: &str) {
+        let (endpoint, server, _) = rpc_responses(vec![
+            response.to_owned(),
+            complete_rpc_response(
+                r#"{"result":{"chain":"regtest","blocks":1},"error":null,"id":0}"#,
+            ),
+        ])
+        .await;
+        let rpc = rpc::NodeRpc::new(endpoint);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            retry_startup(|| async { rpc.chain_info().await.map(|_| ()) }),
+        )
+        .await;
+        server.abort();
+        if let Err(error) = server.await {
+            assert!(error.is_cancelled());
+        }
+        result.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_when_rpc_disconnects_before_response_headers() {
+        assert_startup_recovers_from_rpc_disconnect("").await;
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_when_rpc_disconnects_during_the_response_body() {
+        assert_startup_recovers_from_rpc_disconnect(TRUNCATED_RPC_RESPONSE).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_rpc_endpoints_remain_fatal_during_startup() {
+        for endpoint in ["://invalid", "ftp://127.0.0.1:1"] {
+            let error = rpc::NodeRpc::new(endpoint.into())
+                .chain_info()
+                .await
+                .unwrap_err();
+            assert!(!startup_retryable(&error), "{error:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn stored_status_survives_repeated_rpc_response_disconnects() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ths.db")).unwrap();
+        store.initialize().unwrap();
+        let activity = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "disconnect-send",
+                None,
+            )
+            .unwrap();
+        let faucet = store
+            .claim_address_faucet("tm-external", 7, "disconnect-faucet")
+            .unwrap();
+        store
+            .record_address_error(&faucet.id, "preparing", "", "awaiting node")
+            .unwrap();
+        let wallet = wallet::RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+        let (endpoint, rpc_server, mut progress) =
+            rpc_responses(vec![TRUNCATED_RPC_RESPONSE.to_owned(); 3]).await;
+        let state = api::AppState::new(store.clone(), wallet.clone(), endpoint, "test".into());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_with_background(
+            listener,
+            api::router(state.clone()),
+            background_tasks(state),
+        ));
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            while *progress.borrow_and_update() < 3 {
+                progress.changed().await?;
+            }
+            Ok::<_, tokio::sync::watch::error::RecvError>(())
+        })
+        .await;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let result = async {
+            observed.context("startup did not retry the interrupted RPC")??;
+            let response = client
+                .get(format!(
+                    "http://{address}/api/v1/activity?idempotency_key=disconnect-send"
+                ))
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body: serde_json::Value = response.json().await?;
+            assert_eq!(body[0]["id"], activity.id);
+            assert_eq!(body[0]["status"], "preparing");
+            assert_eq!(body[0]["txid"], "");
+            let response = client
+                .get(format!(
+                    "http://{address}/api/v1/faucet/address?idempotency_key=disconnect-faucet"
+                ))
+                .send()
+                .await?;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body: serde_json::Value = response.json().await?;
+            assert_eq!(body["status"], "preparing");
+            assert_eq!(body["last_error"], "awaiting node");
+            let health = client
+                .get(format!("http://{address}/api/v1/health"))
+                .send()
+                .await?;
+            assert_eq!(health.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!server.is_finished());
+            assert!(store.prepared_transaction(&activity.id).is_err());
+            assert!(wallet.prepared(&activity.id).await?.is_none());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.abort();
+        if let Err(error) = server.await {
+            assert!(error.is_cancelled());
+        }
+        rpc_server.abort();
+        if let Err(error) = rpc_server.await {
+            assert!(error.is_cancelled());
+        }
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_malformed_rpc_json_stops_http_during_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("ths.db")).unwrap();
+        store.initialize().unwrap();
+        let wallet = wallet::RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+        let (endpoint, rpc_server, _) = rpc_responses(vec![complete_rpc_response("{")]).await;
+        let state = api::AppState::new(store, wallet, endpoint, "test".into());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_with_background(
+                listener,
+                api::router(state.clone()),
+                background_tasks(state),
+            ),
+        )
+        .await;
+        rpc_server.abort();
+        if let Err(error) = rpc_server.await {
+            assert!(error.is_cancelled());
+        }
+        let error = result.unwrap().unwrap_err();
+        assert!(!startup_retryable(&error));
+        assert!(error.chain().any(|cause| cause.is::<serde_json::Error>()));
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn startup_retries_past_two_minutes_with_a_delay_then_recovers() {
