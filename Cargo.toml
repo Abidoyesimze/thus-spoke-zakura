@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/tsz-cli", "crates/tsz-server"]
+members = ["crates/ths-cli", "crates/ths-server"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -27,7 +27,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.18", features = ["v4", "serde"] }
-zcash_protocol = { version = "0.10.6", features = ["local-consensus"] }
+zcash_protocol = { package = "zakura-protocol", version = "=2.2.0", features = ["local-consensus"] }
 zip32 = "0.2"
 
 [profile.release]
@@ -42,11 +42,3 @@ inherits = "dev"
 
 [profile.dev-runtime.package."*"]
 opt-level = 3
-
-# rc5's published manifest resolves zakura-pczt rc3, but the published rc3 is
-# missing the transaction extractor API used by rc5's migrations. Keep the
-# package name/version while sourcing the matching upstream revision.
-[patch.crates-io]
-zakura-pczt = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "f27e416f042c1b18218b9d0c6be19ba27ad6ba4f", package = "zakura-pczt" }
-zakura-client-backend = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "f27e416f042c1b18218b9d0c6be19ba27ad6ba4f", package = "zakura-client-backend" }
-zakura-client-sqlite = { git = "https://github.com/zakura-core/wallet-libraries.git", rev = "f27e416f042c1b18218b9d0c6be19ba27ad6ba4f", package = "zakura-client-sqlite" }

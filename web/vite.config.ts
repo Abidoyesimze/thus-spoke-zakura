@@ -5,9 +5,9 @@ import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig(({ mode }) => {
   // Point `npm run dev` at any running instance:
-  //   TSZ_DEV_API=http://127.0.0.1:54277 npm run dev
-  const env = loadEnv(mode, process.cwd(), 'TSZ_');
-  const apiTarget = env.TSZ_DEV_API ?? 'http://127.0.0.1:8080';
+  //   THS_DEV_API=http://127.0.0.1:54277 npm run dev
+  const env = loadEnv(mode, process.cwd(), 'THS_');
+  const apiTarget = env.THS_DEV_API ?? 'http://127.0.0.1:8080';
 
   return {
     plugins: [react(), tailwindcss()],

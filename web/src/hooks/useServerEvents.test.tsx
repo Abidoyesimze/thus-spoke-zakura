@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { screen } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AddressDetail } from '@/features/explorer/AddressDetail';
@@ -87,6 +88,18 @@ function requestsTo(path: string): number {
 }
 
 describe('useServerEvents', () => {
+  it('invalidates only mining on a mining update', () => {
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={client}>
+        <Live>{null}</Live>
+      </QueryClientProvider>,
+    );
+    FakeEventSource.current?.emit('mining');
+    expect(invalidate.mock.calls).toEqual([[{ queryKey: ['mining'] }]]);
+  });
+
   it('refreshes an open transaction page on a new block', async () => {
     let confirmations = 1;
     routes = { [`/transactions/${TXID}`]: () => ({ txid: TXID, height: 106, confirmations }) };

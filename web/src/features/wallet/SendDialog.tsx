@@ -125,7 +125,7 @@ export function SendDialog({
       onOpenChange={onOpenChange}
       eyebrow="NEW TRANSACTION"
       title="Send ZEC"
-      description="Moves existing funds between development accounts. One block is mined to confirm."
+      description="Moves existing funds between development accounts or pools. One block is mined to confirm."
     >
       <form onSubmit={(event) => void submit(event)} noValidate>
         <div className="grid gap-x-3 sm:grid-cols-2">
@@ -185,7 +185,7 @@ export function SendDialog({
                 onClick={() => {
                   const max = quote.data?.max_zatoshi;
                   if (max === undefined) return;
-                  form.setValue('amount', formatZec(max), {
+                  form.setValue('amount', formatZec(max, { grouping: false }), {
                     shouldDirty: true,
                     shouldValidate: true,
                   });

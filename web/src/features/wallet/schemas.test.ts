@@ -18,15 +18,47 @@ const memoIssue = (input: Record<string, unknown>) => {
 };
 
 describe('sendSchema', () => {
-  it('rejects a send to the same account', () => {
-    // The dialog used to default both sides to the account it was opened from,
-    // so this was reachable with two clicks and cost a fee to discover.
-    const result = sendSchema.safeParse({ ...base, from_account: '3', to_account: '3' });
-    expect(result.success).toBe(false);
+  it.each([
+    ['1', 'ironwood', 'ironwood', false],
+    ['1', 'transparent', 'transparent', false],
+    ['1', 'ironwood', 'transparent', true],
+    ['1', 'transparent', 'ironwood', true],
+    ['2', 'ironwood', 'ironwood', true],
+    ['2', 'transparent', 'transparent', true],
+    ['2', 'ironwood', 'transparent', true],
+    ['2', 'transparent', 'ironwood', true],
+  ] as const)('validates destination %s and route %s → %s', (to, source, destination, valid) => {
+    const result = sendSchema.safeParse({
+      ...base,
+      to_account: to,
+      source_pool: source,
+      destination_pool: destination,
+    });
+    expect(result.success).toBe(valid);
     if (!result.success) {
-      const issue = result.error.issues.find((candidate) => candidate.path[0] === 'to_account');
-      expect(issue?.message).toMatch(/different account/i);
+      expect(result.error.issues.find((issue) => issue.path[0] === 'to_account')?.message).toBe(
+        'Choose a different account or a different destination pool.',
+      );
     }
+  });
+
+  it('keeps memo restrictions for same-account pool transfers', () => {
+    expect(
+      sendSchema.safeParse({
+        ...base,
+        to_account: '1',
+        source_pool: 'transparent',
+        memo: 'private note',
+      }).success,
+    ).toBe(true);
+    expect(
+      memoIssue({
+        ...base,
+        to_account: '1',
+        destination_pool: 'transparent',
+        memo: 'hi',
+      }),
+    ).toMatch(/transparent outputs cannot carry a memo/i);
   });
 
   it('accepts a transfer between two different accounts', () => {

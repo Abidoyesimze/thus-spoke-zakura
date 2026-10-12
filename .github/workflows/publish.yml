@@ -40,18 +40,19 @@ jobs:
     steps:
       - name: Install anonymously and pull exact images
         env:
-          TSZ_VERSION: ${{ github.event.release.tag_name }}
-          TSZ_INSTALL_DIR: ${{ runner.temp }}/bin
+          THS_VERSION: ${{ github.event.release.tag_name }}
+          THS_INSTALL_DIR: ${{ runner.temp }}/bin
         shell: bash
         run: |
           docker logout ghcr.io || true
           installer="https://raw.githubusercontent.com/zcashlabs/thus-spoke-zakura/${{ github.event.release.tag_name }}/install.sh"
           if [[ "${{ github.event.release.tag_name }}" == "v0.2.0" ]]; then
+            # The immutable v0.2.0 installer still uses its original variable.
             curl --proto '=https' --tlsv1.2 -fsSL "$installer" \
               | TSZ_VERSION=v0.1.0 sh
           fi
           curl --proto '=https' --tlsv1.2 -fsSL "$installer" | sh
           curl --proto '=https' --tlsv1.2 -fsSL "$installer" \
-            | TSZ_VERSION=latest TSZ_SKIP_IMAGE_PULL=1 sh
-          "$TSZ_INSTALL_DIR/ths" --version
-          "$TSZ_INSTALL_DIR/ths" update --check
+            | THS_VERSION=latest THS_SKIP_IMAGE_PULL=1 sh
+          "$THS_INSTALL_DIR/ths" --version
+          "$THS_INSTALL_DIR/ths" update --check
