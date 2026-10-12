@@ -88,38 +88,46 @@ struct SettlementStatus {
 }
 
 fn settlement_status(
-    node_height: Option<u64>,
-    lightwalletd_height: Option<u64>,
+    node: Option<&ChainCheckpoint>,
+    lightwalletd: Option<&ChainCheckpoint>,
     wallet: &WalletSyncStatus,
 ) -> SettlementStatus {
-    let settlement_blocker = if node_height.is_none() {
+    let settlement_blocker = if node.is_none() {
         Some("node_unavailable")
-    } else if lightwalletd_height.is_none() {
+    } else if lightwalletd.is_none() {
         Some("lightwalletd_unavailable")
     } else if wallet.state == "error" {
         Some("wallet_error")
     } else if wallet.state != "ready" {
         Some("wallet_syncing")
-    } else if node_height != lightwalletd_height {
+    } else if node.map(|tip| tip.height) != lightwalletd.map(|tip| tip.height) {
         Some("height_mismatch")
-    } else if wallet
-        .fully_scanned_height
-        .zip(lightwalletd_height)
-        .is_none_or(|(scanned, tip)| scanned < tip)
-    {
+    } else if node != lightwalletd {
+        Some("chain_mismatch")
+    } else if !node.is_some_and(|tip| wallet_matches_tip(wallet, tip)) {
         Some("wallet_behind")
     } else {
         None
     };
 
     SettlementStatus {
-        node_height,
-        lightwalletd_height,
+        node_height: node.map(|tip| tip.height),
+        lightwalletd_height: lightwalletd.map(|tip| tip.height),
         wallet_scanned_height: wallet.fully_scanned_height,
         wallet_sync_state: wallet.state,
         settled: settlement_blocker.is_none(),
         settlement_blocker,
     }
+}
+
+fn wallet_matches_tip(wallet: &WalletSyncStatus, tip: &ChainCheckpoint) -> bool {
+    wallet.state == "ready"
+        && ((wallet.fully_scanned_height == Some(tip.height)
+            && wallet.fully_scanned_hash.as_deref() == Some(&tip.hash))
+            || (tip.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
+                && wallet.fully_scanned_height.is_none()
+                && wallet.observed_height == Some(tip.height)
+                && wallet.observed_hash.as_deref() == Some(&tip.hash)))
 }
 
 impl AppState {
@@ -248,13 +256,7 @@ impl AppState {
     async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
         let observed = self.0.rpc.checkpoint().await?;
         let status = self.0.wallet_snapshot.read().await.status.clone();
-        let settled = status.state == "ready"
-            && ((status.fully_scanned_height == Some(observed.height)
-                && status.fully_scanned_hash.as_deref() == Some(&observed.hash))
-                || (observed.height < u64::from(WALLET_BIRTHDAY_HEIGHT)
-                    && status.fully_scanned_height.is_none()
-                    && status.observed_height == Some(observed.height)
-                    && status.observed_hash.as_deref() == Some(&observed.hash)));
+        let settled = wallet_matches_tip(&status, &observed);
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;
             snapshot.status.observed_height = Some(observed.height);
@@ -435,16 +437,16 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         .get(HOST)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("127.0.0.1:8080");
-    let (node, lightwalletd_height) =
-        tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_height());
+    let (node, lightwalletd) =
+        tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
     let node = node.ok();
-    let lightwalletd_height = lightwalletd_height.ok();
+    let lightwalletd = lightwalletd.ok();
     let wallet_sync = state.wallet_sync_status().await;
-    let settlement = settlement_status(
-        node.as_ref().map(|chain| chain.blocks),
-        lightwalletd_height,
-        &wallet_sync,
-    );
+    let node_tip = node.as_ref().map(|chain| ChainCheckpoint {
+        height: chain.blocks,
+        hash: chain.bestblockhash.clone(),
+    });
+    let settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
     Ok(Json(Status {
         instance: state.0.instance.clone(),
         node,
@@ -530,6 +532,7 @@ async fn send(
                         &address,
                         req.amount_zatoshi,
                         memo,
+                        record_prepared_payment(&state.0.store, &activity_id),
                     )
                     .await
             }
@@ -777,6 +780,7 @@ async fn fund_address_from_treasury(
                         &treasury,
                         address,
                         amount_zatoshi,
+                        record_prepared_address_payment(&state.0.store, &pending.id),
                     )
                     .await
                 }
@@ -883,6 +887,7 @@ async fn fund_from_treasury(
             &treasury,
             &address,
             amount_zatoshi,
+            record_prepared_payment(&state.0.store, &activity_id),
         )
         .await
     })
@@ -979,6 +984,40 @@ impl PaymentSubmitter for AppState {
 
     async fn recover_prepared(&self, txid: &str) -> anyhow::Result<Option<PreparedPayment>> {
         self.0.wallet.recover_prepared(txid).await
+    }
+}
+
+fn record_prepared_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
+    }
+}
+
+fn record_prepared_address_payment(
+    store: &Store,
+    id: &str,
+) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {
+    let store = store.clone();
+    let id = id.to_owned();
+    move |prepared| {
+        store.record_address_prepared(
+            &id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        Ok(prepared)
     }
 }
 
@@ -1105,13 +1144,16 @@ enum PreparedSubmission {
 
 #[async_trait::async_trait]
 trait FaucetRuntime: Sync {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment>;
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static;
     async fn chain_height(&self) -> anyhow::Result<u64>;
     async fn block_hash(&self, height: u32) -> anyhow::Result<String>;
     async fn synchronize_latest(&self) -> anyhow::Result<()>;
@@ -1149,13 +1191,17 @@ trait FaucetRuntime: Sync {
 
 #[async_trait::async_trait]
 impl FaucetRuntime for AppState {
-    async fn prepare_payment(
+    async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
-    ) -> anyhow::Result<PreparedPayment> {
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+    {
         self.0
             .wallet
             .prepare(
@@ -1166,6 +1212,7 @@ impl FaucetRuntime for AppState {
                 destination,
                 amount_zatoshi,
                 None,
+                record,
             )
             .await
     }
@@ -1314,18 +1361,29 @@ async fn discover_reward(
     Ok(next)
 }
 
-async fn prepare_with_replenishment<R: FaucetRuntime>(
+async fn prepare_with_replenishment<R, F>(
     runtime: &R,
     activity_id: Option<&str>,
     seed: &str,
     treasury: &Account,
     destination: &str,
     amount_zatoshi: u64,
-) -> anyhow::Result<PreparedPayment> {
+    record: F,
+) -> anyhow::Result<PreparedPayment>
+where
+    R: FaucetRuntime,
+    F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static,
+{
     let mut reconciled_after_scan_required = false;
     loop {
         match runtime
-            .prepare_payment(activity_id, seed, destination, amount_zatoshi)
+            .prepare_payment(
+                activity_id,
+                seed,
+                destination,
+                amount_zatoshi,
+                record.clone(),
+            )
             .await
         {
             Ok(prepared) => return Ok(prepared),
@@ -1865,7 +1923,7 @@ async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let mut receiver = state.0.events.subscribe();
-    let stream = async_stream::stream! { loop { match receiver.recv().await { Ok(data) => yield Ok(Event::default().event("update").data(data)), Err(broadcast::error::RecvError::Lagged(_)) => continue, Err(_) => break } } };
+    let stream = async_stream::stream! { loop { match receiver.recv().await { Ok(data) => yield Ok(Event::default().event("update").data(data)), Err(broadcast::error::RecvError::Lagged(_)) => yield Ok(Event::default().event("update").data("resync")), Err(_) => break } } };
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }
 
@@ -2221,33 +2279,76 @@ mod tests {
         WalletSyncStatus {
             state,
             fully_scanned_height,
-            fully_scanned_hash: None,
-            observed_hash: None,
+            fully_scanned_hash: fully_scanned_height.map(|_| "canonical".to_owned()),
+            observed_hash: fully_scanned_height.map(|_| "canonical".to_owned()),
             observed_height: fully_scanned_height,
             last_success_at: Some(123),
             error: error.map(str::to_owned),
         }
     }
 
+    fn settlement_for_test(
+        node: Option<u64>,
+        lightwalletd: Option<u64>,
+        wallet: &WalletSyncStatus,
+    ) -> SettlementStatus {
+        let checkpoint = |height| ChainCheckpoint {
+            height,
+            hash: "canonical".to_owned(),
+        };
+        settlement_status(
+            node.map(checkpoint).as_ref(),
+            lightwalletd.map(checkpoint).as_ref(),
+            wallet,
+        )
+    }
+
     #[test]
     fn settlement_requires_all_three_components_at_the_same_tip() {
-        for scanned in [105, 106] {
-            let status = settlement_status(
-                Some(105),
-                Some(105),
-                &wallet_status("ready", Some(scanned), None),
-            );
-            assert!(status.settled);
-            assert_eq!(status.settlement_blocker, None);
-        }
+        let status = settlement_for_test(
+            Some(105),
+            Some(105),
+            &wallet_status("ready", Some(105), None),
+        );
+        assert!(status.settled);
+        assert_eq!(status.settlement_blocker, None);
 
-        let status = settlement_status(
+        let status = settlement_for_test(
             Some(105),
             Some(104),
             &wallet_status("ready", Some(105), None),
         );
         assert!(!status.settled);
         assert_eq!(status.settlement_blocker, Some("height_mismatch"));
+
+        let status = settlement_for_test(
+            Some(105),
+            Some(105),
+            &wallet_status("ready", Some(106), None),
+        );
+        assert!(
+            !status.settled,
+            "a wallet ahead of the current tip needs reconciliation"
+        );
+
+        let canonical = ChainCheckpoint {
+            height: 105,
+            hash: "canonical".to_owned(),
+        };
+        let replacement = ChainCheckpoint {
+            height: 105,
+            hash: "replacement".to_owned(),
+        };
+        let wallet = wallet_status("ready", Some(105), None);
+        let status = settlement_status(Some(&canonical), Some(&replacement), &wallet);
+        assert_eq!(status.settlement_blocker, Some("chain_mismatch"));
+
+        let status = settlement_status(Some(&replacement), Some(&replacement), &wallet);
+        assert!(
+            !status.settled,
+            "a same-height reorg needs wallet reconciliation"
+        );
+        assert_eq!(status.settlement_blocker, Some("wallet_behind"));
     }
 
     #[test]
@@ -2292,10 +2393,24 @@ mod tests {
         ];
 
         for (node, lightwalletd, wallet, expected) in cases {
-            let status = settlement_status(node, lightwalletd, &wallet);
+            let status = settlement_for_test(node, lightwalletd, &wallet);
             assert!(!status.settled);
             assert_eq!(status.settlement_blocker, Some(expected));
         }
+    }
+
+    #[test]
+    fn settlement_allows_a_canonical_tip_before_the_wallet_birthday() {
+        let tip = ChainCheckpoint {
+            height: u64::from(WALLET_BIRTHDAY_HEIGHT) - 1,
+            hash: "canonical".to_owned(),
+        };
+        let mut wallet = wallet_status("ready", None, None);
+        wallet.observed_height = Some(tip.height);
+        wallet.observed_hash = Some(tip.hash.clone());
+        assert!(settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+        wallet.observed_hash = Some("orphaned".to_owned());
+        assert!(!settlement_status(Some(&tip), Some(&tip), &wallet).settled);
     }
 
     #[test]
@@ -3105,6 +3220,34 @@ mod tests {
             AppState::new(store, wallet, "http://127.0.0.1:1".into(), "test".into()),
             dir,
         )
+    }
+
+    /// a client that falls behind the event buffer must be told to refetch
+    /// everything, since it cannot know which topics it missed.
+    #[tokio::test]
+    async fn a_lagging_event_stream_asks_the_client_to_resync() {
+        use futures_core::Stream;
+
+        let (state, _dir) = state_with_local_wallet();
+        let response = router(state.clone())
+            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let mut body = response.into_body().into_data_stream();
+        for _ in 0..=128 {
+            notify(&state, "chain");
+        }
+
+        let mut received = String::new();
+        while let Ok(Some(Ok(chunk))) = tokio::time::timeout(
+            Duration::from_millis(200),
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_next(cx)),
+        )
+        .await
+        {
+            received.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        assert!(received.contains("data: resync"), "{received}");
     }
 
     #[tokio::test]
@@ -4579,16 +4722,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl FaucetRuntime for RecordingFaucetRuntime {
-        async fn prepare_payment(
+        async fn prepare_payment<F>(
             &self,
             _activity_id: Option<&str>,
             _seed: &str,
             _destination: &str,
             _amount_zatoshi: u64,
-        ) -> anyhow::Result<PreparedPayment> {
+            record: F,
+        ) -> anyhow::Result<PreparedPayment>
+        where
+            F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+        {
             self.events.lock().unwrap().push("prepare".into());
             if self.funds_available.load(Ordering::SeqCst) {
-                Ok(PreparedPayment {
+                record(PreparedPayment {
                     txid: "recovered-txid".into(),
                     raw_transaction: b"recovered transaction".to_vec(),
                     expiry_height: 240,
@@ -4684,6 +4831,7 @@ mod tests {
             &treasury,
             "uregtest-recipient",
             100_000_000,
+            Ok,
         )
         .await
         .unwrap();

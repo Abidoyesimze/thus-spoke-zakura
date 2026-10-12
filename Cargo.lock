@@ -2949,6 +2949,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "libc",
  "nix",
  "reqwest",
  "semver",
