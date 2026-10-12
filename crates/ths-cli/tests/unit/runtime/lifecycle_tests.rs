@@ -50,9 +50,21 @@ fn within_attempt(started: Instant, policy: &LifecyclePolicy) {
     );
 }
 
+struct RunningDocker;
 
+impl DockerResourceCommands for RunningDocker {
+    fn output(&self, args: &[&str]) -> Result<String> {
+        match args {
+            ["container", "inspect", "--format", "{{.State.Running}}", _] => Ok("true".into()),
+            ["logs", "--tail", "50", _] => Ok("still starting".into()),
+            _ => anyhow::bail!("unexpected docker read {args:?}"),
+        }
+    }
 
-
+    fn run(&self, args: &[&str]) -> Result<()> {
+        anyhow::bail!("unexpected docker run {args:?}")
+    }
+}
 
 struct ScriptedDocker {
     running: Result<String, String>,

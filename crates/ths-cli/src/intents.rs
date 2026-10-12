@@ -30,7 +30,7 @@ impl FaucetJournal {
         }
         Ok(Self {
             path: instance_dir.join("faucet-intents.json"),
-            lock: lock,
+            lock,
         })
     }
 

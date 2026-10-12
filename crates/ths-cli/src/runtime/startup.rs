@@ -715,14 +715,7 @@ pub(super) fn startup_require_image(docker: &LifecycleDocker<'_>, image: &str) -
         &["image", "inspect", "--format", "{{.Id}}", image],
         OutputMode::Capture,
     ) {
-        Ok(output)
-            if output.status.success() && !output.stdout_truncated && !output.stderr_truncated =>
-        {
-            Ok(())
-        }
-        Ok(output) if !output.status.success() && !output.stdout_truncated => {
-            confirm_image_absent(docker, image, &output.stderr)
-        }
+        Ok(output) if !output.stdout_truncated && !output.stderr_truncated => Ok(()),
         Ok(_) => bail!("checking image {image} returned truncated output"),
         Err(error) if error.kind == CommandFailureKind::Nonzero => {
             confirm_image_absent(docker, image, &error.stderr)
@@ -740,7 +733,7 @@ pub(super) fn confirm_image_absent(
         &["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
         OutputMode::Capture,
     ) {
-        Ok(listing) if listing.status.success() && !listing.stdout_truncated => {
+        Ok(listing) if !listing.stdout_truncated => {
             let present = String::from_utf8_lossy(&listing.stdout)
                 .lines()
                 .any(|line| line.trim() == image);

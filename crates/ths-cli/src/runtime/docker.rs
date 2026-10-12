@@ -176,7 +176,7 @@ pub(super) fn docker_inherit_in(args: &[&str], current_dir: &std::path::Path) ->
     docker_command(args, Some(current_dir))
 }
 pub(super) fn docker_command(args: &[&str], current_dir: Option<&std::path::Path>) -> Result<()> {
-    let mut command = Command::new("docker");
+    let mut command = docker_cli();
     command.args(args);
     if let Some(current_dir) = current_dir {
         command.current_dir(current_dir);

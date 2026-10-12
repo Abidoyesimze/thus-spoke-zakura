@@ -1317,5 +1317,3 @@ fn pending_start_identity_can_be_loaded_without_a_resource_summary() {
     assert!(docker.resources.lock().unwrap().is_empty());
     assert!(!runtime.instance_dir(&instance).exists());
 }
-
-struct RunningDocker;
