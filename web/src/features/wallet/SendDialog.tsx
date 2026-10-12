@@ -40,6 +40,7 @@ export function SendDialog({
   const parseUri = useParsePaymentUri();
   const [paymentUri, setPaymentUri] = useState('');
   const paymentUriRevision = useRef(0);
+  const [paymentUriNeedsApply, setPaymentUriNeedsApply] = useState(false);
   const fromAccountId = defaultAccountId ?? 1;
 
   const form = useForm<SendInput, unknown, SendValues>({
@@ -109,9 +110,13 @@ export function SendDialog({
     if (paymentUri.trim() === '') return;
     paymentUriRevision.current += 1;
     const uriRevision = paymentUriRevision.current;
+    setPaymentUriNeedsApply(true);
     parseUri.mutate(paymentUri, {
       onSuccess: (parsed) => {
-        if (uriRevision === paymentUriRevision.current) applyPaymentUri(parsed);
+        if (uriRevision === paymentUriRevision.current) {
+          applyPaymentUri(parsed);
+          setPaymentUriNeedsApply(false);
+        }
       },
     });
   };
@@ -119,8 +124,9 @@ export function SendDialog({
   const submit = (event: FormEvent<HTMLFormElement>) => {
     const uriRevision = paymentUriRevision.current;
     return form.handleSubmit(async (values) => {
-      // URI parsing replaces the recipient and amount; never send the previous form values.
-      if (parseUri.isPending || uriRevision !== paymentUriRevision.current) return;
+      // A nonempty request must be applied at its current revision before the form can be sent.
+      if (parseUri.isPending || paymentUriNeedsApply || uriRevision !== paymentUriRevision.current)
+        return;
       if (values.amount > available) {
         form.setError('amount', {
           message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
@@ -159,6 +165,7 @@ export function SendDialog({
             onOpenChange(false);
             form.reset();
             setPaymentUri('');
+            setPaymentUriNeedsApply(false);
             parseUri.reset();
           },
           onError: (error) => toast.error('Transfer failed', errorMessage(error)),
@@ -180,7 +187,11 @@ export function SendDialog({
     >
       <Field
         label="Payment request (optional)"
-        hint="Paste a zcash: URI to fill in the destination, amount, and memo."
+        hint={
+          paymentUriNeedsApply
+            ? 'Apply this payment request or clear it before sending.'
+            : 'Paste a zcash: URI to fill in the destination, amount, and memo.'
+        }
         error={parseUri.isError ? errorMessage(parseUri.error) : undefined}
       >
         {(aria) => (
@@ -191,6 +202,7 @@ export function SendDialog({
               onChange={(event) => {
                 paymentUriRevision.current += 1;
                 setPaymentUri(event.target.value);
+                setPaymentUriNeedsApply(event.target.value.trim() !== '');
                 parseUri.reset();
               }}
               onKeyDown={(event) => {
@@ -332,7 +344,7 @@ export function SendDialog({
           variant="primary"
           size="block"
           loading={send.isPending}
-          disabled={send.isPending || parseUri.isPending}
+          disabled={send.isPending || parseUri.isPending || paymentUriNeedsApply}
         >
           {send.isPending ? 'Sending…' : 'Send ZEC'}
           {!send.isPending && <ArrowRight />}

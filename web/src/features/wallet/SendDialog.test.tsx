@@ -446,6 +446,81 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
   }
 
+  it.each(['button', 'form'] as const)(
+    'blocks %s submission until the current nonempty URI is successfully applied',
+    async (submission) => {
+      const uriA = 'zcash:uregtest1requestA?amount=0.25';
+      const uriB = 'zcash:uregtest1requestB?amount=0.75';
+      const parsedA = {
+        address: 'uregtest1requestA',
+        destination_pool: 'ironwood',
+        to_account: null,
+        amount_zatoshi: 25_000_000,
+        memo: 'request A',
+      };
+      const parsedB = {
+        ...parsedA,
+        address: 'uregtest1requestB',
+        amount_zatoshi: 75_000_000,
+        memo: 'request B',
+      };
+      fetchMock.mockImplementation(sendImpl(QUOTE, parsedA));
+      renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+      const uriField = screen.getByLabelText('Payment request (optional)');
+      const sendButton = screen.getByRole('button', { name: /Send ZEC/i });
+      const attemptSend = async () => {
+        expect(sendButton).toBeDisabled();
+        if (submission === 'button') await userEvent.click(sendButton);
+        else await act(() => fireEvent.submit(sendButton.closest('form')!));
+        expect(sendCalls(fetchMock)).toHaveLength(0);
+      };
+      await userEvent.type(uriField, uriA);
+      await attemptSend();
+      await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      await waitFor(() => expect(sendButton).toBeEnabled());
+      expect(screen.getByLabelText('Destination address')).toHaveValue(parsedA.address);
+      await userEvent.clear(uriField);
+      await userEvent.type(uriField, uriB);
+      await attemptSend();
+      fetchMock.mockImplementation((input, init) =>
+        requestUrl(input).endsWith('/zip321/parse')
+          ? Promise.resolve(
+              new Response(
+                JSON.stringify({ error: { message: 'Current URI error', status: 400 } }),
+                { status: 400, headers: { 'content-type': 'application/json' } },
+              ),
+            )
+          : sendImpl(QUOTE)(input, init),
+      );
+      await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      expect(await screen.findByText('Current URI error')).toBeInTheDocument();
+      await attemptSend();
+      expect(screen.getByLabelText('Destination address')).toHaveValue(parsedA.address);
+      fetchMock.mockImplementation(sendImpl(QUOTE, parsedB));
+      await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      await waitFor(() => expect(sendButton).toBeEnabled());
+      await userEvent.click(sendButton);
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      expect(body(fetchMock)).toMatchObject({
+        to_address: parsedB.address,
+        amount_zatoshi: 75_000_000,
+        memo: parsedB.memo,
+      });
+      expect(body(fetchMock)).not.toHaveProperty('to_account');
+    },
+  );
+
+  it('allows an intentional manual send after clearing an unapplied URI', async () => {
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    const uriField = screen.getByLabelText('Payment request (optional)');
+    await userEvent.type(uriField, 'zcash:uregtest1requestA?amount=0.25');
+    expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeDisabled();
+    await userEvent.clear(uriField);
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock)).toMatchObject({ to_account: 2, amount_zatoshi: 100_000_000 });
+  });
+
   it.each([
     ['changed', 'success'],
     ['cleared', 'success'],
@@ -487,7 +562,14 @@ describe('SendDialog', () => {
       await userEvent.clear(uriField);
       await userEvent.type(uriField, uriA);
     }
-    await waitFor(() => expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeEnabled());
+    const sendButton = screen.getByRole('button', { name: /Send ZEC/i });
+    if (edit === 'cleared') expect(sendButton).toBeEnabled();
+    else {
+      expect(sendButton).toBeDisabled();
+      await userEvent.click(sendButton);
+      await act(() => fireEvent.submit(sendButton.closest('form')!));
+      expect(sendCalls(fetchMock)).toHaveLength(0);
+    }
     expect(screen.getByRole('button', { name: 'Apply' })).not.toHaveAttribute('aria-busy', 'true');
 
     await act(async () => {
@@ -513,7 +595,11 @@ describe('SendDialog', () => {
       await parsing;
     });
 
-    await waitFor(() => expect(screen.getByRole('button', { name: /Send ZEC/i })).toBeEnabled());
+    if (edit === 'cleared') expect(sendButton).toBeEnabled();
+    else {
+      expect(sendButton).toBeDisabled();
+      await act(() => fireEvent.submit(sendButton.closest('form')!));
+    }
     expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
     expect(screen.queryByLabelText('Destination address')).not.toBeInTheDocument();
     expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
@@ -693,7 +779,10 @@ describe('SendDialog', () => {
         );
         await parsingB;
       });
-      await waitFor(() => expect(sendButton).toBeEnabled());
+      await waitFor(() => {
+        if (currentOutcome === 'success') expect(sendButton).toBeEnabled();
+        else expect(sendButton).toBeDisabled();
+      });
       if (order === 'newer first') await resolveA();
       if (currentOutcome === 'error') {
         expect(screen.getByText('Current URI error')).toBeInTheDocument();
@@ -867,11 +956,11 @@ describe('SendDialog', () => {
         return sendImpl(QUOTE)(input, init);
       });
       renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
       await userEvent.type(
         screen.getByLabelText('Payment request (optional)'),
         'zcash:uregtest1external?amount=0.25',
       );
-      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
       expect(sendCalls(fetchMock)).toHaveLength(0);
       await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
       await waitFor(() =>
