@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders, requestUrl, testAccounts } from '@/test/utils';
 import { SendDialog } from './SendDialog';
@@ -445,6 +445,66 @@ describe('SendDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
   }
 
+  it.each(['button', 'form'] as const)(
+    'blocks %s submission while a payment URI is parsing',
+    async (submission) => {
+      const parsed = {
+        address: 'uregtest1external',
+        destination_pool: 'ironwood',
+        to_account: null,
+        amount_zatoshi: 25_000_000,
+        memo: 'coffee',
+      };
+      let finishParsing!: (response: Response) => void;
+      const parsing = new Promise<Response>((resolve) => {
+        finishParsing = resolve;
+      });
+      fetchMock.mockImplementation((input, init) =>
+        requestUrl(input).endsWith('/zip321/parse') ? parsing : sendImpl(QUOTE)(input, init),
+      );
+      await applyPaymentUri('zcash:uregtest1external?amount=0.25');
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute('aria-busy', 'true'),
+      );
+      const sendButton = screen.getByRole('button', { name: /Send ZEC/i });
+      expect(screen.getByLabelText('Destination')).toHaveTextContent('Account 2');
+      expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('1');
+
+      if (submission === 'button') {
+        expect(sendButton).toBeDisabled();
+        await userEvent.click(sendButton);
+      } else {
+        // A disabled button alone cannot protect keyboard/programmatic form submission.
+        await act(async () => {
+          fireEvent.submit(sendButton.closest('form')!);
+          await Promise.resolve();
+        });
+      }
+      expect(sendCalls(fetchMock)).toHaveLength(0);
+
+      await act(async () => {
+        finishParsing(
+          new Response(JSON.stringify(parsed), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+        await parsing;
+      });
+      expect(await screen.findByLabelText('Destination address')).toHaveValue(parsed.address);
+      expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('0.25');
+      await waitFor(() => expect(sendButton).toBeEnabled());
+      await userEvent.click(sendButton);
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      expect(body(fetchMock)).toMatchObject({
+        to_address: parsed.address,
+        amount_zatoshi: parsed.amount_zatoshi,
+        memo: parsed.memo,
+      });
+      expect(body(fetchMock)).not.toHaveProperty('to_account');
+    },
+  );
+
   it('fills the form from a pasted zcash: URI and sends to its address with the memo', async () => {
     fetchMock.mockRestore();
     fetchMock = mockSend(QUOTE, {
@@ -470,6 +530,74 @@ describe('SendDialog', () => {
     });
     expect(body(fetchMock).to_account).toBeUndefined();
   });
+
+  it.each([false, true])(
+    'cancels a waiting send when URI parsing starts (parsing finished: %s)',
+    async (parsingFinished) => {
+      let finishQuote!: (response: Response) => void;
+      let finishParsing!: (response: Response) => void;
+      const quoting = new Promise<Response>((resolve) => {
+        finishQuote = resolve;
+      });
+      const parsing = new Promise<Response>((resolve) => {
+        finishParsing = resolve;
+      });
+      const parsed = {
+        address: 'uregtest1external',
+        destination_pool: 'ironwood',
+        to_account: null,
+        amount_zatoshi: 25_000_000,
+        memo: null,
+      };
+      fetchMock.mockImplementation((input, init) => {
+        if (requestUrl(input).endsWith('/send/quote')) return quoting;
+        if (requestUrl(input).endsWith('/zip321/parse')) return parsing;
+        return sendImpl(QUOTE)(input, init);
+      });
+      renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+      await userEvent.type(
+        screen.getByLabelText('Payment request (optional)'),
+        'zcash:uregtest1external?amount=0.25',
+      );
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      expect(sendCalls(fetchMock)).toHaveLength(0);
+      await userEvent.click(screen.getByRole('button', { name: 'Apply' }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Apply' })).toHaveAttribute('aria-busy', 'true'),
+      );
+      const resolveParsing = async () => {
+        await act(async () => {
+          finishParsing(
+            new Response(JSON.stringify(parsed), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }),
+          );
+          await parsing;
+        });
+      };
+      if (parsingFinished) await resolveParsing();
+      await act(async () => {
+        finishQuote(
+          new Response(JSON.stringify(QUOTE), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          }),
+        );
+        await quoting;
+      });
+      expect(sendCalls(fetchMock)).toHaveLength(0);
+      if (!parsingFinished) await resolveParsing();
+      expect(await screen.findByLabelText('Destination address')).toHaveValue(parsed.address);
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+      expect(body(fetchMock)).toMatchObject({
+        to_address: parsed.address,
+        amount_zatoshi: parsed.amount_zatoshi,
+      });
+      expect(body(fetchMock)).not.toHaveProperty('to_account');
+    },
+  );
 
   it('clears the amount for a URI without one and requires the sender to enter it', async () => {
     fetchMock.mockRestore();

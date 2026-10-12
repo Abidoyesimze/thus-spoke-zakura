@@ -1,5 +1,5 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { ArrowRight } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
@@ -39,6 +39,7 @@ export function SendDialog({
   const send = useSend();
   const parseUri = useParsePaymentUri();
   const [paymentUri, setPaymentUri] = useState('');
+  const paymentUriRevision = useRef(0);
   const fromAccountId = defaultAccountId ?? 1;
 
   const form = useForm<SendInput, unknown, SendValues>({
@@ -106,52 +107,60 @@ export function SendDialog({
 
   const submitPaymentUri = () => {
     if (paymentUri.trim() === '') return;
+    paymentUriRevision.current += 1;
     parseUri.mutate(paymentUri, { onSuccess: applyPaymentUri });
   };
 
-  const submit = form.handleSubmit(async (values) => {
-    if (values.amount > available) {
-      form.setError('amount', {
-        message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
-      });
-      return;
-    }
-    const quoted = quote.data ?? (await quote.refetch()).data;
-    if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
-      form.setError('amount', {
-        message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
-      });
-      return;
-    }
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    const uriRevision = paymentUriRevision.current;
+    return form.handleSubmit(async (values) => {
+      // URI parsing replaces the recipient and amount; never send the previous form values.
+      if (parseUri.isPending || uriRevision !== paymentUriRevision.current) return;
+      if (values.amount > available) {
+        form.setError('amount', {
+          message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
+        });
+        return;
+      }
+      const quoted = quote.data ?? (await quote.refetch()).data;
+      // Parsing may start and finish while the fee quote is awaited, invalidating this send.
+      if (uriRevision !== paymentUriRevision.current) return;
+      if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
+        form.setError('amount', {
+          message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
+        });
+        return;
+      }
 
-    send.mutate(
-      {
-        from_account: values.from_account,
-        ...(values.to_account === ADDRESS_DESTINATION
-          ? { to_address: values.to_address }
-          : { to_account: values.to_account }),
-        source_pool: values.source_pool,
-        destination_pool: values.destination_pool,
-        amount_zatoshi: values.amount,
-        ...(values.memo === '' ? {} : { memo: values.memo }),
-      },
-      {
-        onSuccess: (activity) => {
-          toast.success(
-            activity.to_account === null
-              ? `Sent to ${shortHash(activity.to_address ?? '', 14, 6)}`
-              : `Sent to Account ${activity.to_account}`,
-            'The transaction was mined into a new block.',
-          );
-          onOpenChange(false);
-          form.reset();
-          setPaymentUri('');
-          parseUri.reset();
+      send.mutate(
+        {
+          from_account: values.from_account,
+          ...(values.to_account === ADDRESS_DESTINATION
+            ? { to_address: values.to_address }
+            : { to_account: values.to_account }),
+          source_pool: values.source_pool,
+          destination_pool: values.destination_pool,
+          amount_zatoshi: values.amount,
+          ...(values.memo === '' ? {} : { memo: values.memo }),
         },
-        onError: (error) => toast.error('Transfer failed', errorMessage(error)),
-      },
-    );
-  });
+        {
+          onSuccess: (activity) => {
+            toast.success(
+              activity.to_account === null
+                ? `Sent to ${shortHash(activity.to_address ?? '', 14, 6)}`
+                : `Sent to Account ${activity.to_account}`,
+              'The transaction was mined into a new block.',
+            );
+            onOpenChange(false);
+            form.reset();
+            setPaymentUri('');
+            parseUri.reset();
+          },
+          onError: (error) => toast.error('Transfer failed', errorMessage(error)),
+        },
+      );
+    })(event);
+  };
 
   const options = accountOptions(accounts);
   const destinationOptions = [...options, { value: ADDRESS_DESTINATION, label: 'Other address' }];
@@ -309,7 +318,13 @@ export function SendDialog({
           )}
         </Field>
 
-        <Button type="submit" variant="primary" size="block" loading={send.isPending}>
+        <Button
+          type="submit"
+          variant="primary"
+          size="block"
+          loading={send.isPending}
+          disabled={send.isPending || parseUri.isPending}
+        >
           {send.isPending ? 'Sending…' : 'Send ZEC'}
           {!send.isPending && <ArrowRight />}
         </Button>
