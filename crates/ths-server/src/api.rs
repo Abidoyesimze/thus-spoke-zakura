@@ -11,9 +11,10 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     handler::HandlerWithoutStateExt,
-    http::{HeaderMap, StatusCode, Uri, header::HOST},
+    http::{StatusCode, Uri, header::HOST},
+    middleware::{self, Next},
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -434,8 +435,38 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/search", get(search))
         .route("/api/v1/events", get(events))
         .fallback_service(dashboard_router(static_dir))
+        .layer(middleware::from_fn(require_loopback_host))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    let Some(host) = request.headers().get(HOST) else {
+        // Browser requests always include Host. Preserve compatibility with
+        // direct HTTP/1.0 clients that omit it entirely.
+        return next.run(request).await;
+    };
+    let is_loopback = host
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
+        .map(|authority| {
+            let host = authority
+                .host()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+        .unwrap_or(false);
+
+    if is_loopback {
+        next.run(request).await
+    } else {
+        (StatusCode::FORBIDDEN, "Host must be a loopback address").into_response()
+    }
 }
 
 pub async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
@@ -481,11 +512,7 @@ struct PublicEndpoints {
     p2p: String,
 }
 
-async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Json<Status>> {
-    let dashboard_host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("127.0.0.1:8080");
+async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
     let (node, lightwalletd) =
         tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
     let node = node.ok();
@@ -503,7 +530,7 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<
         auto_mine: true,
         network: "Regtest",
         endpoints: PublicEndpoints {
-            dashboard: format!("http://{dashboard_host}"),
+            dashboard: "http://127.0.0.1:8080".into(),
             zakura_rpc: std::env::var("THS_PUBLIC_ZAKURA_RPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
             lightwalletd: std::env::var("THS_PUBLIC_LIGHTWALLETD")
@@ -3574,7 +3601,12 @@ mod tests {
 
         let (state, _dir) = state_with_local_wallet();
         let response = router(state.clone())
-            .oneshot(Request::get("/api/v1/events").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/v1/events")
+                    .header("host", "127.0.0.1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         let mut body = response.into_body().into_data_stream();
@@ -3603,7 +3635,12 @@ mod tests {
             .unwrap();
 
         let response = router(state)
-            .oneshot(Request::get("/api/v1/status").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::get("/api/v1/status")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -3612,6 +3649,41 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status["account_count"], 5);
+    }
+
+    #[tokio::test]
+    async fn non_loopback_hosts_cannot_access_the_api_or_seed() {
+        let (state, _dir) = state_with_local_wallet();
+        let response = router(state.clone())
+            .oneshot(
+                Request::post("/api/v1/dev/seed")
+                    .header("host", "attacker.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"confirmation": "I understand this seed is for regtest only"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/api/v1/status")
+                    .header("host", "127.0.0.1:8080")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let status: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["endpoints"]["dashboard"], "http://127.0.0.1:8080");
     }
 
     #[tokio::test]
@@ -6420,6 +6492,7 @@ mod tests {
                 Request::builder()
                     .method(method)
                     .uri(uri)
+                    .header("host", "127.0.0.1:8080")
                     .header("content-type", "application/json")
                     .body(if method == "GET" {
                         Body::empty()
