@@ -401,6 +401,7 @@ cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery
 # The preceding command runs helper tests; the live test remains ignored.
 docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact startup_funding_retry_after_auto_mine_failure_has_one_payout
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact internal_address_faucets_record_confirmed_activity
@@ -458,8 +459,8 @@ request bodies, wallet keys, wallet databases, or configuration directories.
 
 To prove the regression is sensitive, perform the negative control only after a
 successful live run and only in an isolated verification worktree. Temporarily
-remove `background.spawn(api::payment_confirmation_loop(state.clone()));` from
-`serve` in `crates/ths-server/src/main.rs`, rerun the same explicit live Cargo command,
+remove the `api::payment_confirmation_loop` task from `background_tasks` in
+`crates/ths-server/src/main.rs`, rerun the same explicit live Cargo command,
 and require failure at background activity recovery after the broadcast,
 intercepted auto-mine failure, and real inclusion checks. Restore the exact line
 immediately, including after a failed run; do not retain the temporary
@@ -479,6 +480,16 @@ transaction IDs for chain inclusion every two seconds, independently of wallet
 synchronization. Each lookup is bounded to two seconds and each pass to ten
 seconds, resuming after the last attempted record when the budget is exhausted.
 Unknown transactions and unavailable RPC responses remain pending for retry.
+
+The server opens HTTP as soon as its local stores load, so stored payment status
+stays readable while Zakura or lightwalletd is unavailable. Health reports ready,
+and send, faucet, and mining requests are accepted, only after both dependencies
+respond and Account 1 is funded. `GET /api/v1/activity?idempotency_key=<key>`
+returns the matching payment as a one-item array, or `[]`.
+`GET /api/v1/faucet/address?idempotency_key=<key>` returns the faucet payment,
+or HTTP 404. Both read only the local store, and `last_error` is `null` unless the
+payment has a recorded error.
+
 A hidden sixth account acts as the mining and faucet
 treasury. Account 1 starts with 5 Ironwood ZEC, so you can experiment immediately.
 

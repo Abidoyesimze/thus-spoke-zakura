@@ -22,9 +22,9 @@ pub const TREASURY_ACCOUNT_ID: u8 = 6;
 const ACCOUNT_COLUMNS: &str =
     "id,name,unified_address,transparent_address,transparent_zatoshi,ironwood_zatoshi";
 /// Qualified so it also reads unambiguously in joins. The order must match `row_activity`.
-const ACTIVITY_COLUMNS: &str = "a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at";
+const ACTIVITY_COLUMNS: &str = "a.id,a.kind,a.from_account,a.to_account,a.to_address,a.source_pool,a.destination_pool,a.amount_zatoshi,a.txid,a.block_hash,a.status,a.created_at,a.last_error";
 /// The order must match `row_address_faucet`.
-const ADDRESS_FAUCET_COLUMNS: &str = "id,address,amount_zatoshi,txid,block_hash,status";
+const ADDRESS_FAUCET_COLUMNS: &str = "id,address,amount_zatoshi,txid,block_hash,status,last_error";
 
 #[derive(Debug, thiserror::Error)]
 #[error("idempotency key was already used for a different payment")]
@@ -61,7 +61,7 @@ pub struct DevelopmentSecrets {
     pub accounts: Vec<DevelopmentAccountSecret>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Activity {
     pub id: String,
     pub kind: String,
@@ -75,6 +75,7 @@ pub struct Activity {
     pub block_hash: Option<String>,
     pub status: String,
     pub created_at: String,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,34 @@ pub struct AddressFaucet {
     pub txid: String,
     pub block_hash: Option<String>,
     pub status: String,
+    pub last_error: Option<String>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "server-owned payment progression (#196) uses this"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityIntent {
+    pub activity: Activity,
+    pub key: String,
+    pub memo: Option<String>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "server-owned payment progression (#196) uses this"
+    )
+)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressFaucetIntent {
+    pub payment: AddressFaucet,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,21 +159,15 @@ impl Store {
             CREATE TABLE IF NOT EXISTS address_faucets (
                 key TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL, address TEXT NOT NULL,
                 amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL DEFAULT '',
-                block_hash TEXT, status TEXT NOT NULL DEFAULT 'preparing'
+                block_hash TEXT, status TEXT NOT NULL DEFAULT 'preparing', last_error TEXT
             );
         "#,
         )?;
         db.execute_batch(ACTIVITY_TABLE)?;
+        add_missing_column(&db, "idempotency", "memo")?;
+        add_missing_column(&db, "activity", "last_error")?;
+        add_missing_column(&db, "address_faucets", "last_error")?;
         migrate_activity_recipients(&db)?;
-        let has_memo = db
-            .prepare("PRAGMA table_info(idempotency)")?
-            .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-            .iter()
-            .any(|column| column == "memo");
-        if !has_memo {
-            db.execute("ALTER TABLE idempotency ADD COLUMN memo TEXT", [])?;
-        }
         let stored_seed = db
             .query_row("SELECT value FROM metadata WHERE key='seed'", [], |r| {
                 r.get::<_, String>(0)
@@ -219,7 +242,7 @@ impl Store {
     pub fn activities(&self, limit: u32) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
-            "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.txid != '' ORDER BY a.rowid DESC LIMIT ?1"
+            "SELECT {ACTIVITY_COLUMNS} FROM activity a ORDER BY a.rowid DESC LIMIT ?1"
         ))?;
         Ok(query
             .query_map([limit.min(100)], row_activity)?
@@ -229,10 +252,55 @@ impl Store {
     pub fn unconfirmed_activities(&self) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
-            "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.txid!='' AND a.status!='confirmed' ORDER BY a.rowid ASC"
+            "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.txid!='' AND a.status NOT IN ('confirmed','failed') ORDER BY a.rowid ASC"
         ))?;
         Ok(query
             .query_map([], row_activity)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn unresolved_activities(&self) -> Result<Vec<ActivityIntent>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ACTIVITY_COLUMNS},i.key,i.memo FROM activity a JOIN idempotency i ON i.activity_id=a.id WHERE a.status NOT IN ('confirmed','failed') ORDER BY a.rowid ASC"
+        ))?;
+        Ok(query
+            .query_map([], |row| {
+                Ok(ActivityIntent {
+                    activity: row_activity(row)?,
+                    key: row.get(13)?,
+                    memo: row.get(14)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn unresolved_address_faucets(&self) -> Result<Vec<AddressFaucetIntent>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ADDRESS_FAUCET_COLUMNS},key FROM address_faucets WHERE status NOT IN ('confirmed','failed') ORDER BY rowid ASC"
+        ))?;
+        Ok(query
+            .query_map([], |row| {
+                Ok(AddressFaucetIntent {
+                    payment: row_address_faucet(row)?,
+                    key: row.get(7)?,
+                })
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -365,7 +433,7 @@ impl Store {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
         let updated = tx.execute(
-            "UPDATE address_faucets SET txid=?1,status='prepared' WHERE id=?2 AND status='preparing'",
+            "UPDATE address_faucets SET txid=?1,status='prepared',last_error=NULL WHERE id=?2 AND status='preparing'",
             params![txid, id],
         )?;
         let payment = address_by_id(&tx, id)?;
@@ -403,7 +471,7 @@ impl Store {
     pub fn mark_address_broadcast(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
         let db = self.0.lock().unwrap();
         let updated = db.execute(
-            "UPDATE address_faucets SET status='broadcast' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            "UPDATE address_faucets SET status='broadcast',last_error=NULL WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
             params![id, txid],
         )?;
         let payment = address_by_id(&db, id)?;
@@ -419,10 +487,94 @@ impl Store {
         }
         let db = self.0.lock().unwrap();
         db.execute(
-            "UPDATE address_faucets SET status='confirmed',block_hash=?1 WHERE id=?2 AND txid=?3",
+            "UPDATE address_faucets SET status='confirmed',block_hash=?1,last_error=NULL WHERE id=?2 AND txid=?3",
             params![block_hash, id, txid],
         )?;
         address_by_id(&db, id)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn record_address_error(
+        &self,
+        id: &str,
+        status: &str,
+        txid: &str,
+        error: &str,
+    ) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE address_faucets SET last_error=?1 WHERE id=?2 AND status=?3 AND txid=?4 AND status NOT IN ('confirmed','failed')",
+            params![error, id, status, txid],
+        )?;
+        address_by_id(&db, id)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn fail_address(&self, id: &str, error: &str) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        let updated = db.execute(
+            "UPDATE address_faucets SET status='failed',last_error=?1 WHERE id=?2 AND status='preparing' AND txid=''",
+            params![error, id],
+        )?;
+        let payment = address_by_id(&db, id)?;
+        if updated == 0 && payment.status != "failed" {
+            bail!("address faucet {id} is no longer waiting for preparation");
+        }
+        Ok(payment)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn record_error(
+        &self,
+        id: &str,
+        status: &str,
+        txid: &str,
+        error: &str,
+    ) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE activity SET last_error=?1 WHERE id=?2 AND status=?3 AND txid=?4 AND status NOT IN ('confirmed','failed')",
+            params![error, id, status, txid],
+        )?;
+        activity_by_id(&db, id).map_err(Into::into)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn fail(&self, id: &str, error: &str) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        let updated = db.execute(
+            "UPDATE activity SET status='failed',last_error=?1 WHERE id=?2 AND status='preparing' AND txid=''",
+            params![error, id],
+        )?;
+        let activity = activity_by_id(&db, id)?;
+        if updated == 0 && activity.status != "failed" {
+            bail!("payment {id} is no longer waiting for preparation");
+        }
+        Ok(activity)
     }
 
     pub fn discard_preparing(&self, id: &str) -> Result<()> {
@@ -449,7 +601,7 @@ impl Store {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
         let updated = tx.execute(
-            "UPDATE activity SET txid=?1,status='prepared' WHERE id=?2 AND status='preparing'",
+            "UPDATE activity SET txid=?1,status='prepared',last_error=NULL WHERE id=?2 AND status='preparing'",
             params![txid, id],
         )?;
         let activity = activity_by_id(&tx, id)?;
@@ -505,7 +657,7 @@ impl Store {
     pub fn mark_broadcast(&self, id: &str, txid: &str) -> Result<Activity> {
         let db = self.0.lock().unwrap();
         let updated = db.execute(
-            "UPDATE activity SET status='broadcast' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            "UPDATE activity SET status='broadcast',last_error=NULL WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
             params![id, txid],
         )?;
         let activity = activity_by_id(&db, id)?;
@@ -521,7 +673,7 @@ impl Store {
         }
         let db = self.0.lock().unwrap();
         db.execute(
-            "UPDATE activity SET status='confirmed',block_hash=?1 WHERE id=?2 AND txid=?3",
+            "UPDATE activity SET status='confirmed',block_hash=?1,last_error=NULL WHERE id=?2 AND txid=?3",
             params![block_hash, id, txid],
         )?;
         activity_by_id(&db, id).map_err(Into::into)
@@ -565,12 +717,25 @@ impl Store {
     }
 }
 
+fn add_missing_column(db: &Connection, table: &str, column: &str) -> Result<()> {
+    let exists = db
+        .prepare(&format!("PRAGMA table_info({table})"))?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|existing| existing == column);
+    if !exists {
+        db.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT"), [])?;
+    }
+    Ok(())
+}
+
 const ACTIVITY_TABLE: &str = r#"
     CREATE TABLE IF NOT EXISTS activity (
         id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER, to_account INTEGER,
         to_address TEXT, source_pool TEXT NOT NULL, destination_pool TEXT NOT NULL,
         amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
-        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, last_error TEXT
     );
 "#;
 
@@ -590,8 +755,8 @@ fn migrate_activity_recipients(db: &Connection) -> Result<()> {
     tx.execute_batch("ALTER TABLE activity RENAME TO activity_before_recipients;")?;
     tx.execute_batch(ACTIVITY_TABLE)?;
     tx.execute_batch(
-        "INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at)
-         SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at
+        "INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at,last_error)
+         SELECT id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,block_hash,status,created_at,last_error
          FROM activity_before_recipients ORDER BY rowid;
          DROP TABLE activity_before_recipients;",
     )?;
@@ -652,6 +817,7 @@ fn row_address_faucet(row: &rusqlite::Row<'_>) -> rusqlite::Result<AddressFaucet
         txid: row.get(3)?,
         block_hash: row.get(4)?,
         status: row.get(5)?,
+        last_error: row.get(6)?,
     })
 }
 fn new_activity(
@@ -682,6 +848,7 @@ fn new_activity(
         block_hash: None,
         status: "preparing".into(),
         created_at: String::new(),
+        last_error: None,
     }
 }
 fn validate_pool(pool: &str) -> Result<()> {
@@ -726,6 +893,7 @@ fn row_activity(row: &rusqlite::Row<'_>) -> rusqlite::Result<Activity> {
         block_hash: row.get(9)?,
         status: row.get(10)?,
         created_at: row.get(11)?,
+        last_error: row.get(12)?,
     })
 }
 fn derived_full_viewing_key(seed: &[u8], id: u8) -> Result<UnifiedFullViewingKey> {
@@ -1390,7 +1558,10 @@ mod tests {
 
         assert_eq!(claims[0].id, claims[1].id);
         assert_eq!(claims[0].status, "preparing");
-        assert!(store.activities(10).unwrap().is_empty());
+        let listed = store.activities(10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, claims[0].id);
+        assert!(listed[0].txid.is_empty());
     }
 
     #[test]
@@ -1450,7 +1621,7 @@ mod tests {
         assert_eq!(retry.status, "preparing");
         assert!(retry.txid.is_empty());
         assert!(store.prepared_transaction(&claim.id).is_err());
-        assert!(store.activities(10).unwrap().is_empty());
+        assert_eq!(store.activities(10).unwrap(), [retry]);
     }
 
     #[test]
@@ -1784,6 +1955,697 @@ mod tests {
         store.initialize().unwrap();
         let claimed = store.activity_for_key("after-migration").unwrap().unwrap();
         assert_eq!(claimed.to_address.as_deref(), Some("tmExternal"));
-        assert_eq!(store.activities(10).unwrap().len(), 2);
+        assert_eq!(store.activities(10).unwrap().len(), 3);
+    }
+    #[test]
+    fn older_stores_gain_payment_errors_without_losing_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(
+                "CREATE TABLE activity (
+                     id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER,
+                     to_account INTEGER NOT NULL, source_pool TEXT NOT NULL,
+                     destination_pool TEXT NOT NULL, amount_zatoshi INTEGER NOT NULL,
+                     txid TEXT NOT NULL, block_hash TEXT, status TEXT NOT NULL,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 CREATE TABLE idempotency (key TEXT PRIMARY KEY, activity_id TEXT NOT NULL);
+                 CREATE TABLE prepared_payments (
+                     activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL,
+                     expiry_height INTEGER NOT NULL
+                 );
+                 CREATE TABLE address_faucets (
+                     key TEXT PRIMARY KEY, id TEXT UNIQUE NOT NULL, address TEXT NOT NULL,
+                     amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL DEFAULT '',
+                     block_hash TEXT, status TEXT NOT NULL DEFAULT 'preparing'
+                 );
+                 INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,status)
+                     VALUES('legacy-send','send',1,2,'ironwood','ironwood',12000,'legacy-txid','broadcast');
+                 INSERT INTO idempotency(key,activity_id) VALUES('legacy-key','legacy-send');
+                 INSERT INTO prepared_payments VALUES('legacy-send',x'0102',140);
+                 INSERT INTO address_faucets(key,id,address,amount_zatoshi) VALUES('legacy-address','legacy-faucet','tm-external',7);",
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            let store = Store::open(&path).unwrap();
+            store.initialize().unwrap();
+            let send = store
+                .claim_transfer(
+                    1,
+                    crate::db::Recipient::Account(2),
+                    "ironwood",
+                    "ironwood",
+                    12_000,
+                    "legacy-key",
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                (send.id.as_str(), send.txid.as_str(), send.status.as_str()),
+                ("legacy-send", "legacy-txid", "broadcast")
+            );
+            assert_eq!(send.last_error, None);
+            assert_eq!(
+                store.prepared_transaction(&send.id).unwrap(),
+                PreparedTransaction {
+                    raw_transaction: vec![1, 2],
+                    expiry_height: 140
+                }
+            );
+            let faucet = store
+                .claim_address_faucet("tm-external", 7, "legacy-address")
+                .unwrap();
+            assert_eq!(faucet.id, "legacy-faucet");
+            assert_eq!(faucet.last_error, None);
+        }
+
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        store
+            .record_error(
+                "legacy-send",
+                "broadcast",
+                "legacy-txid",
+                "lookup unavailable",
+            )
+            .unwrap();
+        store
+            .fail_address("legacy-faucet", "treasury cannot pay")
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(&path).unwrap();
+        reopened.initialize().unwrap();
+        assert_eq!(
+            reopened
+                .activity_for_key("legacy-key")
+                .unwrap()
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("lookup unavailable")
+        );
+        let failed = reopened
+            .address_faucet_for_key("legacy-address")
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.last_error.as_deref(), Some("treasury cannot pay"));
+    }
+
+    #[test]
+    fn unresolved_intents_include_unprepared_claims_and_exclude_terminal_records() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let absent = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                1_000,
+                "absent-memo",
+                None,
+            )
+            .unwrap();
+        let empty = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                2_000,
+                "empty-memo",
+                Some(""),
+            )
+            .unwrap();
+        let text = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "transparent",
+                "ironwood",
+                3_000,
+                "text-memo",
+                Some("rent"),
+            )
+            .unwrap();
+        let faucet = store
+            .claim_faucet(3, "transparent", 4_000, "faucet")
+            .unwrap();
+        let broadcast = store
+            .claim_transfer(
+                2,
+                crate::db::Recipient::Account(1),
+                "ironwood",
+                "transparent",
+                5_000,
+                "broadcast",
+                None,
+            )
+            .unwrap();
+        store
+            .record_prepared(&broadcast.id, "broadcast-txid", b"raw", 140)
+            .unwrap();
+        let broadcast = store
+            .mark_broadcast(&broadcast.id, "broadcast-txid")
+            .unwrap();
+        let confirmed = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(3),
+                "ironwood",
+                "ironwood",
+                6_000,
+                "confirmed",
+                None,
+            )
+            .unwrap();
+        store
+            .record_prepared(&confirmed.id, "confirmed-txid", b"raw", 140)
+            .unwrap();
+        store
+            .confirm(&confirmed.id, "confirmed-txid", "block")
+            .unwrap();
+        let failed = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(4),
+                "ironwood",
+                "ironwood",
+                7_000,
+                "failed",
+                None,
+            )
+            .unwrap();
+        store.fail(&failed.id, "insufficient funds").unwrap();
+
+        let intents = store.unresolved_activities().unwrap();
+        let summary: Vec<_> = intents
+            .iter()
+            .map(|intent| {
+                (
+                    intent.activity.id.as_str(),
+                    intent.key.as_str(),
+                    intent.memo.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (absent.id.as_str(), "absent-memo", None),
+                (empty.id.as_str(), "empty-memo", Some("")),
+                (text.id.as_str(), "text-memo", Some("rent")),
+                (faucet.id.as_str(), "faucet", None),
+                (broadcast.id.as_str(), "broadcast", None),
+            ]
+        );
+        let text = &intents[2].activity;
+        assert_eq!(
+            (
+                text.kind.as_str(),
+                text.from_account,
+                text.to_account,
+                text.source_pool.as_str(),
+                text.destination_pool.as_str(),
+                text.amount_zatoshi,
+                text.txid.as_str(),
+                text.status.as_str(),
+            ),
+            (
+                "send",
+                Some(1),
+                Some(2),
+                "transparent",
+                "ironwood",
+                3_000,
+                "",
+                "preparing"
+            )
+        );
+        assert_eq!(intents[3].activity.kind, "faucet");
+        assert_eq!(intents[3].activity.from_account, None);
+        assert_eq!(intents[3].activity.destination_pool, "transparent");
+        assert_eq!(intents[4].activity, broadcast);
+        assert_eq!(
+            store
+                .unconfirmed_activities()
+                .unwrap()
+                .iter()
+                .map(|activity| activity.id.as_str())
+                .collect::<Vec<_>>(),
+            [broadcast.id.as_str()]
+        );
+
+        let preparing = store
+            .claim_address_faucet("tm-preparing", 10, "address-preparing")
+            .unwrap();
+        let prepared = store
+            .claim_address_faucet("u-prepared", 20, "address-prepared")
+            .unwrap();
+        let prepared = store
+            .record_address_prepared(&prepared.id, "address-txid", b"raw", 140)
+            .unwrap();
+        let confirmed = store
+            .claim_address_faucet("tm-confirmed", 30, "address-confirmed")
+            .unwrap();
+        store
+            .record_address_prepared(&confirmed.id, "confirmed-address-txid", b"raw", 140)
+            .unwrap();
+        store
+            .confirm_address(&confirmed.id, "confirmed-address-txid", "block")
+            .unwrap();
+        let failed = store
+            .claim_address_faucet("tm-failed", 40, "address-failed")
+            .unwrap();
+        store
+            .fail_address(&failed.id, "treasury cannot pay")
+            .unwrap();
+
+        assert_eq!(
+            store.unresolved_address_faucets().unwrap(),
+            [
+                AddressFaucetIntent {
+                    payment: preparing,
+                    key: "address-preparing".into(),
+                },
+                AddressFaucetIntent {
+                    payment: prepared,
+                    key: "address-prepared".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn payment_errors_and_failures_never_overwrite_newer_state() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "guarded",
+                None,
+            )
+            .unwrap();
+        let errored = store
+            .record_error(&claim.id, "preparing", "", "wallet is syncing")
+            .unwrap();
+        assert_eq!(errored.last_error.as_deref(), Some("wallet is syncing"));
+        let prepared = store
+            .record_prepared(&claim.id, "txid-1", b"raw", 140)
+            .unwrap();
+        assert_eq!(prepared.last_error, None);
+
+        let stale = store
+            .record_error(&claim.id, "preparing", "", "stale preparation error")
+            .unwrap();
+        assert_eq!(stale.status, "prepared");
+        assert_eq!(stale.last_error, None);
+        assert!(store.fail(&claim.id, "stale insufficient funds").is_err());
+        let current = store.activity_for_key("guarded").unwrap().unwrap();
+        assert_eq!(
+            (
+                current.status.as_str(),
+                current.txid.as_str(),
+                current.last_error
+            ),
+            ("prepared", "txid-1", None)
+        );
+
+        store
+            .record_error(&claim.id, "prepared", "txid-1", "broadcast unavailable")
+            .unwrap();
+        let broadcast = store.mark_broadcast(&claim.id, "txid-1").unwrap();
+        assert_eq!(broadcast.last_error, None);
+        store
+            .record_error(&claim.id, "broadcast", "txid-1", "auto-mine failed")
+            .unwrap();
+        let confirmed = store.confirm(&claim.id, "txid-1", "block").unwrap();
+        assert_eq!(confirmed.last_error, None);
+        let after = store
+            .record_error(&claim.id, "confirmed", "txid-1", "late error")
+            .unwrap();
+        assert_eq!(after.last_error, None);
+        assert!(store.fail(&claim.id, "late failure").is_err());
+        assert_eq!(
+            store.activity_for_key("guarded").unwrap().unwrap().status,
+            "confirmed"
+        );
+
+        let doomed = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                99_000,
+                "doomed",
+                Some(""),
+            )
+            .unwrap();
+        let failed = store.fail(&doomed.id, "insufficient funds").unwrap();
+        assert_eq!(
+            (failed.status.as_str(), failed.txid.as_str()),
+            ("failed", "")
+        );
+        assert_eq!(failed.last_error.as_deref(), Some("insufficient funds"));
+        let again = store.fail(&doomed.id, "a different reason").unwrap();
+        assert_eq!(again.last_error.as_deref(), Some("insufficient funds"));
+        store
+            .record_error(&doomed.id, "failed", "", "overwrite")
+            .unwrap();
+        assert!(
+            store
+                .record_prepared(&doomed.id, "late-txid", b"late", 140)
+                .is_err()
+        );
+        assert!(store.mark_broadcast(&doomed.id, "late-txid").is_err());
+        store.reset_for_retry(&doomed.id, "").unwrap();
+        store.discard_preparing(&doomed.id).unwrap();
+        let replay = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                99_000,
+                "doomed",
+                Some(""),
+            )
+            .unwrap();
+        assert_eq!(replay.id, doomed.id);
+        assert_eq!(replay.status, "failed");
+        assert_eq!(replay.last_error.as_deref(), Some("insufficient funds"));
+        assert!(store.prepared_transaction(&doomed.id).is_err());
+        let conflict = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                99_000,
+                "doomed",
+                None,
+            )
+            .unwrap_err();
+        assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+    }
+
+    #[test]
+    fn address_faucet_errors_and_failures_never_overwrite_newer_state() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_address_faucet("tm-external", 100, "address-guarded")
+            .unwrap();
+        store
+            .record_address_error(&claim.id, "preparing", "", "treasury is syncing")
+            .unwrap();
+        let prepared = store
+            .record_address_prepared(&claim.id, "txid-1", b"raw", 140)
+            .unwrap();
+        assert_eq!(prepared.last_error, None);
+        let stale = store
+            .record_address_error(&claim.id, "preparing", "", "stale")
+            .unwrap();
+        assert_eq!(stale.last_error, None);
+        assert!(store.fail_address(&claim.id, "stale").is_err());
+        store
+            .record_address_error(&claim.id, "prepared", "txid-1", "broadcast unavailable")
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_address_broadcast(&claim.id, "txid-1")
+                .unwrap()
+                .last_error,
+            None
+        );
+        store
+            .record_address_error(&claim.id, "broadcast", "txid-1", "auto-mine failed")
+            .unwrap();
+        let confirmed = store.confirm_address(&claim.id, "txid-1", "block").unwrap();
+        assert_eq!(confirmed.last_error, None);
+        assert_eq!(
+            store
+                .record_address_error(&claim.id, "confirmed", "txid-1", "late")
+                .unwrap()
+                .last_error,
+            None
+        );
+        assert!(store.fail_address(&claim.id, "late").is_err());
+
+        let doomed = store
+            .claim_address_faucet("tm-external", 100, "address-doomed")
+            .unwrap();
+        let failed = store
+            .fail_address(&doomed.id, "treasury cannot pay")
+            .unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            store
+                .fail_address(&doomed.id, "another reason")
+                .unwrap()
+                .last_error
+                .as_deref(),
+            Some("treasury cannot pay")
+        );
+        store
+            .record_address_error(&doomed.id, "failed", "", "overwrite")
+            .unwrap();
+        assert!(
+            store
+                .record_address_prepared(&doomed.id, "late-txid", b"late", 140)
+                .is_err()
+        );
+        store.discard_address_preparing(&doomed.id).unwrap();
+        let replay = store
+            .claim_address_faucet("tm-external", 100, "address-doomed")
+            .unwrap();
+        assert_eq!(replay, failed);
+    }
+
+    #[test]
+    fn repaired_preparation_never_replaces_a_newer_or_terminal_transaction() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let claim = store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "repair",
+                None,
+            )
+            .unwrap();
+        store
+            .record_prepared(&claim.id, "old-txid", b"old", 140)
+            .unwrap();
+        store.reset_for_retry(&claim.id, "old-txid").unwrap();
+        store
+            .record_prepared(&claim.id, "new-txid", b"new", 180)
+            .unwrap();
+
+        assert!(
+            store
+                .record_prepared(&claim.id, "old-txid", b"old", 140)
+                .is_err()
+        );
+        let current = store.activity_for_key("repair").unwrap().unwrap();
+        assert_eq!(current.txid, "new-txid");
+        assert_eq!(
+            store.prepared_transaction(&claim.id).unwrap(),
+            PreparedTransaction {
+                raw_transaction: b"new".to_vec(),
+                expiry_height: 180
+            }
+        );
+        store
+            .record_prepared(&claim.id, "new-txid", b"different bytes", 999)
+            .unwrap();
+        assert_eq!(
+            store
+                .prepared_transaction(&claim.id)
+                .unwrap()
+                .raw_transaction,
+            b"new"
+        );
+        store.confirm(&claim.id, "new-txid", "block").unwrap();
+        assert!(
+            store
+                .record_prepared(&claim.id, "other-txid", b"other", 200)
+                .is_err()
+        );
+        let confirmed = store.activity_for_key("repair").unwrap().unwrap();
+        assert_eq!(
+            (confirmed.status.as_str(), confirmed.txid.as_str()),
+            ("confirmed", "new-txid")
+        );
+
+        let address = store
+            .claim_address_faucet("tm-external", 5, "address-repair")
+            .unwrap();
+        store
+            .record_address_prepared(&address.id, "address-new", b"new", 180)
+            .unwrap();
+        assert!(
+            store
+                .record_address_prepared(&address.id, "address-old", b"old", 140)
+                .is_err()
+        );
+        store
+            .confirm_address(&address.id, "address-new", "block")
+            .unwrap();
+        assert!(
+            store
+                .record_address_prepared(&address.id, "address-other", b"other", 200)
+                .is_err()
+        );
+        let current = store
+            .address_faucet_for_key("address-repair")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (current.status.as_str(), current.txid.as_str()),
+            ("confirmed", "address-new")
+        );
+        assert_eq!(
+            store
+                .prepared_transaction(&address.id)
+                .unwrap()
+                .raw_transaction,
+            b"new"
+        );
+    }
+    #[test]
+    fn recipient_and_status_upgrades_preserve_errors_and_signed_payments_in_both_orders() {
+        for recipients_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("server.db");
+            let db = Connection::open(&path).unwrap();
+            let recipients = if recipients_first {
+                "to_account INTEGER, to_address TEXT,"
+            } else {
+                "to_account INTEGER NOT NULL,"
+            };
+            let error = if recipients_first {
+                ""
+            } else {
+                ", last_error TEXT"
+            };
+            db.execute_batch(&format!("CREATE TABLE activity (
+                id TEXT PRIMARY KEY, kind TEXT NOT NULL, from_account INTEGER,
+                {recipients} source_pool TEXT NOT NULL, destination_pool TEXT NOT NULL,
+                amount_zatoshi INTEGER NOT NULL, txid TEXT NOT NULL, block_hash TEXT,
+                status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP {error});
+                CREATE TABLE idempotency(key TEXT PRIMARY KEY, activity_id TEXT NOT NULL, memo TEXT);
+                CREATE TABLE prepared_payments(activity_id TEXT PRIMARY KEY, raw_transaction BLOB NOT NULL, expiry_height INTEGER NOT NULL);
+                INSERT INTO activity(id,kind,from_account,to_account,source_pool,destination_pool,amount_zatoshi,txid,status)
+                    VALUES('failed','send',1,2,'ironwood','ironwood',12000,'','failed'),
+                          ('signed','send',1,3,'ironwood','ironwood',13000,'original-txid','broadcast');
+                INSERT INTO idempotency VALUES('failed-key','failed',''),('signed-key','signed','memo');
+                INSERT INTO prepared_payments VALUES('signed',x'010203',140);" )).unwrap();
+            db.execute("UPDATE activity SET created_at='2025-01-02 03:04:05'", [])
+                .unwrap();
+            if recipients_first {
+                db.execute_batch("INSERT INTO activity(id,kind,from_account,to_account,to_address,source_pool,destination_pool,amount_zatoshi,txid,status,created_at)
+                    VALUES('external','send',2,NULL,'tmExternal','ironwood','transparent',14000,'','preparing','2025-02-03 04:05:06');
+                    INSERT INTO idempotency VALUES('external-key','external','');").unwrap();
+            }
+            if !recipients_first {
+                db.execute(
+                    "UPDATE activity SET last_error='original failure' WHERE id='failed'",
+                    [],
+                )
+                .unwrap();
+            }
+            drop(db);
+            for _ in 0..2 {
+                let store = Store::open(&path).unwrap();
+                store.initialize().unwrap();
+                let failed = store.activity_for_key("failed-key").unwrap().unwrap();
+                assert_eq!(failed.id, "failed");
+                assert_eq!(failed.status, "failed");
+                assert_eq!(failed.created_at, "2025-01-02 03:04:05");
+                assert_eq!(failed.to_account, Some(2));
+                assert_eq!(failed.to_address, None);
+                assert_eq!(
+                    failed.last_error.as_deref(),
+                    if recipients_first {
+                        None
+                    } else {
+                        Some("original failure")
+                    }
+                );
+                let intents = store.unresolved_activities().unwrap();
+                assert_eq!(intents.len(), if recipients_first { 2 } else { 1 });
+                assert_eq!(intents[0].activity.id, "signed");
+                assert_eq!(intents[0].activity.status, "broadcast");
+                assert_eq!(intents[0].activity.created_at, "2025-01-02 03:04:05");
+                assert_eq!(intents[0].key, "signed-key");
+                if recipients_first {
+                    let external = &intents[1];
+                    assert_eq!(external.activity.id, "external");
+                    assert_eq!(external.activity.to_account, None);
+                    assert_eq!(external.activity.to_address.as_deref(), Some("tmExternal"));
+                    assert_eq!(external.activity.created_at, "2025-02-03 04:05:06");
+                    assert_eq!(external.key, "external-key");
+                    assert_eq!(external.memo.as_deref(), Some(""));
+                    assert_eq!(external.activity.status, "preparing");
+                    assert_eq!(external.activity.txid, "");
+                    assert_eq!(external.activity.last_error, None);
+                }
+                assert_eq!(intents[0].memo.as_deref(), Some("memo"));
+                assert_eq!(intents[0].activity.txid, "original-txid");
+                assert_eq!(
+                    store.prepared_transaction("signed").unwrap(),
+                    PreparedTransaction {
+                        raw_transaction: vec![1, 2, 3],
+                        expiry_height: 140
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_external_sends_preserve_recipient_key_and_memo_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("server.db");
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        store
+            .claim_transfer(
+                1,
+                Recipient::Address("tmExternal"),
+                "ironwood",
+                "transparent",
+                12000,
+                "external-intent",
+                Some(""),
+            )
+            .unwrap();
+        let activity = store.activity_for_key("external-intent").unwrap().unwrap();
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        store.initialize().unwrap();
+        assert_eq!(
+            store.unresolved_activities().unwrap(),
+            vec![ActivityIntent {
+                activity,
+                key: "external-intent".into(),
+                memo: Some("".into())
+            }]
+        );
     }
 }
