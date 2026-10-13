@@ -408,7 +408,11 @@ pub(super) async fn exercise_recovery(
         )
         .await?;
         let counts = fixture.proxy().counts();
-        if counts.rejected > proxy_before.rejected {
+        if counts.rejected > proxy_before.rejected
+            && pending["last_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("injected auto-mine failure"))
+        {
             break (serde_json::from_value(pending)?, counts);
         }
         wait_for_recovery_poll(fault_deadline).await?;
@@ -535,9 +539,10 @@ pub(super) async fn exercise_recovery(
     let mut expected_confirmed = persisted_broadcast.clone();
     expected_confirmed.status = "confirmed".to_owned();
     expected_confirmed.block_hash = Some(expected_block_hash.clone());
+    expected_confirmed.last_error = None;
     anyhow::ensure!(
         confirmed == expected_confirmed,
-        "activity changed beyond its confirmation status and inclusion block hash"
+        "activity changed beyond its confirmation status, inclusion block hash, and cleared mining error: expected {expected_confirmed:?}, got {confirmed:?}"
     );
     assert_requested_payment_fields(&confirmed)?;
     anyhow::ensure!(
