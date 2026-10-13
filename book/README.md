@@ -24,8 +24,9 @@ derives the same accounts, and anyone who knows this project can derive them
 too. That reproducibility is the point; it is also why **nothing of value may
 ever touch an address shown by this environment.**
 
-This book documents launcher version **0.2.1**; check yours with
-`ths --version`.
+Use the [installer](getting-started.md#install-the-launcher) as the default
+setup path. The installer downloads a published release. Use the [source build instructions](development.md)
+to run the recorded source baseline.
 
 ## One experiment, several chapters
 
@@ -37,9 +38,9 @@ result through the API. Along the way, we will answer three questions:
    the wallet owns spendable balances, and SQLite records development activity.
 2. **When is it true?** A block can exist before lightwalletd indexes it, and
    the index can advance before the wallet publishes a fresh balance snapshot.
-3. **What can be retried?** A recorded payment key can resume confirmation;
-   a lost response before the key is recorded is ambiguous, and mining has no
-   retry key.
+3. **What can be retried?** The caller and operation determine which identity
+   to retain and which state to inspect after an uncertain response. [Chapter
+   6](architecture/operations.md) traces those boundaries.
 
 Those distinctions explain most surprising behavior in the dashboard.
 

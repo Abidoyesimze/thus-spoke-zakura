@@ -6,11 +6,13 @@ three services behind those endpoints do.
 
 An **instance** is one named set of Docker containers, a private Docker
 network, volumes, and host ports. The default name is `default`. Starting it
-again creates a **fresh** chain and wallet; stopping it removes its data.
+again creates a **fresh** chain and wallet after cleanup succeeds; stopping
+it requests deletion of its data. Check the command result before assuming
+cleanup completed.
 An **image** is the built template from which Docker starts a container;
 changing source files does not alter an image that already exists.
 
-![Five startup stages left to right: ths start, checking Docker and images, claiming the fixed loopback ports, starting Zakura then lightwalletd then the app, and ready. A note records that init derives the fixed seed and that a fresh chain opens near height 103. Below, Ctrl+C or any failure deletes only this instance.](images/instance-lifecycle.svg)
+![Five startup stages left to right: ths start, checking Docker and images, claiming the fixed loopback ports, starting Zakura then lightwalletd then the app, and funded readiness. HTTP serves local saved status during startup. Interruption or failure triggers bounded, instance-scoped cleanup; incomplete deletion retains lifecycle-recovery.json.](images/instance-lifecycle.svg)
 
 1. `ths` checks Docker and the required images.
 2. It removes leftovers for the selected instance name, then creates its
@@ -19,9 +21,10 @@ changing source files does not alter an image that already exists.
    Zakura Regtest configuration. Zakura starts, then lightwalletd, then the
    app.
 4. The app synchronizes its wallet and provisions Account 1. The launcher
-   prints endpoints only when the app is ready.
-5. Ctrl+C, a normal shutdown, or a partial startup failure removes that
-   instance's resources and endpoint record.
+   prints the ready line and endpoints after its app readiness probe succeeds.
+5. Ctrl+C, a termination signal, or a partial startup failure triggers cleanup
+   of that instance's resources and metadata. Check the command result;
+   failed or uncertain cleanup retains recovery metadata.
 
 ## Prepare Docker
 
@@ -48,14 +51,20 @@ ths --version
 ths doctor
 ```
 
-`ths --version` prints the launcher version. This book documents **0.2.1**.
+The unpinned command selects the latest published release. To explicitly
+request an exact release version, such as **0.3.0**, set `THS_VERSION` on
+the installer process:
 
-The installer reads three environment variables: `TSZ_INSTALL_DIR` chooses the
-destination directory (default `~/.local/bin`), `TSZ_VERSION` installs an exact
-release instead of the latest, and `TSZ_SKIP_IMAGE_PULL=1` skips the image
+```console
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/zcashlabs/thus-spoke-zakura/main/install.sh | THS_VERSION=0.3.0 sh
+```
+
+The installer reads three environment variables: `THS_INSTALL_DIR` chooses the
+destination directory (default `~/.local/bin`), `THS_VERSION` installs an exact
+release instead of the latest, and `THS_SKIP_IMAGE_PULL=1` skips the image
 download. The image pull happens **before** the binary is moved into place, so
 if Docker is not running the installer aborts with nothing installed. Start
-Docker first, or install with `TSZ_SKIP_IMAGE_PULL=1` and run `ths pull` later.
+Docker first, or install with `THS_SKIP_IMAGE_PULL=1` and run `ths pull` later.
 
 If your shell says `ths: command not found`, either the install aborted or
 `~/.local/bin` is not on `PATH`. See [troubleshooting](troubleshooting.md) for
@@ -80,9 +89,9 @@ default is ready 🌸
   P2P          127.0.0.1:18233
 ```
 
-On a warm machine that takes well under a minute. The **first** run is much
-slower, because Docker must pull about 1.7 GB of images. There is no fixed
-`sleep` interval that means the wallet is ready; wait for `default is ready`.
+There is no fixed `sleep` interval that means the wallet is ready; wait for
+`default is ready`. Startup time depends on Docker, image availability,
+reward maturity, indexing, and wallet synchronization.
 
 ## What scrolls past before that line
 
@@ -105,7 +114,7 @@ Before Account 1 can hold anything, the treasury must have a *spendable*
 mining reward, and a coinbase reward is not spendable until it has matured
 by `COINBASE_MATURITY_BLOCKS` (100) confirmations. So startup mines through
 maturity, shields a reward into the treasury, and pays Account 1 its 5
-Orchard ZEC. A newly ready instance therefore sits at height **103**, with
+Ironwood ZEC. A newly ready instance therefore sits at height **103**, with
 the wallet fully scanned to the same height. Nothing is wrong; the Network
 page just does not start at 0.
 
@@ -177,29 +186,33 @@ ths --name alice status
 ths --name alice endpoints --json
 ```
 
-Names contain 1–40 lowercase letters, digits, or internal hyphens. Each name
-gets its own chain, wallet, volumes, and cleanup. Commands without `--name`
-target `default`. The offset belongs to the `start` that created the
+Each name gets its own chain, wallet, volumes, and cleanup. The offset belongs to the `start` that created the
 instance; later commands find its ports from the instance record.
 
 ## Stop deliberately
 
 Stopping is not a crash to recover from — it is how the environment is meant
 to end. Try it on `alice`, which you do not need again. Return to the
-terminal running it and press **Ctrl+C**. The launcher deletes that
-instance's containers, volumes, chain, seed, keys, and test funds. `default`
-is untouched. If you need a result out of an instance, copy it out before
-stopping.
+terminal running it and press **Ctrl+C**. The launcher attempts to delete
+that instance's containers, volumes, chain, seed, keys, and test funds.
+Check the command result before assuming deletion completed. `default` is
+untouched. If you need a result out of an instance, copy it out before stopping.
+
+You can also run `ths --name alice stop` from another terminal. Once ready,
+the foreground launcher watches the allocated app container by ID: deletion
+by `stop` or `reset` ends that run without a second cleanup pass. A Docker
+inspection error is unknown state, not proof of deletion.
 
 If an interrupted process left resources behind, `ths --name alice reset
---force` deletes only `alice` and its volumes. This is irreversible. Never
-use Regtest addresses or keys for real ZEC, and never publish these local
-services beyond loopback.
+--force` attempts cleanup of only `alice` and its volumes. Verified deletion
+is irreversible; failed or uncertain cleanup retains recovery metadata as
+described above. Never use Regtest addresses or keys for real ZEC, and never
+publish these local services beyond loopback.
 
 **Leave `default` running.** [Chapter 4](using-the-dashboard.md) funds and
 spends on it. If you do stop it, start it again with `ths start --no-open`;
-you will get a fresh chain back at height 103 with the same five accounts,
-but every block, transaction, and balance from this run will be gone.
+after successful cleanup you will get a fresh funded chain with the same five
+accounts, but every block, transaction, and balance from this run will be gone.
 
 **What you learned:** `ths` controls an instance, not a persistent wallet.
 Data belongs to a particular run, and the ports belong to the instance's

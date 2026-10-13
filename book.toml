@@ -10,6 +10,7 @@ build-dir = "site"
 create-missing = false
 
 [output.html]
+no-section-label = true
 additional-css = ["theme/figures.css"]
 default-theme = "light"
 preferred-dark-theme = "navy"
