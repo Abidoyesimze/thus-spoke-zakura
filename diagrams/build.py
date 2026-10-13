@@ -295,36 +295,35 @@ def send_choices():
 
 
 def payment_flow():
-    d = D("payment-flow", 1000, 420, "A payment, and the gap that makes a lost response ambiguous",
-          "A send or faucet request is validated, then its idempotency key is looked up. A "
-          "recorded key returns the stored activity. A new key is built and broadcast, then "
-          "recorded, then confirmed. The broadcast happens before the record, so a crash in "
-          "between leaves a live transaction with no row.")
+    d = D("payment-flow", 1000, 420, "Save the payment before submitting it",
+          "A validated payment is durably claimed as preparing. The wallet and server save "
+          "prepared transaction bytes before broadcast, then the server checks confirmation. "
+          "Identical keys resume the saved payment; changed details or memo conflict.")
     xs, w = d.row(4)
     y, h = 92, 64
-    for x, (t, s), kind in zip(xs, [("POST /send", "or POST /faucet"),
-                                    ("Validate", "accounts, pools, key"),
-                                    ("Look up the key", "in tsz.db"),
-                                    ("Return the stored row", "nothing is built")],
-                               ["plain", "plain", "plain", "note"]):
-        d.card(x, y, w, h, t, s, kind=kind)
-    d.arrow([(xs[0] + w, y + 32), (xs[1] - 8, y + 32)])
-    d.arrow([(xs[1] + w, y + 32), (xs[2] - 8, y + 32)])
-    d.arrow([(xs[2] + w, y + 32), (xs[3] - 8, y + 32)], "recorded",
+    for x, (t, sub), kind in zip(xs, [("Payment request", "send or either faucet"),
+                                      ("Validate intent", "recipient, pools, key"),
+                                      ("Claim in ths.db", "durable preparing state"),
+                                      ("Resume saved state", "same key + same details")],
+                                 ["plain", "plain", "accent", "note"]):
+        d.card(x, y, w, h, t, sub, kind=kind)
+    for i in range(2):
+        d.arrow([(xs[i] + w, y + 32), (xs[i + 1] - 8, y + 32)])
+    d.arrow([(xs[2] + w, y + 32), (xs[3] - 8, y + 32)], "same key",
             lxy=((xs[2] + w + xs[3]) / 2, y - 12))
     bx, bw = d.row(3)
-    d.arrow([(xs[2] + w / 2, y + h), (xs[2] + w / 2, 196), (bx[0] + bw / 2, 196),
-             (bx[0] + bw / 2, 232)], "new key", lxy=(500, 188))
-    for x, (t, s) in zip(bx, [("Build + broadcast", "through lightwalletd"),
-                              ("Record in tsz.db", "txid + key, status broadcast"),
-                              ("Confirm", "mine one block if needed")]):
-        d.card(x, 240, bw, h, t, s)
-    d.arrow([(bx[0] + bw, 272), (bx[1] - 8, 272)])
-    d.arrow([(bx[1] + bw, 272), (bx[2] - 8, 272)])
-    gap_x = (bx[0] + bw + bx[1]) / 2
-    d.card(gap_x - 150, 330, 300, 50, "Ambiguous gap", "the broadcast happens first", kind="accent")
-    d.arrow([(gap_x, 304), (gap_x, 330)], cls="lead", head=False)
-    d.text(500, 400, "a missing activity row does not prove nothing was sent", "s")
+    d.arrow([(xs[2] + w / 2, y + h), (xs[2] + w / 2, 196),
+             (bx[0] + bw / 2, 196), (bx[0] + bw / 2, 232)],
+            "new key", lxy=(500, 188))
+    for x, (t, sub) in zip(bx, [("Save prepared bytes", "wallet journal + ths.db"),
+                               ("Submit saved transaction", "known txid or broadcast"),
+                               ("Check confirmation", "mine one block if needed")]):
+        d.card(x, 240, bw, h, t, sub)
+    for i in range(2):
+        d.arrow([(bx[i] + bw, 272), (bx[i + 1] - 8, 272)])
+    d.card(260, 330, 480, 50, "Changed payment or memo: HTTP 409",
+           "concurrent payment execution is serialized", kind="accent")
+    d.text(500, 400, "confirmation records inclusion; wallet settlement is a separate observation", "s")
     return d
 
 
@@ -389,24 +388,26 @@ def wallet_sync():
 
 
 def retry_decisions():
-    d = D("retry-decisions", 1000, 412, "What a lost response lets you conclude",
-          "If the call was a send or faucet you chose the idempotency key, so look at the "
-          "activity: a row with your key can be resent safely, while no row does not prove "
-          "nothing was broadcast. Mine and address-faucet take no key, so compare the chain "
-          "instead.")
-    d.card(290, 80, 420, 54, "The response never arrived", "which call was it?", kind="accent")
-    hx, hw = d.row(2, gap=32)
-    d.arrow([(500, 134), (500, 158), (hx[0] + hw / 2, 158), (hx[0] + hw / 2, 178)])
-    d.arrow([(500, 134), (500, 158), (hx[1] + hw / 2, 158), (hx[1] + hw / 2, 178)])
-    d.card(hx[0], 186, hw, 60, "send or faucet", "you chose the idempotency key")
-    d.card(hx[1], 186, hw, 60, "mine or faucet/address", "no key, nothing to replay")
-    qx, qw = d.row(4)
-    d.card(qx[0], 290, qw, 64, "Row with your key", "resend it — no second pay")
-    d.card(qx[1], 290, qw, 64, "No row", "not proof nothing was sent", kind="note")
-    d.card(hx[1], 290, hw, 64, "Compare the chain", "tip height, or the destination balance")
-    for x in (qx[0] + qw / 2, qx[1] + qw / 2, hx[1] + hw / 2):
-        d.arrow([(x, 246), (x, 282)], cls="lead", head=False)
-    d.text(500, 392, "look at GET /api/v1/activity and the chain before calling again", "s")
+    d = D("retry-decisions", 1000, 420, "Retain the caller's payment identity",
+          "After a lost payment response, direct API callers reuse their saved key, dashboard "
+          "callers resume retained payments, and CLI callers rerun the same command and instance. "
+          "A new key requests a new payment. Activity omits keys and external faucet records; "
+          "inspect txids and wallet snapshots separately.")
+    d.card(290, 76, 420, 54, "A payment response is uncertain", "which caller and result?", kind="accent")
+    xs, w = d.row(3)
+    for x, (t, sub) in zip(xs, [("API: saved key", "same request details"),
+                               ("Dashboard: Resume", "saved payment across reloads"),
+                               ("CLI: same command", "same arguments and instance")]):
+        d.card(x, 184, w, 64, t, sub)
+        d.arrow([(500, 130), (500, 154), (x + w / 2, 154), (x + w / 2, 176)])
+    for x, (t, sub), kind in zip(xs, [("Resume same intent", "same key + same details"),
+                                     ("Keep pending payment", "broadcast is not terminal"),
+                                     ("Resume saved intent", "terminal observation clears key")],
+                                ["accent", "note", "note"]):
+        d.card(x, 288, w, 64, t, sub, kind=kind)
+        d.arrow([(x + w / 2, 248), (x + w / 2, 280)])
+    d.text(500, 380, "activity omits keys and external faucets; no row is not proof nothing happened", "s")
+    d.text(500, 400, "observe chain inclusion and wallet balances separately", "s")
     return d
 
 

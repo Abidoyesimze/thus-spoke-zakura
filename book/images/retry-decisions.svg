@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 912 412" width="912" height="412" role="img" aria-label="If the call was a send or faucet you chose the idempotency key, so look at the activity: a row with your key can be resent safely, while no row does not prove nothing was broadcast. Mine and address-faucet take no key, so compare the chain instead.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 912 420" width="912" height="420" role="img" aria-label="After a lost payment response, direct API callers reuse their saved key, dashboard callers resume retained payments, and CLI callers rerun the same command and instance. A new key requests a new payment. Activity omits keys and external faucet records; inspect txids and wallet snapshots separately.">
 <style>
 svg {
   --bg: #fdfaf8;
@@ -38,29 +38,34 @@ text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
 .lead { stroke: var(--rule); stroke-width: 1; fill: none; stroke-dasharray: 2 4; }
 </style>
 <defs><marker id="ar-a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--accent)"/></marker><marker id="ar-n" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--rule)"/></marker></defs>
-<text class="t" x="48" y="46">What a lost response lets you conclude</text>
-<rect class="card-a" x="290" y="80" width="420" height="54" rx="8"/>
-<text class="l" x="500.0" y="104.0" text-anchor="middle">The response never arrived</text>
-<text class="s" x="500.0" y="122.0" text-anchor="middle">which call was it?</text>
-<path class="flow" d="M500 134 L500 158 L266.0 158 L266.0 178" marker-end="url(#ar-a)"/>
-<path class="flow" d="M500 134 L500 158 L734.0 158 L734.0 178" marker-end="url(#ar-a)"/>
-<rect class="card" x="48.0" y="186" width="436.0" height="60" rx="8"/>
-<text class="l" x="266.0" y="213.0" text-anchor="middle">send or faucet</text>
-<text class="s" x="266.0" y="231.0" text-anchor="middle">you chose the idempotency key</text>
-<rect class="card" x="516.0" y="186" width="436.0" height="60" rx="8"/>
-<text class="l" x="734.0" y="213.0" text-anchor="middle">mine or faucet/address</text>
-<text class="s" x="734.0" y="231.0" text-anchor="middle">no key, nothing to replay</text>
-<rect class="card" x="48.0" y="290" width="205.0" height="64" rx="8"/>
-<text class="l" x="150.5" y="319.0" text-anchor="middle">Row with your key</text>
-<text class="s" x="150.5" y="337.0" text-anchor="middle">resend it — no second pay</text>
-<rect class="note" x="281.0" y="290" width="205.0" height="64" rx="8"/>
-<text class="l" x="383.5" y="319.0" text-anchor="middle">No row</text>
-<text class="s" x="383.5" y="337.0" text-anchor="middle">not proof nothing was sent</text>
-<rect class="card" x="516.0" y="290" width="436.0" height="64" rx="8"/>
-<text class="l" x="734.0" y="319.0" text-anchor="middle">Compare the chain</text>
-<text class="s" x="734.0" y="337.0" text-anchor="middle">tip height, or the destination balance</text>
-<path class="lead" d="M150.5 246 L150.5 282"/>
-<path class="lead" d="M383.5 246 L383.5 282"/>
-<path class="lead" d="M734.0 246 L734.0 282"/>
-<text class="s" x="500" y="392" text-anchor="middle">look at GET /api/v1/activity and the chain before calling again</text>
+<text class="t" x="48" y="46">Retain the caller's payment identity</text>
+<rect class="card-a" x="290" y="76" width="420" height="54" rx="8"/>
+<text class="l" x="500.0" y="100.0" text-anchor="middle">A payment response is uncertain</text>
+<text class="s" x="500.0" y="118.0" text-anchor="middle">which caller and result?</text>
+<rect class="card" x="48.0" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="189.33333333333334" y="213.0" text-anchor="middle">API: saved key</text>
+<text class="s" x="189.33333333333334" y="231.0" text-anchor="middle">same request details</text>
+<path class="flow" d="M500 130 L500 154 L189.33333333333334 154 L189.33333333333334 176" marker-end="url(#ar-a)"/>
+<rect class="card" x="358.6666666666667" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="500.0" y="213.0" text-anchor="middle">Dashboard: Resume</text>
+<text class="s" x="500.0" y="231.0" text-anchor="middle">saved payment across reloads</text>
+<path class="flow" d="M500 130 L500 154 L500.0 154 L500.0 176" marker-end="url(#ar-a)"/>
+<rect class="card" x="669.3333333333334" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="810.6666666666667" y="213.0" text-anchor="middle">CLI: same command</text>
+<text class="s" x="810.6666666666667" y="231.0" text-anchor="middle">same arguments and instance</text>
+<path class="flow" d="M500 130 L500 154 L810.6666666666667 154 L810.6666666666667 176" marker-end="url(#ar-a)"/>
+<rect class="card-a" x="48.0" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="189.33333333333334" y="317.0" text-anchor="middle">Resume same intent</text>
+<text class="s" x="189.33333333333334" y="335.0" text-anchor="middle">same key + same details</text>
+<path class="flow" d="M189.33333333333334 248 L189.33333333333334 280" marker-end="url(#ar-a)"/>
+<rect class="note" x="358.6666666666667" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="500.0" y="317.0" text-anchor="middle">Keep pending payment</text>
+<text class="s" x="500.0" y="335.0" text-anchor="middle">broadcast is not terminal</text>
+<path class="flow" d="M500.0 248 L500.0 280" marker-end="url(#ar-a)"/>
+<rect class="note" x="669.3333333333334" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="810.6666666666667" y="317.0" text-anchor="middle">Resume saved intent</text>
+<text class="s" x="810.6666666666667" y="335.0" text-anchor="middle">terminal observation clears key</text>
+<path class="flow" d="M810.6666666666667 248 L810.6666666666667 280" marker-end="url(#ar-a)"/>
+<text class="s" x="500" y="380" text-anchor="middle">activity omits keys and external faucets; no row is not proof nothing happened</text>
+<text class="s" x="500" y="400" text-anchor="middle">observe chain inclusion and wallet balances separately</text>
 </svg>
