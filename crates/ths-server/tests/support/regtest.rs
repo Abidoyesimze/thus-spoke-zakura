@@ -360,6 +360,10 @@ impl RegtestStack {
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        self.start_with_funding_fault(false).await
+    }
+
+    pub async fn start_with_funding_fault(&mut self, fail_auto_mine: bool) -> Result<()> {
         ensure!(
             !self.start_attempted,
             "fixture startup may only be attempted once per owned stack"
@@ -511,6 +515,9 @@ impl RegtestStack {
 
         self.cleanup.push(CleanupResource::Proxy);
         self.proxy = Some(GenerateFaultProxy::start(self.node_url.clone()).await?);
+        if fail_auto_mine {
+            self.proxy().fail_startup_auto_mine(&self.data_dir)?;
+        }
         let api_port = select_loopback_port()?;
         self.api_url = format!("http://127.0.0.1:{api_port}");
         self.cleanup.push(CleanupResource::Server);
@@ -523,6 +530,21 @@ impl RegtestStack {
     }
 
     pub async fn restart_server(&mut self) -> Result<()> {
+        self.restart_server_without_readiness(None).await?;
+        self.wait_until_ready().await
+    }
+
+    pub async fn wait_until_ready(&mut self) -> Result<()> {
+        self.wait_for_ready_server(false).await
+    }
+
+    pub async fn restart_server_without_readiness(
+        &mut self,
+        lightwalletd_port: Option<u16>,
+    ) -> Result<()> {
+        if let Some(port) = lightwalletd_port {
+            self.lightwalletd_port = Some(port);
+        }
         let api_port = self
             .api_url
             .rsplit(':')
@@ -536,7 +558,7 @@ impl RegtestStack {
         self.server_exit_code = None;
         self.spawn_server(api_port, lightwalletd_port).await?;
         // Reopened wallets may already have a pending spend of their initial funding.
-        self.wait_for_ready_server(false).await
+        Ok(())
     }
 
     pub fn lightwalletd_port(&self) -> Result<u16> {

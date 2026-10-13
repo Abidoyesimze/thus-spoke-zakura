@@ -310,3 +310,13 @@ pub(super) fn preserve_scenario_failure<T>(scenario: Result<T>, cleanup: Result<
 }
 
 use super::{API_READ_TIMEOUT, request_json};
+
+pub(super) fn server_prepared_journal(
+    path: &std::path::Path,
+) -> Result<Vec<(String, Vec<u8>, u64)>> {
+    let db = Connection::open_with_flags(path.join("ths.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut query = db.prepare("SELECT activity_id,raw_transaction,expiry_height FROM prepared_payments ORDER BY activity_id")?;
+    Ok(query
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}

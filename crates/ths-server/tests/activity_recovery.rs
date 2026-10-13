@@ -301,3 +301,21 @@ async fn run_live_scenario(live_scenario: LiveScenario) -> Result<()> {
 #[cfg(test)]
 #[path = "scenarios/activity_recovery/tests.rs"]
 mod tests;
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn startup_funding_retry_after_auto_mine_failure_has_one_payout() -> Result<()> {
+    treasury::startup_funding_retry_after_auto_mine_failure_has_one_payout().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn startup_outage_serves_stored_status_and_recovers() -> Result<()> {
+    recovery::startup_outage_serves_stored_status_and_recovers().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn external_address_send_progresses_without_caller_replay() -> Result<()> {
+    send::external_address_send_progresses_without_caller_replay().await
+}

@@ -376,3 +376,71 @@ pub(super) async fn concurrent_identical_sends_have_one_chain_effect() -> Result
     let cleanup = fixture.shutdown().await;
     preserve_scenario_failure(scenario, cleanup)
 }
+
+pub(super) async fn external_address_send_progresses_without_caller_replay() -> Result<()> {
+    super::recovery::queued_address_send_progresses_without_replay().await?;
+    let mut reporter = super::RecoveryFailureReporter::new();
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let scenario = async {
+        fixture.start().await?;
+        reporter.phase(super::RecoveryPhase::Recovery);
+        let client = Client::new();
+        let address = super::faucet::external_faucet_test_address();
+        let key = "external-unprepared-status-only";
+        fixture.proxy().set_startup_unavailable(true)?;
+        let response = client.post(format!("{}/api/v1/send",fixture.api_url())).timeout(SEND_TIMEOUT).json(&json!({"from_account":1,"to_address":address,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":1_000_000,"idempotency_key":key,"memo":null})).send().await?;
+        anyhow::ensure!(response.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR, "pre-prepare outage did not preserve the foreground error");
+        let path = format!("/api/v1/activity?idempotency_key={key}");
+        let pending: Vec<Activity> = request_json(&client, fixture.api_url(), &path, None, API_READ_TIMEOUT).await?;
+        anyhow::ensure!(pending.len() == 1, "accepted external claim is not unique");
+        let original = &pending[0];
+        anyhow::ensure!(original.status == "preparing" && original.txid.is_empty() && original.to_account.is_none() && original.to_address.as_deref() == Some(address.as_str()), "outage did not retain the original empty-txid external intent");
+        anyhow::ensure!(super::assertions::prepared_payment(fixture.data_dir(), &original.id)?.is_none(), "pre-prepare outage journaled signed bytes");
+        fixture.interrupt_server().await?;
+        fixture.proxy().set_startup_unavailable(false)?;
+        fixture.restart_server().await?;
+        let deadline = RegtestStack::recovery_deadline();
+        let confirmed = loop {
+            let stored: Vec<Activity> = fixture.recovery_read(deadline, &path).await?;
+            anyhow::ensure!(stored.len() == 1 && stored[0].id == original.id, "background preparation replaced or duplicated the original claim");
+            let stored = stored.into_iter().next().unwrap();
+            if stored.status == "confirmed" { break stored; }
+            anyhow::ensure!(stored.status != "failed", "external progression failed: {:?}", stored.last_error);
+            anyhow::ensure!(std::time::Instant::now() < deadline, "accepted external intent did not prepare and confirm without caller replay");
+            tokio::time::sleep(super::RECOVERY_POLL_INTERVAL).await;
+        };
+        anyhow::ensure!(confirmed.from_account == Some(1) && confirmed.to_account.is_none() && confirmed.to_address.as_deref() == Some(address.as_str()) && confirmed.source_pool == "ironwood" && confirmed.destination_pool == "transparent" && confirmed.amount_zatoshi == 1_000_000, "background preparation changed persisted request fields");
+        let tx: serde_json::Value = rpc(&client, fixture.node_url(), "getrawtransaction", json!([confirmed.txid,1])).await?;
+        anyhow::ensure!(tx["confirmations"].as_u64().is_some_and(|n| n > 0) && tx["blockhash"].as_str() == confirmed.block_hash.as_deref(), "external send lacks original transaction inclusion");
+        let block: serde_json::Value = rpc(&client, fixture.node_url(), "getblockheader", json!([tx["blockhash"]])).await?;
+        let canonical: String = rpc(&client, fixture.node_url(), "getblockhash", json!([block["height"]])).await?;
+        anyhow::ensure!(tx["blockhash"].as_str() == Some(canonical.as_str()), "external send is not on the canonical chain");
+        anyhow::ensure!(tx["vout"].as_array().is_some_and(|outputs| outputs.iter().any(|output| output["valueZat"] == 1_000_000 && (output["scriptPubKey"]["address"] == address || output["scriptPubKey"]["addresses"].as_array().is_some_and(|addresses| addresses.iter().any(|value| value == &address))))), "external transaction omitted the exact transparent destination output");
+        let balance: serde_json::Value = rpc(&client, fixture.node_url(), "getaddressbalance", json!([{"addresses":[address]}])).await?;
+        anyhow::ensure!(balance["balance"] == 1_000_000, "external address received more or less than one payout");
+        let journal = super::assertions::prepared_payment(fixture.data_dir(), &original.id)?.ok_or_else(|| anyhow::anyhow!("background preparation omitted its wallet journal"))?;
+        anyhow::ensure!(journal.txid == confirmed.txid, "wallet journal txid differs from the confirmed operation");
+        let db = super::Connection::open_with_flags(fixture.data_dir().join("ths.db"), super::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let saved: (Vec<u8>,u64,Option<String>) = db.query_row("SELECT p.raw_transaction,p.expiry_height,i.memo FROM prepared_payments p JOIN idempotency i ON i.activity_id=p.activity_id WHERE i.key=?1", [key], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        anyhow::ensure!(saved.0 == journal.raw_transaction && saved.1 == journal.expiry_height && saved.2.is_none(), "server and wallet journals disagree on bytes, expiry, or memo");
+        let count: u64 = db.query_row("SELECT COUNT(*) FROM idempotency WHERE key=?1", [key], |row| row.get(0))?;
+        anyhow::ensure!(count == 1, "autonomous preparation duplicated the key");
+        let wallet = super::Connection::open_with_flags(fixture.data_dir().join("wallet.db"), super::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let reserved: u64 = wallet.query_row("SELECT COUNT(*) FROM ironwood_received_note_spends s JOIN transactions t ON t.id_tx=s.transaction_id WHERE t.raw=?1", [&journal.raw_transaction], |row| row.get(0))?;
+        anyhow::ensure!(reserved > 0, "background preparation omitted original input reservations");
+        fixture.assert_running().await?;
+        Ok(())
+    }.await;
+    let cleanup = fixture.shutdown().await;
+    if scenario.is_err() || cleanup.is_err() {
+        reporter.emit(
+            Some(&fixture),
+            if scenario.is_ok() {
+                super::FailureRoute::Cleanup
+            } else {
+                super::FailureRoute::Error
+            },
+        );
+    }
+    preserve_scenario_failure(scenario, cleanup)
+}

@@ -144,3 +144,124 @@ async fn wait_for_wallet_height(
         tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
     }
 }
+
+use super::{Connection, Context, OpenFlags, PathBuf, preserve_scenario_failure};
+
+pub(super) async fn startup_funding_retry_after_auto_mine_failure_has_one_payout() -> Result<()> {
+    let mut reporter = super::RecoveryFailureReporter::new();
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let scenario = async {
+        fixture.start_with_funding_fault(true).await?;
+        reporter.phase(super::RecoveryPhase::Recovery);
+        anyhow::ensure!(
+            fixture.proxy().counts().rejected == 1,
+            "startup fault did not execute"
+        );
+        let client = Client::new();
+        let activity: serde_json::Value = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/activity?idempotency_key=startup-account-1-ironwood-v1",
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+        anyhow::ensure!(
+            activity.as_array().is_some_and(|a| a.len() == 1),
+            "startup key does not identify exactly one payment"
+        );
+        let payment = &activity[0];
+        let original = fixture.proxy().startup_funding_snapshot()?;
+        anyhow::ensure!(
+            payment["id"] == original.id && payment["txid"] == original.txid,
+            "startup retry replaced the first signed transaction"
+        );
+        let accounts: serde_json::Value = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            Duration::from_secs(5),
+        )
+        .await?;
+        let account = accounts
+            .as_array()
+            .context("accounts response is not an array")?
+            .iter()
+            .find(|account| account["id"] == 1)
+            .context("Account 1 missing")?;
+        anyhow::ensure!(
+            account["ironwood_zatoshi"] == 500_000_000,
+            "startup retry produced an incorrect SDK account balance"
+        );
+        anyhow::ensure!(
+            payment["status"] == "confirmed"
+                && payment["amount_zatoshi"] == 500_000_000
+                && payment["to_account"] == 1,
+            "startup funding did not confirm the original amount"
+        );
+        let db = Connection::open_with_flags(
+            fixture.data_dir().join("ths.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let count: u64 = db.query_row(
+            "SELECT COUNT(*) FROM activity WHERE kind='faucet' AND to_account=1",
+            [],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(count == 1, "startup retry created another payout");
+        let raw: Vec<u8> = db.query_row(
+            "SELECT raw_transaction FROM prepared_payments WHERE activity_id=?1",
+            [payment["id"].as_str().context("missing payment id")?],
+            |r| r.get(0),
+        )?;
+        let wallet = Connection::open_with_flags(
+            fixture.data_dir().join("wallet.db"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let (txid, journal): (String, Vec<u8>) = wallet.query_row(
+            "SELECT txid,raw_transaction FROM ext_tsz_prepared_payments WHERE activity_id=?1",
+            [payment["id"].as_str().unwrap()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        anyhow::ensure!(
+            payment["txid"] == txid && raw == journal && raw == original.raw,
+            "startup retry changed signed payment identity"
+        );
+        let expiry: u64 = db.query_row(
+            "SELECT expiry_height FROM prepared_payments WHERE activity_id=?1",
+            [&original.id],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(
+            expiry == original.expiry_height,
+            "startup retry changed the original expiry height"
+        );
+        let evidence: serde_json::Value = rpc(
+            &client,
+            fixture.node_url(),
+            "getrawtransaction",
+            json!([txid, 1]),
+        )
+        .await?;
+        anyhow::ensure!(
+            evidence["confirmations"].as_u64().is_some_and(|n| n > 0)
+                && evidence["blockhash"] == payment["block_hash"],
+            "startup payment lacks chain inclusion"
+        );
+        Ok(())
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    if scenario.is_err() || cleanup.is_err() {
+        reporter.emit(
+            Some(&fixture),
+            if scenario.is_ok() {
+                super::FailureRoute::Cleanup
+            } else {
+                super::FailureRoute::Error
+            },
+        );
+    }
+    preserve_scenario_failure(scenario, cleanup)
+}

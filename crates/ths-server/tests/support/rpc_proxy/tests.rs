@@ -250,3 +250,90 @@ async fn proxy_preserves_upstream_errors_and_bounds_transport_shutdown() -> Resu
     tokio::time::timeout(Duration::from_secs(2), unavailable.shutdown()).await??;
     Ok(())
 }
+
+#[tokio::test]
+async fn startup_mining_fault_waits_for_broadcast_bytes_and_is_consumed_once() -> Result<()> {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let upstream = LocalServer::start(
+        Router::new()
+            .fallback(record_request)
+            .with_state(requests.clone()),
+    )
+    .await?;
+    let mut proxy = GenerateFaultProxy::start(upstream.url.clone()).await?;
+    let dir = tempfile::tempdir()?;
+    let db = rusqlite::Connection::open(dir.path().join("ths.db"))?;
+    db.execute_batch(
+        "CREATE TABLE activity(id TEXT,txid TEXT,status TEXT);
+        CREATE TABLE idempotency(key TEXT,activity_id TEXT);
+        CREATE TABLE prepared_payments(activity_id TEXT,raw_transaction BLOB,expiry_height INTEGER);
+        INSERT INTO activity VALUES('original','original-txid','preparing');
+        INSERT INTO idempotency VALUES('startup-account-1-ironwood-v1','original');
+        INSERT INTO prepared_payments VALUES('original',x'010203',140);",
+    )?;
+    proxy.fail_startup_auto_mine(dir.path())?;
+    let client = Client::new();
+    let generate = request("startup-mine", "generate", json!([1]));
+    let (_, before) = post_json(&client, proxy.url(), &generate).await?;
+    assert_eq!(before["result"], json!({"forwarded": true}));
+    assert!(proxy.startup_funding_snapshot().is_err());
+    db.execute("UPDATE activity SET status='broadcast'", [])?;
+    let (_, other) = post_json(
+        &client,
+        proxy.url(),
+        &request("other-mine", "generate", json!([2])),
+    )
+    .await?;
+    assert_eq!(other["result"], json!({"forwarded": true}));
+    let (_, fault) = post_json(&client, proxy.url(), &generate).await?;
+    assert_eq!(fault["error"]["code"], -28);
+    let snapshot = proxy.startup_funding_snapshot()?;
+    assert_eq!(snapshot.id, "original");
+    assert_eq!(snapshot.txid, "original-txid");
+    assert_eq!(snapshot.raw, vec![1, 2, 3]);
+    assert_eq!(snapshot.expiry_height, 140);
+    let (_, after) = post_json(&client, proxy.url(), &generate).await?;
+    assert_eq!(after["result"], json!({"forwarded": true}));
+    assert_eq!(
+        proxy.counts(),
+        GenerateCounts {
+            rejected: 1,
+            forwarded: 3
+        }
+    );
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    proxy.shutdown().await?;
+    upstream.shutdown().await
+}
+
+#[tokio::test]
+async fn startup_outage_affects_readiness_only_and_can_be_released() -> Result<()> {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let upstream = LocalServer::start(
+        Router::new()
+            .fallback(record_request)
+            .with_state(requests.clone()),
+    )
+    .await?;
+    let mut proxy = GenerateFaultProxy::start(upstream.url.clone()).await?;
+    let client = Client::new();
+    proxy.set_startup_unavailable(true)?;
+    let read = request("readiness", "getblockchaininfo", json!([]));
+    let (_, blocked) = post_json(&client, proxy.url(), &read).await?;
+    assert_eq!(blocked["error"]["code"], -28);
+    for method in ["getrawtransaction", "generate"] {
+        let (_, forwarded) = post_json(
+            &client,
+            proxy.url(),
+            &request("unrelated", method, json!([1])),
+        )
+        .await?;
+        assert_eq!(forwarded["result"], json!({"forwarded": true}));
+    }
+    proxy.set_startup_unavailable(false)?;
+    let (_, released) = post_json(&client, proxy.url(), &read).await?;
+    assert_eq!(released["result"], json!({"forwarded": true}));
+    assert_eq!(requests.lock().unwrap().len(), 3);
+    proxy.shutdown().await?;
+    upstream.shutdown().await
+}

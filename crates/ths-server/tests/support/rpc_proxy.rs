@@ -30,13 +30,32 @@ pub struct GenerateCounts {
     pub forwarded: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupPaymentSnapshot {
+    pub id: String,
+    pub txid: String,
+    pub raw: Vec<u8>,
+    pub expiry_height: u64,
+}
+
+fn startup_payment_snapshot(path: &std::path::Path) -> Result<StartupPaymentSnapshot> {
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("ths.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    Ok(db.query_row("SELECT a.id,a.txid,p.raw_transaction,p.expiry_height FROM activity a JOIN idempotency i ON i.activity_id=a.id JOIN prepared_payments p ON p.activity_id=a.id WHERE i.key='startup-account-1-ironwood-v1' AND a.status='broadcast'", [], |row| Ok(StartupPaymentSnapshot { id: row.get(0)?, txid: row.get(1)?, raw: row.get(2)?, expiry_height: row.get(3)? }))?)
+}
+
 #[derive(Default)]
 struct ProxyState {
+    startup_unavailable: bool,
     armed: bool,
     rejected: usize,
     forwarded: usize,
     hidden_transaction: Option<String>,
     hidden_lookups: usize,
+    startup_snapshot_path: Option<std::path::PathBuf>,
+    startup_snapshot: Option<StartupPaymentSnapshot>,
 }
 
 struct SharedProxy {
@@ -254,6 +273,35 @@ impl GenerateFaultProxy {
         Ok(())
     }
 
+    pub fn fail_startup_auto_mine(&self, data_dir: &std::path::Path) -> Result<()> {
+        self.fail_next_generate()?;
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot_path = Some(data_dir.to_owned());
+        Ok(())
+    }
+
+    pub fn startup_funding_snapshot(&self) -> Result<StartupPaymentSnapshot> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot
+            .clone()
+            .context("startup funding fault did not capture signed bytes")
+    }
+
+    pub fn set_startup_unavailable(&self, unavailable: bool) -> Result<()> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_unavailable = unavailable;
+        Ok(())
+    }
+
     pub fn counts(&self) -> GenerateCounts {
         let state = self
             .shared
@@ -352,6 +400,22 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
     };
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let method = payload.get("method").and_then(Value::as_str);
+    if method == Some("getblockchaininfo") {
+        let unavailable = match shared.state.lock() {
+            Ok(state) => state.startup_unavailable,
+            Err(_) => {
+                return json_rpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    id,
+                    -32603,
+                    "fixture RPC-proxy state is unavailable",
+                );
+            }
+        };
+        if unavailable {
+            return json_rpc_error(StatusCode::OK, id, -28, "injected startup outage");
+        }
+    }
     let is_generate = method == Some("generate");
     let is_fault_target = is_generate && payload.get("params") == Some(&json!([1]));
 
@@ -371,7 +435,7 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
         return json_rpc_error(StatusCode::OK, id, -5, "injected missing transaction");
     }
 
-    let rejected = {
+    let rejected_code = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(_) => {
@@ -384,15 +448,44 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
             }
         };
         if is_fault_target && state.armed {
-            state.armed = false;
-            state.rejected += 1;
-            true
+            if let Some(path) = state.startup_snapshot_path.as_ref() {
+                match startup_payment_snapshot(path) {
+                    Ok(snapshot) => {
+                        state.startup_snapshot = Some(snapshot);
+                        state.startup_snapshot_path = None;
+                        state.armed = false;
+                        state.rejected += 1;
+                        Some(-28)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::QueryReturnedNoRows)
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "capturing startup funding fault failed");
+                        return json_rpc_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            id,
+                            -32603,
+                            "startup funding snapshot failed",
+                        );
+                    }
+                }
+            } else {
+                state.armed = false;
+                state.rejected += 1;
+                Some(-32603)
+            }
         } else {
-            false
+            None
         }
     };
-    if rejected {
-        return json_rpc_error(StatusCode::OK, id, -32603, "injected auto-mine failure");
+    if let Some(code) = rejected_code {
+        return json_rpc_error(StatusCode::OK, id, code, "injected auto-mine failure");
     }
 
     if is_generate {

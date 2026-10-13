@@ -239,10 +239,20 @@ pub(super) async fn broadcast_recovers_after_auto_mine_failure() -> Result<()> {
 }
 
 pub(super) async fn queued_retry_survives_restart(external: bool) -> Result<()> {
+    queued_payment_survives_restart(external, false).await
+}
+
+pub(super) async fn queued_address_send_progresses_without_replay() -> Result<()> {
+    queued_payment_survives_restart(false, true).await
+}
+
+async fn queued_payment_survives_restart(external: bool, external_send: bool) -> Result<()> {
+    let mut reporter = super::RecoveryFailureReporter::new();
     let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
     let mut broadcast_proxy = None;
     let scenario = async {
         fixture.start().await?;
+        reporter.phase(super::RecoveryPhase::Recovery);
         broadcast_proxy = Some(QueuedBroadcastProxy::start(fixture.lightwalletd_port()?).await?);
         let proxy = broadcast_proxy.as_ref().unwrap();
         fixture.restart_with_lightwalletd(proxy.port()).await?;
@@ -251,7 +261,9 @@ pub(super) async fn queued_retry_survives_restart(external: bool) -> Result<()> 
         let one = Some(BlockHeight::from_u32(1));
         let network = LocalNetwork { overwinter: one, sapling: one, blossom: one, heartwood: one, canopy: one, nu5: one, nu6: one, nu6_1: one, nu6_2: one, nu6_3: one, nu7: None };
         let address = Address::Transparent(TransparentAddress::PublicKeyHash([43; 20])).encode(&network);
-        let (path, body) = if external {
+        let (path, body) = if external_send {
+            ("/api/v1/send", json!({"from_account":1,"to_address":address,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":1_000_000,"idempotency_key":key,"memo":null}))
+        } else if external {
             ("/api/v1/faucet/address", json!({"address": address, "amount_zatoshi": 1_000_000, "idempotency_key": key}))
         } else {
             ("/api/v1/send", json!({"from_account": 1, "to_account": 2, "source_pool": "ironwood", "destination_pool": "ironwood", "amount_zatoshi": 1_000_000, "idempotency_key": key}))
@@ -267,32 +279,61 @@ pub(super) async fn queued_retry_survives_restart(external: bool) -> Result<()> 
         fixture.proxy().hide_transaction(Some(original.txid.clone()))?;
         fixture.proxy().fail_next_generate()?;
         proxy.queue_next_broadcast();
+        if !external_send {
         let retry: serde_json::Value = request_json(&client, fixture.api_url(), path, Some(&body), SEND_TIMEOUT).await?;
         anyhow::ensure!(retry == lost, "queued retry changed the original pending response");
         proxy.assert_identical_retry()?;
         anyhow::ensure!(fixture.proxy().hidden_lookups()? > 0, "queued retry did not exercise missing transaction lookup");
         anyhow::ensure!(pending_payment_snapshot(&fixture, external, key)? == original, "queued retry changed journals or reserved inputs");
 
+        }
+
         fixture.restart_server().await?;
         anyhow::ensure!(pending_payment_snapshot(&fixture, external, key)? == original, "reopening stores changed the pending original payment");
         fixture.proxy().hide_transaction(None)?;
         let _: serde_json::Value = rpc(&client, fixture.node_url(), "generate", json!([1])).await?;
-        let confirmed: serde_json::Value = request_json(&client, fixture.api_url(), path, Some(&body), SEND_TIMEOUT).await?;
+        // The preceding phases deliberately replayed queued bytes. After restart and restore,
+        // the external faucet must finish with status reads alone before terminal replay checks.
+        let confirmed: serde_json::Value = if external || external_send {
+            let deadline = RegtestStack::recovery_deadline();
+            loop {
+                let stored: serde_json::Value = fixture.recovery_read(deadline, &format!("{}?idempotency_key={key}", if external { "/api/v1/faucet/address" } else { "/api/v1/activity" })).await?;
+                let stored = if external_send { stored[0].clone() } else { stored };
+                if stored["status"] == "confirmed" { break stored; }
+                anyhow::ensure!(Instant::now() < deadline, "external faucet did not progress under status-only observation");
+                tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+            }
+        } else {
+            request_json(&client, fixture.api_url(), path, Some(&body), SEND_TIMEOUT).await?
+        };
         anyhow::ensure!(confirmed["status"] == "confirmed" && confirmed["txid"].as_str() == Some(original.txid.as_str()), "retry did not confirm the original transaction");
         let evidence: serde_json::Value = rpc(&client, fixture.node_url(), "getrawtransaction", json!([original.txid, 1])).await?;
         anyhow::ensure!(evidence["confirmations"].as_u64().is_some_and(|n| n > 0) && evidence["blockhash"].is_string() && confirmed["block_hash"] == evidence["blockhash"], "confirmation lacks canonical transaction evidence");
         let block: serde_json::Value = rpc(&client, fixture.node_url(), "getblockheader", json!([evidence["blockhash"]])).await?;
         let canonical: String = rpc(&client, fixture.node_url(), "getblockhash", json!([block["height"]])).await?;
         anyhow::ensure!(evidence["blockhash"].as_str() == Some(canonical.as_str()), "confirmed transaction is not on the canonical chain");
+        if external_send {
+            proxy.assert_identical_broadcasts()?;
+            anyhow::ensure!(confirmed["to_account"].is_null() && confirmed["to_address"] == address, "external send lost recipient identity");
+            let journal = prepared_payment(fixture.data_dir(), &original.id)?.context("original wallet journal disappeared")?;
+            anyhow::ensure!(journal.txid == original.txid && journal.raw_transaction == original.raw && journal.expiry_height == original.expiry_height, "external confirmation changed the original wallet preparation");
+            let db = Connection::open_with_flags(fixture.data_dir().join("ths.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            let saved: (Vec<u8>, u64) = db.query_row("SELECT raw_transaction,expiry_height FROM prepared_payments WHERE activity_id=?1", [&original.id], |row| Ok((row.get(0)?,row.get(1)?)))?;
+            anyhow::ensure!(saved == (original.raw.clone(), original.expiry_height), "external confirmation changed server signed bytes or expiry");
+            let memo: Option<String> = db.query_row("SELECT memo FROM idempotency WHERE key=?1", [key], |row| row.get(0))?;
+            anyhow::ensure!(memo.is_none(), "transparent external send acquired a memo");
+        } else {
         let before: ChainInfo = rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
         let replay: serde_json::Value = request_json(&client, fixture.api_url(), path, Some(&body), SEND_TIMEOUT).await?;
         anyhow::ensure!(replay == confirmed, "confirmed replay changed the payment");
         proxy.assert_identical_retry()?;
         let after: ChainInfo = rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
         anyhow::ensure!(before.blocks == after.blocks && before.bestblockhash == after.bestblockhash, "confirmed replay mined another payment");
+
+        }
         let mempool: Vec<String> = rpc(&client, fixture.node_url(), "getrawmempool", json!([])).await?;
         anyhow::ensure!(mempool.is_empty(), "confirmed replay broadcast another transaction");
-        if external {
+        if external || external_send {
             let balance: serde_json::Value = rpc(&client, fixture.node_url(), "getaddressbalance", json!([{"addresses": [address]}])).await?;
             anyhow::ensure!(balance["balance"] == 1_000_000, "external destination did not receive exactly one payout");
         } else {
@@ -316,7 +357,18 @@ pub(super) async fn queued_retry_survives_restart(external: bool) -> Result<()> 
     } else {
         Ok(())
     };
-    preserve_scenario_failure(scenario, preserve_scenario_failure(cleanup, proxy_cleanup))
+    let cleanup = preserve_scenario_failure(cleanup, proxy_cleanup);
+    if scenario.is_err() || cleanup.is_err() {
+        reporter.emit(
+            Some(&fixture),
+            if scenario.is_ok() {
+                super::FailureRoute::Cleanup
+            } else {
+                super::FailureRoute::Error
+            },
+        );
+    }
+    preserve_scenario_failure(scenario, cleanup)
 }
 
 fn seed_preparing_payment(path: &std::path::Path, idempotency_key: &str) -> Result<String> {
@@ -527,9 +579,13 @@ pub(super) async fn exercise_recovery(
         confirmed.status == "confirmed",
         "recovered activity was not confirmed"
     );
+    // Server-owned progression may retry the failed auto-mine once while the
+    // client polls. It must not repeat the injected rejection or mine forever.
+    let recovery_counts = fixture.proxy().counts();
     anyhow::ensure!(
-        fixture.proxy().counts() == proxy_after_auto_mine,
-        "recovery polling changed proxy mining counters"
+        recovery_counts.rejected == proxy_after_auto_mine.rejected
+            && recovery_counts.forwarded <= proxy_after_auto_mine.forwarded + 1,
+        "recovery polling caused more than one auto-mine retry: {recovery_counts:?}"
     );
     let final_activities: Vec<Activity> = request_json(
         &client,
@@ -565,4 +621,99 @@ async fn wait_for_recovery_poll(deadline: Instant) -> Result<()> {
     );
     tokio::time::sleep(remaining.min(RECOVERY_POLL_INTERVAL)).await;
     Ok(())
+}
+
+pub(super) async fn startup_outage_serves_stored_status_and_recovers() -> Result<()> {
+    let mut reporter = super::RecoveryFailureReporter::new();
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let scenario = async {
+        fixture.start().await?;
+        reporter.phase(super::RecoveryPhase::Recovery);
+        let real_lightwalletd = fixture.lightwalletd_port()?;
+        let client = Client::new();
+        let address = super::faucet::external_faucet_test_address();
+        let external_key = "outage-stored-external";
+        let external: serde_json::Value = request_json(&client, fixture.api_url(), "/api/v1/faucet/address", Some(&json!({"address":address,"amount_zatoshi":1_000_000,"idempotency_key":external_key})), SEND_TIMEOUT).await?;
+        anyhow::ensure!(external["status"] == "confirmed", "external fixture payment did not settle");
+        let internal_path = "/api/v1/activity?idempotency_key=startup-account-1-ironwood-v1";
+        let external_path = format!("/api/v1/faucet/address?idempotency_key={external_key}");
+        let internal: serde_json::Value = request_json(&client, fixture.api_url(), internal_path, None, API_READ_TIMEOUT).await?;
+        let balances: serde_json::Value = request_json(&client, fixture.api_url(), "/api/v1/accounts", None, API_READ_TIMEOUT).await?;
+        let wallet_before = prepared_payment_journal(fixture.data_dir())?;
+        let server_before = super::assertions::server_prepared_journal(fixture.data_dir())?;
+        let constructed_before = constructed_transactions(fixture.data_dir())?;
+        let counts = fixture.proxy().counts();
+        let tip: ChainInfo = rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+        fixture.interrupt_server().await?;
+        fixture.proxy().set_startup_unavailable(true)?;
+        fixture.restart_server_without_readiness(None).await?;
+        let started = Instant::now();
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            match fixture.recovery_read::<serde_json::Value>(deadline, internal_path).await {
+                Ok(stored) => {
+                    anyhow::ensure!(stored == internal, "outage changed stored internal status");
+                    let stored: serde_json::Value = fixture.recovery_read(deadline, &external_path).await?;
+                    anyhow::ensure!(stored == external, "outage changed stored external status");
+                    let health = client.get(format!("{}/api/v1/health",fixture.api_url())).timeout(API_READ_TIMEOUT).send().await?;
+                    anyhow::ensure!(health.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE, "startup outage reported healthy");
+                    let mutation = client.post(format!("{}/api/v1/send",fixture.api_url())).timeout(API_READ_TIMEOUT).json(&json!({"from_account":1,"to_account":2,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":1_000_000,"idempotency_key":"outage-must-not-claim"})).send().await?;
+                    anyhow::ensure!(mutation.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE, "startup outage admitted a mutation");
+                    if started.elapsed() > Duration::from_secs(122) { break; }
+                }
+                Err(error) if support::is_retryable_read_transport(&error) => {}
+                Err(error) => return Err(error),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stored outage observation exceeded its deadline");
+            tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+        }
+        fixture.assert_running().await?;
+        anyhow::ensure!(super::assertions::server_prepared_journal(fixture.data_dir())? == server_before, "outage changed server prepared bytes or expiry");
+        anyhow::ensure!(prepared_payment_journal(fixture.data_dir())? == wallet_before && constructed_transactions(fixture.data_dir())? == constructed_before, "outage changed wallet journal or constructed transactions");
+        let db = Connection::open_with_flags(fixture.data_dir().join("ths.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let claims: u64 = db.query_row("SELECT COUNT(*) FROM idempotency WHERE key='outage-must-not-claim'", [], |row| row.get(0))?;
+        anyhow::ensure!(claims == 0, "startup mutation created a claim");
+        anyhow::ensure!(fixture.proxy().counts() == counts, "startup outage broadcast or mined");
+        let current: ChainInfo = rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+        anyhow::ensure!(current.blocks == tip.blocks && current.bestblockhash == tip.bestblockhash, "outage moved the real chain");
+        fixture.proxy().set_startup_unavailable(false)?;
+        fixture.wait_until_ready().await?;
+        let recovered: serde_json::Value = request_json(&client, fixture.api_url(), "/api/v1/accounts", None, API_READ_TIMEOUT).await?;
+        anyhow::ensure!(recovered == balances, "recovery changed SDK balances");
+        let unavailable = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let unavailable_port = unavailable.local_addr()?.port();
+        drop(unavailable);
+        fixture.restart_server_without_readiness(Some(unavailable_port)).await?;
+        let deadline = RegtestStack::recovery_deadline();
+        loop {
+            match fixture.recovery_read::<serde_json::Value>(deadline, &external_path).await {
+                Ok(stored) => { anyhow::ensure!(stored == external, "unavailable lightwalletd changed stored status"); break; }
+                Err(error) if support::is_retryable_read_transport(&error) => {}
+                Err(error) => return Err(error),
+            }
+            anyhow::ensure!(Instant::now() < deadline, "stored status required lightwalletd");
+            tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+        }
+        let health = client.get(format!("{}/api/v1/health",fixture.api_url())).timeout(API_READ_TIMEOUT).send().await?;
+        anyhow::ensure!(health.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE, "unavailable lightwalletd reported healthy");
+        fixture.restart_server_without_readiness(Some(real_lightwalletd)).await?;
+        fixture.wait_until_ready().await?;
+        let restored: serde_json::Value = request_json(&client, fixture.api_url(), internal_path, None, API_READ_TIMEOUT).await?;
+        anyhow::ensure!(restored == internal, "dependency recovery replaced the original operation");
+        anyhow::ensure!(prepared_payment_journal(fixture.data_dir())? == wallet_before, "dependency recovery replaced original signed bytes");
+        anyhow::ensure!(super::assertions::server_prepared_journal(fixture.data_dir())? == server_before, "recovery changed server prepared bytes or expiry");
+        Ok(())
+    }.await;
+    let cleanup = fixture.shutdown().await;
+    if scenario.is_err() || cleanup.is_err() {
+        reporter.emit(
+            Some(&fixture),
+            if scenario.is_ok() {
+                super::FailureRoute::Cleanup
+            } else {
+                super::FailureRoute::Error
+            },
+        );
+    }
+    preserve_scenario_failure(scenario, cleanup)
 }

@@ -358,7 +358,7 @@ async fn address_faucet_request(
     .await
 }
 
-fn external_faucet_test_address() -> String {
+pub(super) fn external_faucet_test_address() -> String {
     use zcash_keys::address::Address;
     use zcash_protocol::{consensus::BlockHeight, local_consensus::LocalNetwork};
     let one = Some(BlockHeight::from_u32(1));
