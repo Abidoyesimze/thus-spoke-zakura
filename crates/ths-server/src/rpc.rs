@@ -156,6 +156,7 @@ impl NodeRpc {
             Err(error) => Err(error),
         }
     }
+    #[cfg(test)]
     pub async fn transaction_known(&self, txid: &str) -> Result<bool> {
         Ok(self.lookup_transaction(txid).await?.is_some())
     }

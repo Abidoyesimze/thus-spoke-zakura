@@ -220,13 +220,14 @@ where
 }
 
 async fn start_and_sync(state: api::AppState) -> Result<()> {
+    let already_provisioned = api::initial_balance_provisioned(&state)?;
     // Network stages have their own deadlines. Await provisioning to completion
     // so its payment guards remain owned while a wallet worker is running.
     retry_startup(|| async {
         api::dependencies_ready(&state)
             .await
             .context("waiting for startup dependencies")?;
-        api::provision_initial_balance(&state)
+        api::provision_initial_balance_with_history(&state, already_provisioned)
             .await
             .context("provisioning Account 1 with 5 Ironwood ZEC")
     })

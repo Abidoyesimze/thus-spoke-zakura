@@ -147,6 +147,11 @@ impl QueuedBroadcastProxy {
         self.shared.broadcasts.lock().unwrap().queued = true;
     }
 
+    pub fn broadcast_counts(&self) -> (usize, usize) {
+        let state = self.shared.broadcasts.lock().unwrap();
+        (state.requests.len(), state.queued_responses)
+    }
+
     pub fn assert_identical_retry(&self) -> Result<()> {
         let state = self.shared.broadcasts.lock().unwrap();
         anyhow::ensure!(
