@@ -21,6 +21,87 @@ fn responses_decode_or_report_their_status_and_body() {
 }
 
 #[test]
+fn activity_output_distinguishes_routes_and_hides_the_treasury() {
+    let activity: Vec<serde_json::Value> = serde_json::from_str(
+        r#"[
+            {"id":"f","kind":"faucet","from_account":6,"to_account":1,"to_address":null,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":125000000,"txid":"faucet-tx","block_hash":"faucet-block","status":"confirmed","created_at":"2026-10-12 10:30:00","last_error":null},
+            {"id":"s","kind":"send","from_account":1,"to_account":2,"to_address":null,"source_pool":"transparent","destination_pool":"ironwood","amount_zatoshi":50000000,"txid":"shield-tx","block_hash":null,"status":"broadcast","created_at":"2026-10-12 10:31:00","last_error":null},
+            {"id":"u","kind":"send","from_account":2,"to_account":3,"to_address":null,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":25000000,"txid":"unshield-tx","block_hash":null,"status":"preparing","created_at":"2026-10-12 10:32:00","last_error":"wallet is still syncing"},
+            {"id":"e","kind":"send","from_account":4,"to_account":null,"to_address":"uregtest1external","source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":10000000,"txid":"","block_hash":null,"status":"preparing","created_at":"2026-10-12 10:33:00","last_error":null}
+        ]"#,
+    )
+    .unwrap();
+
+    let output = activity_lines(&activity).unwrap();
+    for expected in [
+        "faucet  confirmed  1.25 ZEC",
+        "faucet (ironwood) -> account 1 (ironwood)",
+        "shield  broadcast  0.5 ZEC",
+        "unshield  preparing  0.25 ZEC",
+        "account 4 (ironwood) -> uregtest1external (ironwood)",
+        "Transaction: faucet-tx",
+        "Confirmed in: faucet-block",
+        "Error: wallet is still syncing",
+        "Created: 2026-10-12 10:30:00",
+    ] {
+        assert!(
+            output.contains(expected),
+            "missing `{expected}` from {output}"
+        );
+    }
+    assert!(!output.contains("account 6"));
+    assert!(!output.contains("Transaction: \n"));
+}
+
+#[test]
+fn activity_output_handles_empty_history_and_preserves_json_fields() {
+    assert_eq!(activity_lines(&[]).unwrap(), "No wallet activity yet.");
+
+    let activity = vec![serde_json::json!({
+        "id": "a",
+        "kind": "send",
+        "from_account": 1,
+        "to_account": null,
+        "to_address": "uregtest1external",
+        "source_pool": "ironwood",
+        "destination_pool": "ironwood",
+        "amount_zatoshi": 10,
+        "txid": "",
+        "block_hash": null,
+        "status": "preparing",
+        "created_at": "2026-10-12 10:30:00",
+        "last_error": "wallet is still syncing",
+        "future_server_field": {"kept": true},
+    })];
+
+    let output = render_activity_history(&activity, true).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+        serde_json::Value::Array(activity)
+    );
+}
+
+#[test]
+fn activity_history_forwards_only_explicit_limits() {
+    for (limit, expected_request) in [
+        (None, "GET /api/v1/activity HTTP/1.1"),
+        (Some(20), "GET /api/v1/activity?limit=20 HTTP/1.1"),
+    ] {
+        let (url, requests) = serve(vec![("200 OK", "[]")]);
+        let activity = activity_history(
+            &url,
+            &reqwest::blocking::Client::new(),
+            &name("alpha"),
+            limit,
+        )
+        .unwrap();
+
+        assert!(activity.is_empty());
+        assert_eq!(requests.recv().unwrap().0, expected_request);
+    }
+}
+
+#[test]
 fn wallet_faucet_keeps_funding_after_a_failed_account_and_keeps_its_keys() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Runtime {
