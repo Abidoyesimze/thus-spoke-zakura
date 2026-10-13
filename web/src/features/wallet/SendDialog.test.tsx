@@ -355,7 +355,7 @@ describe('SendDialog', () => {
   );
 
   it.each(['absent', 'retained', 'unavailable'] as const)(
-    'releases a rejection only after proving its server record absent (lookup: %s)',
+    'keeps a rejected request until the user acts (lookup: %s)',
     async (lookup) => {
       fetchMock.mockImplementation((input, init) => {
         if (requestUrl(input).endsWith('/send')) {
@@ -375,31 +375,16 @@ describe('SendDialog', () => {
       });
       renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
       await userEvent.click(screen.getByRole('button', { name: 'Send ZEC' }));
-      expect(
-        await screen.findByText(
-          lookup === 'unavailable' ? 'Payment not confirmed' : 'Payment rejected',
-        ),
-      ).toBeInTheDocument();
+      expect(await screen.findByText('Payment rejected')).toBeInTheDocument();
       const first = body(fetchMock).idempotency_key;
       const name = 'ths:send:[1,2,"ironwood","ironwood","100000000",null]';
-      if (lookup === 'absent') {
-        expect(localStorage.length).toBe(0);
-        expect(screen.queryByRole('button', { name: 'View payment' })).not.toBeInTheDocument();
-        await waitFor(() =>
-          expect(screen.queryByText(/Payment outcome unknown/)).not.toBeInTheDocument(),
-        );
-      } else {
-        expect(localStorage.getItem(name)).toBe(first);
-      }
+      expect(localStorage.getItem(name)).toBe(first);
+      expect(screen.getByRole('button', { name: 'View payment' })).toBeInTheDocument();
       fetchMock.mockImplementation(sendImpl(QUOTE));
-      await userEvent.click(
-        screen.getByRole('button', {
-          name: lookup === 'absent' ? 'Send ZEC' : 'Resume payment',
-        }),
-      );
+      await userEvent.click(screen.getByRole('button', { name: 'Resume payment' }));
       await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(2));
       const next = requestBody(sendCalls(fetchMock)[1]?.[1]).idempotency_key;
-      expect(next === first).toBe(lookup !== 'absent');
+      expect(next).toBe(first);
     },
   );
 

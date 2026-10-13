@@ -277,5 +277,12 @@ export function useRetainedPayments(kind: PaymentKind) {
       ),
     }));
   }, []);
-  return { ...snapshot, show, dismissKey };
+  const forgetKey = useCallback((key: string) => {
+    setSnapshot((previous) => ({
+      ...previous,
+      retained: previous.retained.filter((item) => item.key !== key),
+      displayed: previous.displayed.filter((item) => item.key !== key),
+    }));
+  }, []);
+  return { ...snapshot, show, dismissKey, forgetKey };
 }

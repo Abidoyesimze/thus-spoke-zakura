@@ -4,7 +4,6 @@ import {
   api,
   errorMessage,
   idempotencyKey,
-  isPaymentRejection,
   type Activity,
   type MiningJob,
   type PaymentRequest,
@@ -71,7 +70,6 @@ type PaymentCallbacks<T> = {
 };
 type PaymentLifecycle = {
   onRetained: (identity: PaymentIdentity) => void;
-  onRejected: (identity: PaymentIdentity) => void;
   onError: (
     error: Error,
     variables: SendVariables | FaucetVariables,
@@ -115,20 +113,8 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
       setPendingKey(identity.key);
       // Publish before POST: an immediate terminal response can release storage.
       lifecycle?.onRetained(identity);
-      try {
-        const activity = await post(variables, identity.key);
-        return { activity, key: identity.key };
-      } catch (error) {
-        // An expired wallet journal can preserve the claim even after a
-        // rejected proposal. Release only when a keyed lookup proves it absent;
-        // a lookup failure must leave the identity available for recovery.
-        if (isPaymentRejection(error) && !(await api.payment(identity.key))) {
-          await clearPayment(identity, ownedKeys.current);
-          lifecycle?.onRejected(identity);
-          submission.key = undefined;
-        }
-        throw error;
-      }
+      const activity = await post(variables, identity.key);
+      return { activity, key: identity.key };
     },
     retry: false,
     onError: (error, submission) => lifecycle?.onError(error, submission.variables, submission.key),
