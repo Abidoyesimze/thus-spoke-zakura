@@ -142,6 +142,12 @@ Transparent outputs cannot carry a memo, so the field is disabled for them.
 
 ![Send ZEC between development accounts](book/images/send.png)
 
+The Send dialog also accepts a Regtest address or a single-payment ZIP-321 URI.
+Apply an edited URI, or clear it, before sending. Wallet's **Request** button
+creates a copyable URI and QR code for a development account without moving
+funds. See the book's [payment request walkthrough](https://amiabix.github.io/thus-spoke-zakura-book/using-the-dashboard.html#payment-request)
+and [API reference](https://amiabix.github.io/thus-spoke-zakura-book/connect-an-app.html#the-rest-of-the-api-surface).
+
 The same transfer from a terminal:
 
 ```console

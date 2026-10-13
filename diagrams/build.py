@@ -139,9 +139,9 @@ class D:
 def instance_lifecycle():
     d = D("instance-lifecycle", 1000, 412, "Starting an instance, and throwing it away",
           "Five startup stages left to right: ths start, checking Docker and images, claiming the "
-          "fixed loopback ports, starting Zakura then lightwalletd then the app, and ready. A note "
-          "records that a fresh chain opens near height 103. Below, Ctrl+C or any failure deletes "
-          "only this instance.")
+          "fixed loopback ports, starting Zakura then lightwalletd then the app, and funded readiness. "
+          "HTTP serves local saved status during startup. Interruption or failure triggers bounded, "
+          "instance-scoped cleanup; incomplete deletion retains lifecycle-recovery.json.")
     xs, w = d.row(5, gap=24)
     y, h = 96, 64
     for x, (t, s) in zip(xs, [("ths start", "--name, --port-offset"), ("Check Docker", "all three images"),
@@ -150,14 +150,14 @@ def instance_lifecycle():
         d.card(x, y, w, h, t, s, kind="accent" if t == "Ready" else "plain")
     for a, b in zip(xs, xs[1:]):
         d.arrow([(a + w, y + h / 2), (b - 8, y + h / 2)])
-    d.card(516, 202, 436, 54, "The chain opens near height 103, not 1",
-           "coinbase maturity first, then Account 1 is funded", kind="note")
+    d.card(516, 202, 436, 54, "HTTP opens before funded readiness",
+           "dependencies + confirmed Account 1 funding", kind="note")
     for x in (xs[3] + w / 2, xs[4] + w / 2):
         d.arrow([(x, y + h), (x, 202)], cls="lead", head=False)
     b2x, b2w = d.row(2, gap=32)[0], d.row(2, gap=32)[1]
-    d.card(b2x[0], 304, b2w, 64, "Ctrl+C, or any failure", "at any stage above")
-    d.card(b2x[1], 304, b2w, 64, "Deletes this instance only",
-           "its containers, its four volumes, its network")
+    d.card(b2x[0], 304, b2w, 64, "Interrupt, fail, or external stop", "at any stage above")
+    d.card(b2x[1], 304, b2w, 64, "Bounded instance cleanup",
+           "retain recovery metadata if uncertain")
     d.arrow([(b2x[0] + b2w, 336), (b2x[1] - 8, 336)])
     d.arrow([(xs[2] + w / 2, y + h), (xs[2] + w / 2, 276), (b2x[0] + 80, 276), (b2x[0] + 80, 296)],
             cls="lead", head=False)
@@ -177,16 +177,16 @@ def architecture_topology():
     d.text(500, 220, "every published port binds 127.0.0.1 only", "s")
     for x in (xs[0] + w / 2, xs[2] + w / 2):
         d.arrow([(x, 188), (x, 236)], cls="lead", head=False)
-    d.zone(48, 248, 904, 152, "PRIVATE DOCKER NETWORK  tsz-&lt;name&gt;")
+    d.zone(48, 248, 904, 152, "PRIVATE DOCKER NETWORK  ths-&lt;name&gt;")
     for x, t, s in zip(xs, ["app", "lightwalletd", "zakura"],
-                       ["tsz-server + React · :8080", "compact blocks · :9067", "Regtest node · :18232"]):
+                       ["ths-server + React · :8080", "compact blocks · :9067", "Regtest node · :18232"]):
         d.card(x, 284, w, 64, t, s, kind="accent" if t == "app" else "plain")
     d.arrow([(xs[0] + w, 316), (xs[1] - 8, 316)])
     d.arrow([(xs[1] + w, 316), (xs[2] - 8, 316)])
     vx, vw = d.row(4, gap=20)
     d.text(500, 428, "VOLUMES — DELETED WITH THE INSTANCE", "k")
     for x, t, s in zip(vx, ["wallet", "lightwalletd", "chain", "config"],
-                       ["tsz.db + wallet.db", "block cache", "Zakura state", "zakurad.toml"]):
+                       ["ths.db + wallet.db", "block cache", "Zakura state", "zakurad.toml"]):
         d.card(x, 444, vw, 52, t, s, kind="note")
     return d
 
@@ -195,7 +195,8 @@ def state_ownership():
     d = D("state-ownership", 1000, 372, "One change, and who owns each answer",
           "The chain flows left to right from Zakura through lightwalletd's index into the server "
           "wallet's scan, which publishes an account snapshot the dashboard reads. SQLite activity "
-          "is a separate path, written when the server sends rather than when it scans.")
+          "is a separate path: a durable intent is claimed before preparation, and saved bytes "
+          "precede broadcast. Activity is not a balance ledger and exposes no request key.")
     xs, w = d.row(5, gap=24)
     y, h = 104, 68
     for x, (t, s) in zip(xs, [("Zakura", "chain, tip hash"), ("lightwalletd", "compact index"),
@@ -205,8 +206,8 @@ def state_ownership():
     for a, b, lab in zip(xs, xs[1:], ["blocks", "compact blocks", "canonical check", "/api/v1/accounts"]):
         d.arrow([(a + w, y + h / 2), (b - 8, y + h / 2)], lab, lxy=((a + w + b) / 2, y - 12))
     hx, hw = d.row(2, gap=32)
-    d.card(hx[0], 250, hw, 56, "tsz.db activity", "txid + key, written on send")
-    d.card(hx[1], 250, hw, 56, "GET /api/v1/activity", "what this server did")
+    d.card(hx[0], 250, hw, 56, "ths.db activity", "claim, saved txid, status; no key in API")
+    d.card(hx[1], 250, hw, 56, "GET /api/v1/activity", "stored payment observations")
     d.arrow([(hx[0] + hw, 278), (hx[1] - 8, 278)], cls="thin")
     d.text(500, 340, "a separate path — activity is not a balance ledger", "s")
     return d
@@ -215,12 +216,12 @@ def state_ownership():
 def account_pools():
     d = D("account-pools", 1000, 468, "Where faucet money comes from",
           "Mining pays every block reward to hidden Account 6's transparent balance; shielding a "
-          "matured reward moves it to Account 6's Orchard balance, which is the pool every faucet "
+          "matured reward moves it to Account 6's Ironwood balance, which is the pool every faucet "
           "payment spends from into accounts 1 to 5.")
     d.card(48, 80, 904, 48, "One fixed development seed derives all six accounts", kind="note")
     for y, t, s in [(160, "Mining a block", "zakurad.toml names the miner"),
                     (262, "Account 6 · transparent", "every coinbase reward"),
-                    (364, "Account 6 · Orchard", "the faucet's spending pool")]:
+                    (364, "Account 6 · Ironwood", "the faucet's spending pool")]:
         d.card(48, y, 300, 62, t, s)
     d.arrow([(198, 222), (198, 254)], "reward")
     d.arrow([(198, 324), (198, 356)], "shield at 100 confs")
@@ -228,9 +229,9 @@ def account_pools():
     ax = [412, 596, 780]
     d.card(ax[0], 184, 156, 58, "Account 1", "opens with 5 ZEC", kind="accent")
     for i, x in enumerate(ax[1:]):
-        d.card(x, 184, 156, 58, f"Account {i + 2}", "transparent | Orchard")
+        d.card(x, 184, 156, 58, f"Account {i + 2}", "transparent | Ironwood")
     for i, x in enumerate(ax[:2]):
-        d.card(x, 266, 156, 58, f"Account {i + 4}", "transparent | Orchard")
+        d.card(x, 266, 156, 58, f"Account {i + 4}", "transparent | Ironwood")
     d.arrow([(348, 395), (674, 395), (674, 352)], "faucet", lxy=(511, 385))
     d.text(500, 450, "Account 6 never appears in /api/v1/accounts or any displayed balance", "s")
     return d
@@ -238,15 +239,15 @@ def account_pools():
 
 def treasury_funding():
     d = D("treasury-funding", 1000, 392, "A faucet payment, and the detour when funds are short",
-          "A faucet request proposes a payment from the treasury's Orchard pool. With enough "
-          "spendable funds it broadcasts, records and confirms. Otherwise it mines for maturity, "
+          "A faucet request proposes a payment from the treasury's Ironwood pool. The server durably claims "
+          "the intent before SDK work and saves prepared bytes before broadcast and confirmation. If spendable funds are insufficient, it mines for maturity, "
           "discovers and shields a reward, and retries the proposal.")
     xs, w = d.row(4)
     y, h = 92, 64
-    for x, (t, s) in zip(xs, [("Faucet request", "account, pool, amount"),
+    for x, (t, s) in zip(xs, [("Claim faucet intent", "durable preparing state"),
                               ("Propose from treasury", "the SDK decides"),
-                              ("Broadcast", "through lightwalletd"),
-                              ("Record + confirm", "txid, then a block")]):
+                              ("Save + broadcast", "prepared bytes first"),
+                              ("Check confirmation", "saved txid, then a block")]):
         d.card(x, y, w, h, t, s)
     d.arrow([(xs[0] + w, y + 32), (xs[1] - 8, y + 32)])
     d.arrow([(xs[1] + w, y + 32), (xs[2] - 8, y + 32)], "enough funds",
@@ -255,12 +256,12 @@ def treasury_funding():
     bx, bw = d.row(3)
     for x, (t, s) in zip(bx, [("Mine for maturity", "100 confirmations"),
                               ("Discover the reward", "match the coinbase output"),
-                              ("Shield it", "into the treasury's Orchard")]):
+                              ("Shield it", "into the treasury's Ironwood")]):
         d.card(x, 244, bw, h, t, s)
     d.arrow([(bx[0] + bw, 276), (bx[1] - 8, 276)])
     d.arrow([(bx[1] + bw, 276), (bx[2] - 8, 276)])
     d.arrow([(xs[1] + 60, y + h), (xs[1] + 60, 202), (bx[0] + bw / 2, 202), (bx[0] + bw / 2, 236)],
-            "insufficient spendable Orchard funds", lxy=(360, 194))
+            "insufficient spendable Ironwood funds", lxy=(360, 194))
     d.arrow([(bx[2] + bw / 2, 244), (bx[2] + bw / 2, 218), (xs[1] + w - 60, 218),
              (xs[1] + w - 60, y + h + 6)], "retry the proposal", lxy=(700, 210))
     d.text(500, 372, "so one faucet call can move the chain by more than one block", "s")
@@ -271,22 +272,22 @@ def send_choices():
     d = D("send-choices", 940, 372, "One send, two account + pool pairs",
           "A send picks a source account and pool on the left and a destination account and pool "
           "on the right, with the amount flowing between the pools. Three notes: transparent "
-          "change returns as an Orchard note, the fee leaves the source on top of the amount, and "
-          "a memo needs an Orchard destination.")
+          "change returns as an Ironwood note, the fee leaves the source on top of the amount, and "
+          "a memo needs an Ironwood destination.")
     d.text(48, 74, "SOURCE", "k", "start")
     d.text(668, 74, "DESTINATION", "k", "start")
     d.card(48, 88, 224, 56, "Source account", "one of 1–5")
     d.card(668, 88, 224, 56, "Destination account", "one of 1–5")
     d.arrow([(272, 116), (404, 116)], cls="thin", head=False)
     d.arrow([(536, 116), (668, 116)], cls="thin", head=False)
-    d.text(470, 120, "must differ", "s")
-    d.card(48, 174, 224, 56, "Source pool", "transparent · orchard")
-    d.card(668, 174, 224, 56, "Destination pool", "orchard · transparent")
+    d.text(470, 120, "account or pool differs", "s")
+    d.card(48, 174, 224, 56, "Source pool", "transparent · ironwood")
+    d.card(668, 174, 224, 56, "Destination pool", "ironwood · transparent")
     d.arrow([(272, 202), (658, 202)])
     d.text(470, 190, "amount in zatoshi", "a")
-    for x, t, s in [(48, "Transparent change", "returns as Orchard"),
+    for x, t, s in [(48, "Transparent change", "returns as Ironwood"),
                     (358, "Fee leaves the source", "/send/quote has the max"),
-                    (668, "Memo", "Orchard destination only")]:
+                    (668, "Memo", "Ironwood destination only")]:
         d.card(x, 290, 224, 50, t, s, kind="note")
     d.arrow([(160, 230), (160, 290)], cls="lead", head=False)
     d.arrow([(470, 206), (470, 290)], cls="lead", head=False)

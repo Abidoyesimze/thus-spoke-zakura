@@ -9,7 +9,7 @@ and as markdown for anything that would otherwise have to scrape the HTML:
 
     getting-started.html   the page
     getting-started.md     the same page, no navigation or theme chrome
-    book.md                every chapter concatenated, one fetch, ~21k tokens
+    book.md                every chapter concatenated, one fetch
     llms.txt               an index of the above, per https://llmstxt.org/
 
 Output is deterministic: no timestamps, so a rebuild that changes nothing
@@ -43,11 +43,11 @@ PAGES = {
     "architecture/overview": ("2. Components and state",
                               "Three containers, four volumes, and which one owns each answer"),
     "accounts-and-balances": ("3. Accounts and balances",
-                              "Transparent and Orchard pools, and where faucet money comes from"),
+                              "Transparent and Ironwood pools, authoritative snapshots, and treasury funding"),
     "using-the-dashboard": ("4. Fund and send",
-                            "Fund an account and send between pools, from the dashboard or the CLI"),
+                            "Fund, send, and generate ZIP-321 requests from the dashboard or CLI"),
     "mining-and-sync": ("5. Mining and wallet sync",
-                        "Mine a block and follow it from the node into the wallet snapshot"),
+                        "Server-owned mining jobs, uncertain retries, and canonical wallet settlement"),
     "architecture/operations": ("6. Uncertain operations",
                                 "Idempotency keys, what an HTTP response proves, and what a lost one does not"),
     "connect-an-app": ("7. Connect your application",
