@@ -9,7 +9,7 @@ data it wants**, then connect to that owner's local interface.
 1. Use the **dashboard HTTP API** when your program needs user accounts,
    reconciled balances, activity, or the server's wallet sync status.
 2. Use **Zakura JSON-RPC** for the node tip, blocks, raw transactions, and
-   mempool state. Those facts do not tell you which Orchard notes your
+   mempool state. Those facts do not tell you which Ironwood notes your
    development wallet can spend.
 3. Use **lightwalletd gRPC** when building a compatible light client that
    scans compact blocks itself. The local service uses plaintext transport.
@@ -93,7 +93,7 @@ print("Node tip:", status["node"]["bestblockhash"])
 for account in get_json("/api/v1/accounts"):
     print(
         f'Account {account["id"]}: '
-        f'{account["orchard_zatoshi"]} Orchard zatoshi, '
+        f'{account["ironwood_zatoshi"]} Ironwood zatoshi, '
         f'{account["transparent_zatoshi"]} transparent zatoshi'
     )
 ```
@@ -106,11 +106,17 @@ prints only user Accounts 1–5. `100000000` zatoshi is 1 ZEC.
 `GET /api/v1/accounts` carries more than balances. Each account object also
 has `name`, `unified_address`, `transparent_address`, and
 `unified_full_viewing_key`. The addresses are what you pay from outside the
-dashboard; the viewing key is the only way to read an Orchard memo this
+dashboard; the viewing key is the only way to read an Ironwood memo this
 environment sent, since nothing in the API or UI shows one back. Because the
 seed is fixed (see [Chapter 3](accounts-and-balances.md#an-account-is-a-wallet-identity)),
 these values are identical in every instance — convenient for fixtures, and
 a reason never to reuse them anywhere real.
+
+For scripts that need the node, compact-block index, and wallet to agree,
+`GET /api/v1/status` also reports `settled` and `settlement_blocker`. Use
+`ths wait` before continuing, or `ths run -- <command>` to run a child command
+in a fresh settled instance and clean it up afterward. The child receives the
+API URL in `THS_API_URL`; see the [CLI reference](cli.md).
 
 The explicit `ready` check matters. `GET /api/v1/accounts` returns the
 last wallet snapshot even while a new scan is in progress or has failed.
@@ -122,7 +128,7 @@ reorganization can change a hash without changing a height.
 ## Listen for changes, then fetch state
 
 `GET /api/v1/events` is a server-sent event stream. Each `update` event
-contains one topic: `wallet`, `chain`, or `sync`. The event is a **hint
+contains one topic: `wallet`, `chain`, `sync`, `mining`, or `resync`. The event is a **hint
 to refetch**, not a balance or block payload. The dashboard's query hooks
 invalidate the relevant queries when one arrives. A simple terminal view
 is:
@@ -136,7 +142,8 @@ Leave it running, perform a faucet or mine in another terminal, and watch
 for `update` events. Press Ctrl+C to stop the stream. Your client should
 read the relevant HTTP endpoint after an event; it should also fetch
 initial state when it connects, since a stream starts with no full
-snapshot.
+snapshot. A `mining` event prompts a job-status refresh. A `resync` event means
+updates were missed; refetch the state your client uses.
 
 ## Read chain state directly
 
@@ -163,7 +170,7 @@ with urllib.request.urlopen(request, timeout=10) as response:
 Save this as `chain_info.py` and run `python3 chain_info.py`. The result
 describes the node. Use the accounts API for the development wallet's
 balances and the activity API for recorded requests. Do not try to infer
-private Orchard recipients or memo plaintext from raw chain data.
+private Ironwood recipients or memo plaintext from raw chain data.
 
 ## Connect a light client
 
@@ -176,25 +183,35 @@ use the form your client library requires.
 ## The rest of the API surface
 
 These are every route the server serves today, from
-`crates/tsz-server/src/api.rs`:
+`crates/ths-server/src/api.rs`:
 
 | Route | Notes |
 | --- | --- |
-| `GET /api/v1/health` | 200 when Zakura answers **and** the wallet has published at least one snapshot; 503 otherwise. The natural readiness probe. |
-| `GET /api/v1/status` | Node tip, account count, network, endpoints, `wallet_sync`. |
+| `GET /api/v1/health` | 200 after startup finishes, Zakura answers, and the wallet has published at least one snapshot; 503 otherwise. The natural readiness probe. |
+| `GET /api/v1/status` | Node tip, account count, network, endpoints, `wallet_sync`, and settlement status. |
 | `GET /api/v1/accounts` | Accounts 1–5 with balances, addresses, and viewing keys. |
-| `GET /api/v1/activity` | Recorded development payments; see [Chapter 6](architecture/operations.md#call-the-api-with-a-deliberate-key) for the object's eleven fields. |
+| `GET /api/v1/activity` | Recorded development payments; see [Chapter 6](architecture/operations.md#call-the-api-with-a-deliberate-key) for the object's thirteen fields. |
+| `GET /api/v1/activity?idempotency_key=<key>` | Read one payment's stored activity as a one-item array, or `[]`; the read does not resume it. |
 | `POST /api/v1/send/quote` | Dry run: `available_zatoshi`, `fee_zatoshi`, `max_zatoshi` for one account and pool pair. Builds and broadcasts nothing. Check an intended amount against `max_zatoshi` before calling `send`. |
-| `POST /api/v1/send` | Payment between accounts. Needs an idempotency key. |
+| `POST /api/v1/send` | Payment to a user account or supported Regtest address. Needs an idempotency key. |
 | `POST /api/v1/faucet` | Treasury payment to an account. Needs an idempotency key. |
-| `POST /api/v1/faucet/address` | Treasury payment to any Regtest address. **No** key, no activity record. |
-| `POST /api/v1/mine` | Generate 1–10,000 blocks. No retry key. |
+| `POST /api/v1/faucet/address` | Treasury payment to a supported Regtest address. Needs an idempotency key; external recipients have a separate stored faucet record. |
+| `GET /api/v1/faucet/address?idempotency_key=<key>` | Read an internal or external address-faucet result, or 404 if none is stored. |
+| `POST /api/v1/mine` | Generate 1–10,000 blocks and wait for wallet synchronization. Each call uses a fresh internal key. |
+| `POST /api/v1/mining/jobs` | Start a keyed mining job with `{blocks,idempotency_key}`; returns HTTP 202 and the job. |
+| `GET /api/v1/mining/jobs`, `/mining/jobs/{id}` | Read the latest job or a specific job; see [Chapter 5](mining-and-sync.md). |
+| `POST /api/v1/zip321/parse` | Parse one Regtest payment URI into its address, pool, optional amount, and memo; moves no funds. |
+| `POST /api/v1/zip321/request` | Generate a payment URI from `{account_id}` and an optional amount and memo; moves no funds. |
 | `POST /api/v1/dev/seed` | Returns the raw seed hex. Refuses unless the body carries `"confirmation": "I understand this seed is for regtest only"`. |
 | `GET /api/v1/blocks`, `/blocks/{id}`, `/transactions/{txid}`, `/mempool`, `/addresses/{address}`, `/search` | Read-only explorer views of public chain data. |
 | `GET /api/v1/events` | The server-sent stream described above. |
 
+Accepted payment intents now progress in the background, including payments
+to external faucet addresses. A successful response can still describe a
+pending payment; read its stored status before choosing whether to replay it.
+
 [Chapter 6](architecture/operations.md) explains the retry boundaries around
-the four write routes. These interfaces are for local Regtest experiments;
+payment and mining requests. These interfaces are for local Regtest experiments;
 keep them on loopback and verify the current source before building a
 long-lived integration.
 
