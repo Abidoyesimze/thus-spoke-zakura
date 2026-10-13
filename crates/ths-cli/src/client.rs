@@ -44,6 +44,24 @@ pub(crate) struct Activity {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ActivityHistoryEntry {
+    kind: String,
+    from_account: Option<u8>,
+    to_account: Option<u8>,
+    #[serde(default)]
+    to_address: Option<String>,
+    source_pool: String,
+    destination_pool: String,
+    amount_zatoshi: u64,
+    txid: String,
+    block_hash: Option<String>,
+    status: String,
+    created_at: String,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
 /// How long one payment command waits for its accepted payments to settle. The environment keeps
 /// processing them after the command stops waiting.
 const PAYMENT_WAIT: Duration = Duration::from_secs(30);
@@ -221,11 +239,15 @@ pub(crate) fn unresolved_json<T: Serialize>(
 
 impl Activity {
     fn recipient(&self) -> String {
-        match (self.to_account, &self.to_address) {
-            (Some(id), _) => format!("account {id}"),
-            (None, Some(address)) => address.clone(),
-            (None, None) => "an unknown recipient".to_owned(),
-        }
+        recipient(self.to_account, self.to_address.as_deref())
+    }
+}
+
+fn recipient(to_account: Option<u8>, to_address: Option<&str>) -> String {
+    match (to_account, to_address) {
+        (Some(id), _) => format!("account {id}"),
+        (None, Some(address)) => address.to_owned(),
+        (None, None) => "an unknown recipient".to_owned(),
     }
 }
 
@@ -781,7 +803,128 @@ fn format_zec(zatoshi: u64) -> String {
     }
 }
 
+pub(crate) fn activity_history(
+    dashboard: &str,
+    client: &reqwest::blocking::Client,
+    name: &InstanceName,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>> {
+    let mut request = client.get(format!("{dashboard}/api/v1/activity"));
+    if let Some(limit) = limit {
+        request = request.query(&[("limit", limit)]);
+    }
+    request
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("asking environment {name} for wallet activity"))
+}
+
+fn activity_kind(activity: &ActivityHistoryEntry) -> &'static str {
+    if activity.kind == "faucet" {
+        "faucet"
+    } else {
+        match (
+            activity.source_pool.as_str(),
+            activity.destination_pool.as_str(),
+        ) {
+            ("transparent", "ironwood") => "shield",
+            ("ironwood", "transparent") => "unshield",
+            _ => "send",
+        }
+    }
+}
+
+pub(crate) fn activity_lines(activity: &[serde_json::Value]) -> Result<String> {
+    if activity.is_empty() {
+        return Ok("No wallet activity yet.".to_owned());
+    }
+
+    activity
+        .iter()
+        .map(|value| {
+            let entry: ActivityHistoryEntry =
+                serde_json::from_value(value.clone()).context("decoding wallet activity entry")?;
+            let source = if entry.kind == "faucet" {
+                format!("faucet ({})", entry.source_pool)
+            } else {
+                match entry.from_account {
+                    Some(account) => format!("account {account} ({})", entry.source_pool),
+                    None => format!("unknown account ({})", entry.source_pool),
+                }
+            };
+            let destination = recipient(entry.to_account, entry.to_address.as_deref());
+            let mut lines = vec![
+                format!(
+                    "{}  {}  {} ZEC",
+                    activity_kind(&entry),
+                    entry.status,
+                    format_zec(entry.amount_zatoshi)
+                ),
+                format!(
+                    "  Route: {source} -> {destination} ({})",
+                    entry.destination_pool
+                ),
+            ];
+            if !entry.txid.trim().is_empty() {
+                lines.push(format!("  Transaction: {}", entry.txid));
+            }
+            if let Some(block_hash) = &entry.block_hash {
+                lines.push(format!("  Confirmed in: {block_hash}"));
+            }
+            if let Some(error) = &entry.last_error {
+                lines.push(format!("  Error: {error}"));
+            }
+            lines.push(format!("  Created: {}", entry.created_at));
+            Ok(lines.join("\n"))
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|entries| entries.join("\n\n"))
+}
+
+pub(crate) fn render_activity_history(
+    activity: &[serde_json::Value],
+    json: bool,
+) -> Result<String> {
+    if json {
+        Ok(serde_json::to_string_pretty(activity)?)
+    } else {
+        activity_lines(activity)
+    }
+}
+
 impl Runtime {
+    pub fn wallet_activity(
+        &self,
+        name: &InstanceName,
+        limit: Option<u32>,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        self.wallet_activity_with(
+            name,
+            &dashboard,
+            &client,
+            std::io::stdout().lock(),
+            limit,
+            json,
+        )
+    }
+
+    pub(crate) fn wallet_activity_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        limit: Option<u32>,
+        json: bool,
+    ) -> Result<()> {
+        let activity = activity_history(dashboard, client, name, limit)?;
+        writeln!(out, "{}", render_activity_history(&activity, json)?)?;
+        Ok(())
+    }
+
     pub fn wallet_balances(&self, name: &InstanceName, json: bool) -> Result<()> {
         let (dashboard, client) = self.instance_client(name)?;
         let accounts = account_balances(&dashboard, &client, name)?;
