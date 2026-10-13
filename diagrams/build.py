@@ -437,7 +437,7 @@ def source_to_runtime():
           "three exist. Editing source changes neither a running container nor an existing image.")
     xs, w = d.row(3)
     d.zone(48, 72, 904, 116, "SOURCE IN THIS REPOSITORY")
-    for x, t, s in zip(xs, ["web/", "crates/tsz-server/", "docker/lightwalletd.Dockerfile"],
+    for x, t, s in zip(xs, ["web/", "crates/ths-server/", "docker/lightwalletd.Dockerfile"],
                        ["React dashboard", "HTTP API and wallet", None]):
         d.card(x, 104, w, 62, t, s)
     for x in (xs[0] + w / 2, xs[1] + w / 2, xs[2] + w / 2):
@@ -447,7 +447,7 @@ def source_to_runtime():
     d.zone(48, 236, 904, 172, "IMAGES — THE ONLY THING A RUN USES")
     d.card(xs[0], 268, w * 2 + 28, 60, "app:&lt;version&gt;", "web/ and the server crate, together")
     d.card(xs[2], 268, w, 60, "lightwalletd:&lt;version&gt;", "from that Dockerfile")
-    d.card(xs[1], 344, w, 52, "zakuracore/zakura:1.4.0", "pinned — ths pull, never built")
+    d.card(xs[1], 344, w, 52, "zakuracore/zakura:1.6.0", "pinned — ths pull, never built")
     d.text(500, 432, "editing source changes neither a running container nor an existing image", "s")
     return d
 
@@ -460,7 +460,7 @@ def diagnose_state():
     rows = [("Does the launcher run?", "ths doctor · ths pull", "Docker daemon, then the images"),
             ("Is this instance up, and where?", "ths status · ths endpoints --json", "each name is its own instance"),
             ("Node healthy, balances stale?", "wallet_sync in /api/v1/status", "usually lightwalletd lagging behind"),
-            ("Only then: a payment you doubt", "/api/v1/activity, then the chain", "only a keyed payment is safe to repeat")]
+            ("Only then: a payment you doubt", "keyed activity / faucet GETs", "read by saved key before replay")]
     y = 84
     for i, (t, s, hint) in enumerate(rows):
         d.card(xs[0], y, w, 62, t, s, kind="accent" if i == 3 else "plain")

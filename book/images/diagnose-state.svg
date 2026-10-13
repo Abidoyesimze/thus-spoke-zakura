@@ -62,8 +62,8 @@ text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
 <path class="lead" d="M138.0 314 L138.0 336"/>
 <rect class="card-a" x="48.0" y="336" width="436.0" height="62" rx="8"/>
 <text class="l" x="266.0" y="364.0" text-anchor="middle">Only then: a payment you doubt</text>
-<text class="s" x="266.0" y="382.0" text-anchor="middle">/api/v1/activity, then the chain</text>
+<text class="s" x="266.0" y="382.0" text-anchor="middle">keyed activity / faucet GETs</text>
 <rect class="note" x="516.0" y="336" width="436.0" height="62" rx="8"/>
-<text class="l" x="734.0" y="371.0" text-anchor="middle">only a keyed payment is safe to repeat</text>
+<text class="l" x="734.0" y="371.0" text-anchor="middle">read by saved key before replay</text>
 <path class="thin" d="M484.0 367 L508.0 367" marker-end="url(#ar-n)"/>
 </svg>
