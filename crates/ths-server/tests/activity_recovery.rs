@@ -853,8 +853,7 @@ struct AddressFaucetResult {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker and prepared regtest images"]
-async fn address_faucet_background_recovery_after_restart_pays_each_destination_once() -> Result<()>
-{
+async fn address_faucet_retry_after_server_restart_pays_each_destination_once() -> Result<()> {
     let server = PathBuf::from(env!("CARGO_BIN_EXE_ths-server"));
     let mut fixture = RegtestStack::new(server)?;
     let scenario = async {
