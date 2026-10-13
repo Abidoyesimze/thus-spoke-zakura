@@ -30,13 +30,33 @@ pub struct GenerateCounts {
     pub forwarded: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StartupPaymentSnapshot {
+    pub id: String,
+    pub txid: String,
+    pub raw: Vec<u8>,
+    pub expiry_height: u64,
+}
+
+fn startup_payment_snapshot(path: &std::path::Path) -> Result<StartupPaymentSnapshot> {
+    let db = rusqlite::Connection::open_with_flags(
+        path.join("ths.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )?;
+    Ok(db.query_row("SELECT a.id,a.txid,p.raw_transaction,p.expiry_height FROM activity a JOIN idempotency i ON i.activity_id=a.id JOIN prepared_payments p ON p.activity_id=a.id WHERE i.key='startup-account-1-ironwood-v1' AND a.status='broadcast'", [], |row| Ok(StartupPaymentSnapshot { id: row.get(0)?, txid: row.get(1)?, raw: row.get(2)?, expiry_height: row.get(3)? }))?)
+}
+
 #[derive(Default)]
 struct ProxyState {
+    startup_unavailable: bool,
     armed: bool,
+    reject_payment_mining: bool,
     rejected: usize,
     forwarded: usize,
     hidden_transaction: Option<String>,
     hidden_lookups: usize,
+    startup_snapshot_path: Option<std::path::PathBuf>,
+    startup_snapshot: Option<StartupPaymentSnapshot>,
 }
 
 struct SharedProxy {
@@ -241,6 +261,15 @@ impl GenerateFaultProxy {
         &self.url
     }
 
+    pub fn reject_payment_mining(&self, reject: bool) -> Result<()> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .reject_payment_mining = reject;
+        Ok(())
+    }
+
     pub fn fail_next_generate(&self) -> Result<()> {
         let mut state = self
             .shared
@@ -251,6 +280,35 @@ impl GenerateFaultProxy {
             anyhow::bail!("fixture generate fault is already armed");
         }
         state.armed = true;
+        Ok(())
+    }
+
+    pub fn fail_startup_auto_mine(&self, data_dir: &std::path::Path) -> Result<()> {
+        self.fail_next_generate()?;
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot_path = Some(data_dir.to_owned());
+        Ok(())
+    }
+
+    pub fn startup_funding_snapshot(&self) -> Result<StartupPaymentSnapshot> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_snapshot
+            .clone()
+            .context("startup funding fault did not capture signed bytes")
+    }
+
+    pub fn set_startup_unavailable(&self, unavailable: bool) -> Result<()> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .startup_unavailable = unavailable;
         Ok(())
     }
 
@@ -352,6 +410,22 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
     };
     let id = payload.get("id").cloned().unwrap_or(Value::Null);
     let method = payload.get("method").and_then(Value::as_str);
+    if method == Some("getblockchaininfo") {
+        let unavailable = match shared.state.lock() {
+            Ok(state) => state.startup_unavailable,
+            Err(_) => {
+                return json_rpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    id,
+                    -32603,
+                    "fixture RPC-proxy state is unavailable",
+                );
+            }
+        };
+        if unavailable {
+            return json_rpc_error(StatusCode::OK, id, -28, "injected startup outage");
+        }
+    }
     let is_generate = method == Some("generate");
     let is_fault_target = is_generate && payload.get("params") == Some(&json!([1]));
 
@@ -371,7 +445,7 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
         return json_rpc_error(StatusCode::OK, id, -5, "injected missing transaction");
     }
 
-    let rejected = {
+    let rejected_code = {
         let mut state = match shared.state.lock() {
             Ok(state) => state,
             Err(_) => {
@@ -383,16 +457,48 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
                 );
             }
         };
-        if is_fault_target && state.armed {
-            state.armed = false;
+        if is_fault_target && state.reject_payment_mining {
             state.rejected += 1;
-            true
+            Some(-32603)
+        } else if is_fault_target && state.armed {
+            if let Some(path) = state.startup_snapshot_path.as_ref() {
+                match startup_payment_snapshot(path) {
+                    Ok(snapshot) => {
+                        state.startup_snapshot = Some(snapshot);
+                        state.startup_snapshot_path = None;
+                        state.armed = false;
+                        state.rejected += 1;
+                        Some(-28)
+                    }
+                    Err(error)
+                        if matches!(
+                            error.downcast_ref::<rusqlite::Error>(),
+                            Some(rusqlite::Error::QueryReturnedNoRows)
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "capturing startup funding fault failed");
+                        return json_rpc_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            id,
+                            -32603,
+                            "startup funding snapshot failed",
+                        );
+                    }
+                }
+            } else {
+                state.armed = false;
+                state.rejected += 1;
+                Some(-32603)
+            }
         } else {
-            false
+            None
         }
     };
-    if rejected {
-        return json_rpc_error(StatusCode::OK, id, -32603, "injected auto-mine failure");
+    if let Some(code) = rejected_code {
+        return json_rpc_error(StatusCode::OK, id, code, "injected auto-mine failure");
     }
 
     if is_generate {
@@ -527,259 +633,4 @@ fn is_safe_response_header(name: &str, connection_tokens: &[String]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-
-    use anyhow::Result;
-    use axum::{
-        Json, Router,
-        extract::State,
-        http::StatusCode,
-        response::{IntoResponse, Response},
-    };
-    use reqwest::Client;
-    use serde_json::{Value, json};
-    use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
-
-    use super::{GenerateCounts, GenerateFaultProxy};
-
-    struct LocalServer {
-        url: String,
-        shutdown: Option<oneshot::Sender<()>>,
-        task: JoinHandle<()>,
-    }
-
-    impl LocalServer {
-        async fn start(router: Router) -> Result<Self> {
-            let listener = TcpListener::bind("127.0.0.1:0").await?;
-            let address = listener.local_addr()?;
-            let (shutdown, receiver) = oneshot::channel();
-            let task = tokio::spawn(async move {
-                let _ = axum::serve(listener, router)
-                    .with_graceful_shutdown(async move {
-                        let _ = receiver.await;
-                    })
-                    .await;
-            });
-            Ok(Self {
-                url: format!("http://{address}"),
-                shutdown: Some(shutdown),
-                task,
-            })
-        }
-
-        async fn shutdown(mut self) -> Result<()> {
-            if let Some(shutdown) = self.shutdown.take() {
-                let _ = shutdown.send(());
-            }
-            tokio::time::timeout(Duration::from_secs(5), &mut self.task).await??;
-            Ok(())
-        }
-    }
-
-    async fn record_request(
-        State(requests): State<Arc<Mutex<Vec<Value>>>>,
-        Json(request): Json<Value>,
-    ) -> Json<Value> {
-        requests.lock().unwrap().push(request.clone());
-        Json(json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned().unwrap_or(Value::Null),
-            "result": {"forwarded": true},
-        }))
-    }
-
-    async fn upstream_http_error(Json(request): Json<Value>) -> Response {
-        (
-            StatusCode::IM_A_TEAPOT,
-            [("x-fixture-error", "preserved")],
-            Json(json!({
-                "jsonrpc": "2.0",
-                "id": request.get("id").cloned().unwrap_or(Value::Null),
-                "error": {"code": -32011, "message": "upstream HTTP failure"},
-            })),
-        )
-            .into_response()
-    }
-
-    async fn upstream_json_rpc_error(Json(request): Json<Value>) -> Json<Value> {
-        Json(json!({
-            "jsonrpc": "2.0",
-            "id": request.get("id").cloned().unwrap_or(Value::Null),
-            "result": Value::Null,
-            "error": {"code": -32012, "message": "upstream JSON-RPC failure"},
-        }))
-    }
-
-    fn request(id: &str, method: &str, params: Value) -> Value {
-        json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params})
-    }
-
-    async fn post_json(client: &Client, url: &str, request: &Value) -> Result<(StatusCode, Value)> {
-        let response = client.post(url).json(request).send().await?;
-        let status = response.status();
-        Ok((status, response.json().await?))
-    }
-
-    #[tokio::test]
-    async fn proxy_forwards_unarmed_requests_and_consumes_only_matching_generate_once() -> Result<()>
-    {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let upstream = LocalServer::start(
-            Router::new()
-                .fallback(record_request)
-                .with_state(Arc::clone(&requests)),
-        )
-        .await?;
-        let mut proxy = GenerateFaultProxy::start(upstream.url.clone()).await?;
-        let client = Client::new();
-
-        let unarmed = request("read-one", "getblockchaininfo", json!([]));
-        let (status, response) = post_json(&client, proxy.url(), &unarmed).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["id"], "read-one");
-        assert_eq!(response["result"], json!({"forwarded": true}));
-
-        proxy.fail_next_generate()?;
-        assert!(proxy.fail_next_generate().is_err());
-
-        let read_after_arming = request("read-two", "getrawmempool", json!([]));
-        let (status, _) = post_json(&client, proxy.url(), &read_after_arming).await?;
-        assert_eq!(status, StatusCode::OK);
-        let other_generate = request("generate-two", "generate", json!([2]));
-        let (status, _) = post_json(&client, proxy.url(), &other_generate).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            proxy.counts(),
-            GenerateCounts {
-                rejected: 0,
-                forwarded: 1,
-            }
-        );
-
-        let matching_generate = request("generate-one", "generate", json!([1]));
-        let (status, response) = post_json(&client, proxy.url(), &matching_generate).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["id"], "generate-one");
-        assert_eq!(response["result"], Value::Null);
-        assert_eq!(response["error"]["code"], -32603);
-        assert_eq!(
-            proxy.counts(),
-            GenerateCounts {
-                rejected: 1,
-                forwarded: 1,
-            }
-        );
-
-        let (status, response) = post_json(&client, proxy.url(), &matching_generate).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["result"], json!({"forwarded": true}));
-        assert_eq!(
-            proxy.counts(),
-            GenerateCounts {
-                rejected: 1,
-                forwarded: 2,
-            }
-        );
-        assert_eq!(
-            requests.lock().unwrap().as_slice(),
-            &[
-                unarmed,
-                read_after_arming,
-                other_generate,
-                matching_generate
-            ]
-        );
-
-        proxy.shutdown().await?;
-        upstream.shutdown().await
-    }
-
-    #[tokio::test]
-    async fn separate_proxy_instances_do_not_consume_each_others_faults() -> Result<()> {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let upstream = LocalServer::start(
-            Router::new()
-                .fallback(record_request)
-                .with_state(Arc::clone(&requests)),
-        )
-        .await?;
-        let mut first = GenerateFaultProxy::start(upstream.url.clone()).await?;
-        let mut second = GenerateFaultProxy::start(upstream.url.clone()).await?;
-        let client = Client::new();
-        let matching_generate = request("isolation", "generate", json!([1]));
-
-        first.fail_next_generate()?;
-        let (status, _) = post_json(&client, second.url(), &matching_generate).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            first.counts(),
-            GenerateCounts {
-                rejected: 0,
-                forwarded: 0,
-            }
-        );
-        assert_eq!(
-            second.counts(),
-            GenerateCounts {
-                rejected: 0,
-                forwarded: 1,
-            }
-        );
-
-        let (status, response) = post_json(&client, first.url(), &matching_generate).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["error"]["code"], -32603);
-        assert_eq!(
-            first.counts(),
-            GenerateCounts {
-                rejected: 1,
-                forwarded: 0,
-            }
-        );
-
-        first.shutdown().await?;
-        second.shutdown().await?;
-        upstream.shutdown().await
-    }
-
-    #[tokio::test]
-    async fn proxy_preserves_upstream_errors_and_bounds_transport_shutdown() -> Result<()> {
-        let client = Client::new();
-        let request = request("errors", "getblockchaininfo", json!([]));
-
-        let http_error = LocalServer::start(Router::new().fallback(upstream_http_error)).await?;
-        let mut proxy = GenerateFaultProxy::start(http_error.url.clone()).await?;
-        let response = client.post(proxy.url()).json(&request).send().await?;
-        assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
-        assert_eq!(response.headers()["x-fixture-error"], "preserved");
-        let response: Value = response.json().await?;
-        assert_eq!(response["id"], "errors");
-        assert_eq!(response["error"]["code"], -32011);
-        tokio::time::timeout(Duration::from_secs(2), proxy.shutdown()).await??;
-        http_error.shutdown().await?;
-
-        let json_error =
-            LocalServer::start(Router::new().fallback(upstream_json_rpc_error)).await?;
-        let mut proxy = GenerateFaultProxy::start(json_error.url.clone()).await?;
-        let (status, response) = post_json(&client, proxy.url(), &request).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(response["id"], "errors");
-        assert_eq!(response["error"]["code"], -32012);
-        proxy.shutdown().await?;
-        json_error.shutdown().await?;
-
-        let mut unavailable = GenerateFaultProxy::start("http://127.0.0.1:9".to_owned()).await?;
-        let response = tokio::time::timeout(
-            Duration::from_secs(2),
-            client.post(unavailable.url()).json(&request).send(),
-        )
-        .await??;
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        tokio::time::timeout(Duration::from_secs(2), unavailable.shutdown()).await??;
-        Ok(())
-    }
-}
+mod tests;
