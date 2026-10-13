@@ -6135,23 +6135,32 @@ mod tests {
         std::thread::spawn(move || {
             for (status, body) in responses {
                 let body = body.into();
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                reader.read_line(&mut request_line).unwrap();
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    if line == "\r\n" {
-                        break;
+                let (mut stream, request_line, request) = loop {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    reader.read_line(&mut request_line).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse().unwrap();
+                        }
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
+                    if request_line.starts_with("HEAD ") {
+                        // Local health probes can connect to ephemeral test ports.
+                        continue;
                     }
-                }
-                let mut request = vec![0; length];
-                reader.read_exact(&mut request).unwrap();
+                    let mut request = vec![0; length];
+                    reader.read_exact(&mut request).unwrap();
+                    break (stream, request_line, request);
+                };
                 requests
                     .send((
                         request_line.trim_end().to_owned(),

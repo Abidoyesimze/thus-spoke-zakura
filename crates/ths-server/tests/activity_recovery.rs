@@ -144,6 +144,225 @@ async fn queued_external_faucet_retry_survives_lost_response_and_restart() -> Re
     queued_retry_survives_restart(true).await
 }
 
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn disconnected_payment_preparation_keeps_the_original_transaction() -> Result<()> {
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let mut broadcast_proxy = None;
+    let scenario = async {
+        fixture.start().await?;
+        broadcast_proxy = Some(QueuedBroadcastProxy::start(fixture.lightwalletd_port()?).await?);
+        let proxy = broadcast_proxy.as_ref().unwrap();
+        fixture.restart_with_lightwalletd(proxy.port()).await?;
+        fixture.proxy().reject_payment_mining(true)?;
+        proxy.pause_subtree_roots();
+        let client = Client::new();
+        let key = "disconnected-real-preparation";
+        let body = json!({
+            "from_account": 1, "to_account": 2,
+            "source_pool": "ironwood", "destination_pool": "ironwood",
+            "amount_zatoshi": 1_000_000, "idempotency_key": key,
+        });
+        let lost = lose_payment_response(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        proxy.wait_for_paused_subtree_roots().await?;
+        anyhow::ensure!(
+            lost["status"] == "preparing" && lost["txid"] == "",
+            "disconnected POST did not leave a durable claim"
+        );
+        // Keep the real wallet call paused beyond the ten-second dispatch budget.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        let duplicate = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        anyhow::ensure!(
+            duplicate.operation["id"] == lost["id"] && duplicate.operation["txid"] == "",
+            "deadline or duplicate admission replaced the active preparation"
+        );
+        let mut conflict = body.clone();
+        conflict["amount_zatoshi"] = json!(2_000_000);
+        let rejected = client
+            .post(format!("{}/api/v1/send", fixture.api_url()))
+            .json(&conflict)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            rejected.status() == reqwest::StatusCode::CONFLICT,
+            "conflicting duplicate was accepted"
+        );
+        proxy.resume_subtree_roots();
+        let location = format!("/api/v1/activity?idempotency_key={key}");
+        let pending = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &location,
+            "broadcast",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        let original = pending_payment_snapshot(&fixture, false, key)?;
+        anyhow::ensure!(
+            pending["id"] == lost["id"] && pending["txid"] == original.txid,
+            "wallet/server journals changed the disconnected payment identity"
+        );
+        fixture.restart_server().await?;
+        anyhow::ensure!(
+            pending_payment_snapshot(&fixture, false, key)? == original,
+            "restart changed the signed original"
+        );
+        fixture.proxy().reject_payment_mining(false)?;
+        let confirmed = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &location,
+            "confirmed",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            confirmed["id"] == lost["id"] && confirmed["txid"] == original.txid,
+            "background recovery did not confirm the original"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    if let Some(proxy) = broadcast_proxy.as_ref() {
+        proxy.resume_subtree_roots();
+    }
+    let cleanup = fixture.shutdown().await;
+    let proxy_cleanup = if let Some(proxy) = broadcast_proxy.as_mut() {
+        proxy.shutdown().await
+    } else {
+        Ok(())
+    };
+    preserve_scenario_failure(scenario, preserve_scenario_failure(cleanup, proxy_cleanup))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn expired_unseen_send_replaces_once_under_the_original_key() -> Result<()> {
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let mut broadcast_proxy = None;
+    let scenario = async {
+        fixture.start().await?;
+        broadcast_proxy = Some(QueuedBroadcastProxy::start(fixture.lightwalletd_port()?).await?);
+        let proxy = broadcast_proxy.as_ref().unwrap();
+        proxy.withhold_broadcasts(true);
+        fixture.restart_with_lightwalletd(proxy.port()).await?;
+        fixture.proxy().reject_payment_mining(true)?;
+        let client = Client::new();
+        let key = "expired-unseen-send";
+        let body = json!({
+            "from_account": 1, "to_account": 2,
+            "source_pool": "ironwood", "destination_pool": "ironwood",
+            "amount_zatoshi": 1_000_000, "idempotency_key": key,
+        });
+        let admission = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        let _ = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &admission.location,
+            "broadcast",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        let original = pending_payment_snapshot(&fixture, false, key)?;
+        let chain: ChainInfo =
+            rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+        let blocks = original.expiry_height.saturating_sub(chain.blocks) + 1;
+        anyhow::ensure!(
+            blocks > 0 && blocks <= 100,
+            "unexpected expiry distance: {blocks}"
+        );
+        let _: serde_json::Value = rpc_with_timeout(
+            &client,
+            fixture.node_url(),
+            "generate",
+            json!([blocks]),
+            Duration::from_secs(120),
+        )
+        .await?;
+        let mempool: Vec<String> =
+            rpc(&client, fixture.node_url(), "getrawmempool", json!([])).await?;
+        anyhow::ensure!(
+            !mempool.contains(&original.txid),
+            "original transaction reached the chain node"
+        );
+        proxy.withhold_broadcasts(false);
+        fixture.proxy().reject_payment_mining(false)?;
+        let confirmed = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &admission.location,
+            "confirmed",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            confirmed["id"] == original.id && confirmed["txid"] != original.txid,
+            "expired original was not safely replaced under its key"
+        );
+        let replacement = confirmed["txid"]
+            .as_str()
+            .context("replacement has no txid")?;
+        let evidence: serde_json::Value = rpc(
+            &client,
+            fixture.node_url(),
+            "getrawtransaction",
+            json!([replacement, 1]),
+        )
+        .await?;
+        anyhow::ensure!(
+            evidence["confirmations"].as_u64().is_some_and(|n| n > 0)
+                && evidence["blockhash"] == confirmed["block_hash"],
+            "replacement lacks canonical inclusion"
+        );
+        let block: serde_json::Value = rpc(
+            &client,
+            fixture.node_url(),
+            "getblockheader",
+            json!([evidence["blockhash"]]),
+        )
+        .await?;
+        let canonical: String = rpc(
+            &client,
+            fixture.node_url(),
+            "getblockhash",
+            json!([block["height"]]),
+        )
+        .await?;
+        anyhow::ensure!(
+            evidence["blockhash"] == canonical,
+            "replacement is not on the canonical chain"
+        );
+        let accounts: Vec<AccountBalance> = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            accounts
+                .iter()
+                .any(|a| a.id == 2 && a.ironwood_zatoshi == 1_000_000),
+            "replacement did not produce exactly one SDK payout"
+        );
+        let replay = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        anyhow::ensure!(
+            replay.operation == confirmed,
+            "terminal replay changed the replacement"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    let proxy_cleanup = if let Some(proxy) = broadcast_proxy.as_mut() {
+        proxy.shutdown().await
+    } else {
+        Ok(())
+    };
+    preserve_scenario_failure(scenario, preserve_scenario_failure(cleanup, proxy_cleanup))
+}
+
 #[derive(PartialEq, Eq)]
 struct PendingPaymentSnapshot {
     id: String,
@@ -634,7 +853,8 @@ struct AddressFaucetResult {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker and prepared regtest images"]
-async fn address_faucet_retry_after_server_restart_pays_each_destination_once() -> Result<()> {
+async fn address_faucet_background_recovery_after_restart_pays_each_destination_once() -> Result<()>
+{
     let server = PathBuf::from(env!("CARGO_BIN_EXE_ths-server"));
     let mut fixture = RegtestStack::new(server)?;
     let scenario = async {
@@ -702,24 +922,26 @@ async fn address_faucet_retry_after_server_restart_pays_each_destination_once() 
                 "original transaction is absent from the mempool"
             );
 
-            // Discard the first result as a client with a lost response would, then restart the app.
+            // Recovery after restart must not need another payment POST.
             fixture.restart_server().await?;
             fixture.proxy().reject_payment_mining(false)?;
-            let replay: AddressFaucetResult = confirmed_payment(
-                &client,
-                fixture.api_url(),
-                "/api/v1/faucet/address",
-                Some(&body),
-                SEND_TIMEOUT,
-            )
-            .await?;
+            let confirmed: AddressFaucetResult = serde_json::from_value(
+                wait_payment_state(
+                    &client,
+                    fixture.api_url(),
+                    &admission.location,
+                    "confirmed",
+                    Instant::now() + SEND_TIMEOUT,
+                )
+                .await?,
+            )?;
             anyhow::ensure!(
-                replay.status == "confirmed" && replay.txid == first.txid,
-                "retry constructed another payment instead of confirming the original"
+                confirmed.status == "confirmed" && confirmed.txid == first.txid,
+                "background recovery changed the original payment"
             );
             anyhow::ensure!(
-                replay.address == address && replay.amount_zatoshi == 1_000_000,
-                "replayed payment changed its destination or amount"
+                confirmed.address == address && confirmed.amount_zatoshi == 1_000_000,
+                "recovered payment changed its destination or amount"
             );
             let tx: serde_json::Value = rpc(
                 &client,
@@ -729,7 +951,7 @@ async fn address_faucet_retry_after_server_restart_pays_each_destination_once() 
             )
             .await?;
             anyhow::ensure!(
-                tx["blockhash"].as_str() == replay.block_hash.as_deref(),
+                tx["blockhash"].as_str() == confirmed.block_hash.as_deref(),
                 "response block hash differs from the confirmed transaction"
             );
             let balance: serde_json::Value = rpc(
@@ -1399,7 +1621,7 @@ async fn prepare_rolls_back_constructed_transaction_when_journal_write_fails() -
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Docker and prepared regtest images"]
-async fn retry_recovers_prepare_interrupted_before_store_recording() -> Result<()> {
+async fn background_recovers_prepare_interrupted_before_store_recording() -> Result<()> {
     let server = PathBuf::from(env!("CARGO_BIN_EXE_ths-server"));
     let mut fixture = RegtestStack::new(server)?;
     let scenario = async {
@@ -1479,20 +1701,22 @@ async fn retry_recovers_prepare_interrupted_before_store_recording() -> Result<(
             .restart_server()
             .await
             .context("restarting server after interrupted preparation")?;
-        let recovered: Activity = confirmed_payment(
-            &client,
-            fixture.api_url(),
-            "/api/v1/send",
-            Some(&request),
-            SEND_TIMEOUT,
-        )
-        .await
-        .context("retrying interrupted payment")?;
+        let recovered: Activity = serde_json::from_value(
+            wait_payment_state(
+                &client,
+                fixture.api_url(),
+                &admission.location,
+                "confirmed",
+                Instant::now() + SEND_TIMEOUT,
+            )
+            .await
+            .context("waiting for interrupted payment without another POST")?,
+        )?;
         anyhow::ensure!(
             recovered.id == activity_id
                 && recovered.txid == original.txid
                 && recovered.status == "confirmed",
-            "retry did not confirm the original activity and transaction"
+            "background recovery did not confirm the original activity and transaction"
         );
         let application_database = Connection::open(fixture.data_dir().join("ths.db"))?;
         let recorded: (Vec<u8>, u64) = application_database.query_row(
@@ -1540,6 +1764,165 @@ async fn retry_recovers_prepare_interrupted_before_store_recording() -> Result<(
     .await;
     let cleanup = fixture.shutdown().await;
     preserve_scenario_failure(scenario, cleanup)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn restart_recovers_claim_before_preparation_without_payment_post() -> Result<()> {
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let scenario = async {
+        fixture.start().await?;
+        fixture.interrupt_server().await?;
+        let key = "claim-before-worker-restart";
+        let id = seed_preparing_payment(fixture.data_dir(), key)?;
+        anyhow::ensure!(
+            prepared_payment(fixture.data_dir(), &id)?.is_none(),
+            "claim was already prepared before restart"
+        );
+        fixture.restart_server().await?;
+        let client = Client::new();
+        let payment: Activity = serde_json::from_value(
+            wait_payment_state(
+                &client,
+                fixture.api_url(),
+                &format!("/api/v1/activity?idempotency_key={key}"),
+                "confirmed",
+                Instant::now() + SEND_TIMEOUT,
+            )
+            .await?,
+        )?;
+        anyhow::ensure!(
+            payment.id == id && payment.status == "confirmed",
+            "reopened claim did not complete"
+        );
+        let accounts: Vec<AccountBalance> = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            accounts
+                .iter()
+                .any(|a| a.id == 2 && a.ironwood_zatoshi == 1_000_000),
+            "reopened claim did not produce exactly one SDK balance increase"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    scenario?;
+    cleanup
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn insufficient_send_stays_failed_after_restart_and_later_funding() -> Result<()> {
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let scenario = async {
+        fixture.start().await?;
+        let client = Client::new();
+        let key = "insufficient-send-later-funded";
+        let body = json!({
+            "from_account": 1, "to_account": 2,
+            "source_pool": "ironwood", "destination_pool": "ironwood",
+            "amount_zatoshi": 600_000_000, "idempotency_key": key,
+        });
+        let admission = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        let deadline = Instant::now() + SEND_TIMEOUT;
+        let failed = loop {
+            let rows: Vec<serde_json::Value> = request_json(
+                &client,
+                fixture.api_url(),
+                &admission.location,
+                None,
+                API_READ_TIMEOUT,
+            )
+            .await?;
+            let row = rows.first().context("accepted Send disappeared")?;
+            if row["status"] == "failed" {
+                break row.clone();
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "insufficient Send did not fail: {row}"
+            );
+            tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+        };
+        anyhow::ensure!(
+            failed["id"] == admission.operation["id"]
+                && failed["txid"] == ""
+                && failed["last_error"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("insufficient")),
+            "insufficient Send lost its durable failure: {failed}"
+        );
+        fixture.restart_server().await?;
+        let faucet = json!({
+            "account_id": 1, "pool": "ironwood", "amount_zatoshi": 200_000_000,
+            "idempotency_key": "fund-after-insufficient-send",
+        });
+        let _: Activity = confirmed_payment(
+            &client,
+            fixture.api_url(),
+            "/api/v1/faucet",
+            Some(&faucet),
+            SEND_TIMEOUT,
+        )
+        .await?;
+        let replay = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        anyhow::ensure!(
+            replay.operation == failed,
+            "later funding changed the failed Send"
+        );
+        let mut new_body = body.clone();
+        new_body["idempotency_key"] = json!("insufficient-send-new-key");
+        let paid: Activity = confirmed_payment(
+            &client,
+            fixture.api_url(),
+            "/api/v1/send",
+            Some(&new_body),
+            SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            paid.status == "confirmed" && paid.id != failed["id"],
+            "new key did not make a distinct payment"
+        );
+        let accounts: Vec<AccountBalance> = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            accounts
+                .iter()
+                .any(|a| a.id == 2 && a.ironwood_zatoshi == 600_000_000),
+            "SDK destination balance does not show exactly one payout"
+        );
+        let still_failed: Vec<serde_json::Value> = request_json(
+            &client,
+            fixture.api_url(),
+            &admission.location,
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            still_failed == vec![failed],
+            "failed intent changed after new payment"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    scenario?;
+    cleanup
 }
 
 #[tokio::test(flavor = "multi_thread")]
