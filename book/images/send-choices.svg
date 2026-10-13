@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 852 372" width="852" height="372" role="img" aria-label="A send picks a source account and pool on the left and a destination account and pool on the right, with the amount flowing between the pools. Three notes: transparent change returns as an Orchard note, the fee leaves the source on top of the amount, and a memo needs an Orchard destination.">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 852 372" width="852" height="372" role="img" aria-label="A send picks a source account and pool on the left and a destination account and pool on the right, with the amount flowing between the pools. Three notes: transparent change returns as an Ironwood note, the fee leaves the source on top of the amount, and a memo needs an Ironwood destination.">
 <style>
 svg {
   --bg: #fdfaf8;
@@ -49,24 +49,24 @@ text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
 <text class="s" x="780.0" y="131.0" text-anchor="middle">one of 1–5</text>
 <path class="thin" d="M272 116 L404 116"/>
 <path class="thin" d="M536 116 L668 116"/>
-<text class="s" x="470" y="120" text-anchor="middle">must differ</text>
+<text class="s" x="470" y="120" text-anchor="middle">account or pool differs</text>
 <rect class="card" x="48" y="174" width="224" height="56" rx="8"/>
 <text class="l" x="160.0" y="199.0" text-anchor="middle">Source pool</text>
-<text class="s" x="160.0" y="217.0" text-anchor="middle">transparent · orchard</text>
+<text class="s" x="160.0" y="217.0" text-anchor="middle">transparent · ironwood</text>
 <rect class="card" x="668" y="174" width="224" height="56" rx="8"/>
 <text class="l" x="780.0" y="199.0" text-anchor="middle">Destination pool</text>
-<text class="s" x="780.0" y="217.0" text-anchor="middle">orchard · transparent</text>
+<text class="s" x="780.0" y="217.0" text-anchor="middle">ironwood · transparent</text>
 <path class="flow" d="M272 202 L658 202" marker-end="url(#ar-a)"/>
 <text class="a" x="470" y="190" text-anchor="middle">amount in zatoshi</text>
 <rect class="note" x="48" y="290" width="224" height="50" rx="8"/>
 <text class="l" x="160.0" y="312.0" text-anchor="middle">Transparent change</text>
-<text class="s" x="160.0" y="330.0" text-anchor="middle">returns as Orchard</text>
+<text class="s" x="160.0" y="330.0" text-anchor="middle">returns as Ironwood</text>
 <rect class="note" x="358" y="290" width="224" height="50" rx="8"/>
 <text class="l" x="470.0" y="312.0" text-anchor="middle">Fee leaves the source</text>
 <text class="s" x="470.0" y="330.0" text-anchor="middle">/send/quote has the max</text>
 <rect class="note" x="668" y="290" width="224" height="50" rx="8"/>
 <text class="l" x="780.0" y="312.0" text-anchor="middle">Memo</text>
-<text class="s" x="780.0" y="330.0" text-anchor="middle">Orchard destination only</text>
+<text class="s" x="780.0" y="330.0" text-anchor="middle">Ironwood destination only</text>
 <path class="lead" d="M160 230 L160 290"/>
 <path class="lead" d="M470 206 L470 290"/>
 <path class="lead" d="M780 230 L780 290"/>
