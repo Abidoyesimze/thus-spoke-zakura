@@ -370,13 +370,19 @@ fn send_key_survives_an_interrupted_process_and_resumes_the_same_payment() {
         .args(["--exact", "runtime::tests::send_interruption_probe"])
         .env("THS_SEND_PROBE_ROOT", &runtime.root)
         .env("THS_SEND_PROBE_URL", &url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let submitted = requests.recv_timeout(Duration::from_secs(10)).unwrap();
     interrupted.kill().unwrap();
-    interrupted.wait().unwrap();
+    let interrupted = interrupted.wait_with_output().unwrap();
+    assert!(!interrupted.status.success(), "probe was not interrupted");
+    let probe_output = String::from_utf8(interrupted.stdout).unwrap();
+    assert!(
+        probe_output.contains("running 1 test"),
+        "expected one selected interruption probe: {probe_output}"
+    );
     let key = sent_key(&submitted);
     assert_eq!(saved_send_key(&runtime, &alpha, &intent), Some(key.clone()));
 

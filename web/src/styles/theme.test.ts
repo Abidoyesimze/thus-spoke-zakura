@@ -73,6 +73,8 @@ describe.each(['light', 'dark'] as const)('%s theme', (scope) => {
     ['ink-muted', 'panel'],
     ['ink-muted', 'canvas'],
     ['accent', 'panel'],
+    ['accent-ink', 'accent'],
+    ['accent-ink', 'accent-hover'],
     ['accent-strong', 'panel'],
     ['accent-strong', 'accent-soft'],
     ['positive', 'positive-soft'],

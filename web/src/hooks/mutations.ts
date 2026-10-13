@@ -1,7 +1,27 @@
-import { useRef } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import { useMutation, useQueryClient, type UseMutationResult } from '@tanstack/react-query';
-import { api, idempotencyKey, type Activity, type MiningJob, type Pool } from '@/lib/api';
-import { queryKeys } from './queries';
+import {
+  api,
+  errorMessage,
+  idempotencyKey,
+  isPaymentRejection,
+  type Activity,
+  type MiningJob,
+  type PaymentRequest,
+  type PaymentUri,
+} from '@/lib/api';
+import { isTerminalPayment, queryKeys } from './queries';
+import {
+  clearPayment,
+  paymentName,
+  retainPayment,
+  retainedPaymentKey,
+  type PaymentIdentity,
+  type PaymentKind,
+  type SendVariables,
+  type FaucetVariables,
+} from './payment-identity';
+export type { SendVariables, FaucetVariables } from './payment-identity';
 
 /** Everything a successful money movement invalidates. */
 function walletKeys() {
@@ -10,13 +30,13 @@ function walletKeys() {
 
 function useInvalidateWallet() {
   const queryClient = useQueryClient();
-  return async () => {
+  return useCallback(async () => {
     await Promise.all(
       walletKeys().map((key) =>
         queryClient.invalidateQueries({ queryKey: key, refetchType: 'active' }),
       ),
     );
-  };
+  }, [queryClient]);
 }
 
 function operationKey<T>(
@@ -40,117 +60,178 @@ function operationKey<T>(
       storageArea.removeItem(storageKey(variables));
       if (storageArea === localStorage) sessionStorage.removeItem(storageKey(variables));
     },
-    clearIfMatches(variables: T, expectedKey: string) {
-      const itemKey = storageKey(variables);
-      if (storageArea.getItem(itemKey) === expectedKey) storageArea.removeItem(itemKey);
-      if (storageArea === localStorage && sessionStorage.getItem(itemKey) === expectedKey) {
-        sessionStorage.removeItem(itemKey);
+  };
+}
+
+export type PaymentResult = { activity: Activity; key: string; cleanupError?: string };
+type PaymentSubmission<T> = { variables: T; key: string | undefined; error?: unknown };
+type PaymentCallbacks<T> = {
+  onError?: (error: Error, variables: T, key: string | undefined) => void;
+  onSuccess?: (result: PaymentResult, variables: T) => void;
+};
+type PaymentLifecycle = {
+  onRetained: (identity: PaymentIdentity) => void;
+  onRejected: (identity: PaymentIdentity) => void;
+  onError: (
+    error: Error,
+    variables: SendVariables | FaucetVariables,
+    key: string | undefined,
+  ) => void;
+};
+
+function usePaymentMutation<T extends SendVariables | FaucetVariables>(
+  kind: PaymentKind,
+  post: (variables: T, key: string) => Promise<Activity>,
+  lifecycle?: PaymentLifecycle,
+) {
+  const queryClient = useQueryClient();
+  const invalidate = useInvalidateWallet();
+  const ownedKeys = useRef(new Map<string, string>());
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const clear = useCallback(
+    async (identity: PaymentIdentity) => {
+      try {
+        await clearPayment(identity, ownedKeys.current);
+      } finally {
+        void invalidate();
       }
+    },
+    [invalidate],
+  );
+  // The sender and the status card both learn of a confirmation, in an order
+  // that depends on rendering; whichever sees it first announces it.
+  const announced = useRef(new Set<string>());
+  const claimAnnouncement = useCallback((key: string) => {
+    if (announced.current.has(key)) return false;
+    announced.current.add(key);
+    return true;
+  }, []);
+  const mutation = useMutation<PaymentResult, Error, PaymentSubmission<T>>({
+    mutationFn: async (submission) => {
+      if ('error' in submission) throw submission.error;
+      const { variables, key } = submission;
+      const identity = await retainPayment(kind, variables, ownedKeys.current, key);
+      submission.key = identity.key;
+      setPendingKey(identity.key);
+      // Publish before POST: an immediate terminal response can release storage.
+      lifecycle?.onRetained(identity);
+      try {
+        const activity = await post(variables, identity.key);
+        return { activity, key: identity.key };
+      } catch (error) {
+        // An expired wallet journal can preserve the claim even after a
+        // rejected proposal. Release only when a keyed lookup proves it absent;
+        // a lookup failure must leave the identity available for recovery.
+        if (isPaymentRejection(error) && !(await api.payment(identity.key))) {
+          await clearPayment(identity, ownedKeys.current);
+          lifecycle?.onRejected(identity);
+          submission.key = undefined;
+        }
+        throw error;
+      }
+    },
+    retry: false,
+    onError: (error, submission) => lifecycle?.onError(error, submission.variables, submission.key),
+    onSuccess: async (result, { variables }) => {
+      const { activity, key } = result;
+      // A lookup started before acceptance must not overwrite this response.
+      await queryClient.cancelQueries({ queryKey: queryKeys.payment(key) });
+      queryClient.setQueryData<Activity | null>(queryKeys.payment(key), (previous) =>
+        isTerminalPayment(previous) ? previous : activity,
+      );
+      if (isTerminalPayment(activity)) {
+        try {
+          await clearPayment(
+            { kind, name: paymentName(kind, variables), key, variables } as PaymentIdentity,
+            ownedKeys.current,
+          );
+        } catch (error) {
+          // Cleanup cannot change the outcome; the persistent status view
+          // keeps the result and offers a storage-only recovery action.
+          result.cleanupError = errorMessage(error);
+        }
+      }
+      // Query owners handle wallet refresh errors. Acceptance must not wait
+      // for node-dependent views while stored payment status is available.
+      void invalidate();
+    },
+  });
+  const submission = (variables: T, key?: string): PaymentSubmission<T> => {
+    try {
+      // Capture retained identity at the user action, before a queued lock or
+      // terminal status update can release it. This action only replays that key.
+      return {
+        variables,
+        key: key ?? retainedPaymentKey(paymentName(kind, variables), ownedKeys.current),
+      };
+    } catch (error) {
+      return {
+        variables,
+        key: undefined,
+        error: error instanceof DOMException ? new Error(error.message, { cause: error }) : error,
+      };
+    }
+  };
+  const callbacks = (options?: PaymentCallbacks<T>) => ({
+    onError: (error: Error, { variables, key }: PaymentSubmission<T>) =>
+      options?.onError?.(error, variables, key),
+    onSuccess: (result: PaymentResult, { variables }: PaymentSubmission<T>) =>
+      options?.onSuccess?.(result, variables),
+  });
+  const resume = (identity: PaymentIdentity, options?: PaymentCallbacks<T>) => {
+    setPendingKey(null);
+    mutation.mutate(submission(identity.variables as T, identity.key), callbacks(options));
+  };
+  return {
+    ...mutation,
+    clear,
+    resume,
+    claimAnnouncement,
+    pendingKey: mutation.isPending ? pendingKey : null,
+    mutate: (variables: T, options?: PaymentCallbacks<T>) => {
+      setPendingKey(null);
+      mutation.mutate(submission(variables), callbacks(options));
+    },
+    mutateAsync: (variables: T) => {
+      setPendingKey(null);
+      return mutation.mutateAsync(submission(variables));
     },
   };
 }
 
-function withFaucetLock<T>(name: string, action: () => T | Promise<T>): Promise<T> {
-  if (!navigator.locks) {
-    return Promise.reject(new Error('This browser cannot coordinate faucet payments across tabs.'));
-  }
-  return navigator.locks.request(name, action);
+export function useSend(lifecycle?: PaymentLifecycle) {
+  return usePaymentMutation(
+    'send',
+    (variables: SendVariables, key) => api.send({ ...variables, idempotency_key: key }),
+    lifecycle,
+  );
 }
 
-export interface SendVariables {
-  from_account: number;
-  to_account: number;
-  source_pool: Pool;
-  destination_pool: Pool;
-  amount_zatoshi: bigint;
+export function useFaucet(lifecycle?: PaymentLifecycle) {
+  return usePaymentMutation(
+    'faucet',
+    (variables: FaucetVariables, key) => api.faucet({ ...variables, idempotency_key: key }),
+    lifecycle,
+  );
+}
+
+/** Resolves a pasted `zcash:` URI; it moves no funds, so nothing is invalidated. */
+export function useParsePaymentUri(): UseMutationResult<PaymentUri, Error, string> {
+  return useMutation({ mutationFn: (uri: string) => api.parsePaymentUri(uri) });
+}
+
+export interface PaymentRequestVariables {
+  account_id: number;
+  amount_zatoshi?: bigint;
   memo?: string;
 }
 
-export function useSend(): UseMutationResult<Activity, Error, SendVariables> {
-  const invalidate = useInvalidateWallet();
-  const operation = operationKey('send', (variables: SendVariables) =>
-    JSON.stringify([
-      variables.from_account,
-      variables.to_account,
-      variables.source_pool,
-      variables.destination_pool,
-      variables.amount_zatoshi.toString(),
-      variables.memo ?? null,
-    ]),
-  );
-  return useMutation({
-    mutationFn: (variables: SendVariables) =>
-      api.send({ ...variables, idempotency_key: operation.keyFor(variables) }),
-    onSuccess: async (_activity, variables) => {
-      operation.clear(variables);
-      await invalidate();
-    },
-  });
-}
-
-export interface FaucetVariables {
-  account_id: number;
-  pool: Pool;
-  amount_zatoshi: bigint;
-}
-
-type FaucetOperationResult = { activity: Activity; key: string };
-
-export function useFaucet(): UseMutationResult<FaucetOperationResult, Error, FaucetVariables> {
-  const invalidate = useInvalidateWallet();
-  const ownedKeys = useRef(new Map<string, string>());
-  const operation = operationKey(
-    'faucet',
-    (variables: FaucetVariables) =>
-      `${variables.account_id}:${variables.pool}:${variables.amount_zatoshi}`,
-    localStorage,
-  );
-  return useMutation({
-    mutationFn: async (variables: FaucetVariables) => {
-      const name = operation.nameFor(variables);
-      const tabName = `${name}:tab`;
-      const key = await withFaucetLock(name, () => {
-        const legacyKey = sessionStorage.getItem(name);
-        const ownedKey = ownedKeys.current.get(name) ?? sessionStorage.getItem(tabName);
-        if (ownedKey) {
-          sessionStorage.setItem(tabName, ownedKey);
-          if (legacyKey !== null) sessionStorage.removeItem(name);
-          ownedKeys.current.set(name, ownedKey);
-          return ownedKey;
-        }
-
-        const sharedKey = localStorage.getItem(name);
-        if (legacyKey) {
-          if (sharedKey === null) localStorage.setItem(name, legacyKey);
-          // Keep the migrated payment with this tab until it sees confirmation.
-          sessionStorage.setItem(tabName, legacyKey);
-          sessionStorage.removeItem(name);
-          ownedKeys.current.set(name, legacyKey);
-          return legacyKey;
-        }
-        if (legacyKey !== null) sessionStorage.removeItem(name);
-
-        const key = sharedKey ?? operation.keyFor(variables);
-        sessionStorage.setItem(tabName, key);
-        ownedKeys.current.set(name, key);
-        return key;
-      });
-      const activity = await api.faucet({ ...variables, idempotency_key: key });
-      return { activity, key };
-    },
-    onSuccess: async ({ activity, key }, variables) => {
-      if (activity.status === 'confirmed') {
-        const name = operation.nameFor(variables);
-        await withFaucetLock(name, () => {
-          operation.clearIfMatches(variables, key);
-          const tabName = `${name}:tab`;
-          if (sessionStorage.getItem(tabName) === key) sessionStorage.removeItem(tabName);
-          if (ownedKeys.current.get(name) === key) ownedKeys.current.delete(name);
-        });
-      }
-      await invalidate();
-    },
-  });
+export function usePaymentRequest(): UseMutationResult<
+  PaymentRequest,
+  Error,
+  PaymentRequestVariables
+> {
+  return useMutation({ mutationFn: (variables) => api.paymentRequest(variables) });
 }
 
 export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
