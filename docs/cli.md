@@ -11,7 +11,7 @@ For a quick tour of the dashboard itself, see the [README](../README.md).
 - All commands accept two **global options**, which can be placed before or
   after the subcommand:
   - `--name <NAME>` — target a named, isolated environment instead of the
-    default one (default: `default`).
+    default one (default: `default`, or a fresh `run-<UUID>` for `run`).
   - `--json` — print machine-readable JSON instead of human-readable text,
     where the command supports it.
 - Accounts are referred to by **index**, `1` through `5`. Every environment
@@ -22,7 +22,7 @@ For a quick tour of the dashboard itself, see the [README](../README.md).
 - Amounts are ZEC decimal strings with up to 8 decimal places, e.g. `1`,
   `0.5`, `2.25000001`. These are disposable Regtest coins with no value.
 - Every command in this reference (other than `start`, `build`, `pull`,
-  `update`, `uninstall`, `list`, and `doctor`) requires a running environment.
+  `run`, `update`, `uninstall`, `list`, and `doctor`) requires a running environment.
   Start one first with `ths` (or `ths --name <NAME>`).
 
 ---
@@ -45,6 +45,39 @@ The default loopback ports are dashboard `32805`, Zakura RPC `18232`, P2P
 `18233`, and lightwalletd `9067`. `--port-offset` adds a multiple of 10 to
 each host port (default: `0`). Startup fails and names an occupied port
 instead of selecting a random port.
+
+### `ths wait [--timeout <SECONDS>] [--json]`
+
+Waits until Zakura, lightwalletd, and the wallet agree on the canonical chain
+height and hash. The default timeout is 120 seconds. On timeout, the error
+reports the last observed heights and settlement blocker; `--json` prints
+the successful settlement status.
+
+```console
+ths --name protocol wait --timeout 300
+```
+
+### `ths run [--timeout <SECONDS>] -- <COMMAND> [ARGS...]`
+
+Creates a fresh environment, waits for settlement, runs the command in the
+current project directory, then deletes its containers and development data.
+It generates a unique `run-<UUID>` name unless `--name` is supplied, refuses
+an existing environment, and requires the default loopback ports to be free.
+The 120-second default timeout bounds startup and settlement; the child has
+no runtime limit. `--json` is rejected because the child owns stdout.
+
+The child receives `THS_INSTANCE`, `THS_NETWORK=regtest`, `THS_API_URL`,
+`THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS=false`,
+and `THS_P2P_ADDR`. Seeds and spending keys are not exported. Commands that
+read from the controlling terminal are not supported. The launcher preserves
+a nonzero child exit code while reporting any cleanup failure; a successful
+child with failed cleanup makes the launcher fail. Unverified cleanup retains
+its recovery journal.
+
+```console
+ths run -- npm test
+ths --name payment-tests run --timeout 300 -- cargo test --test payments
+```
 
 ### `ths build [--dev]`
 
@@ -433,6 +466,8 @@ account 1 to account 3, all without opening the dashboard.
 | `ths pull` | Pull the exact images for this launcher version |
 | `ths status [--json]` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
+| `ths wait [--timeout N] [--json]` | Wait for an existing environment to settle |
+| `ths run [--timeout N] -- <COMMAND>` | Run against a fresh settled environment, then delete it |
 | `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |

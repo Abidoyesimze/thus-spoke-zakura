@@ -40,9 +40,9 @@ dependencies remain protected. Existing recovery journals with a known container
 ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
-allocation identities. It does not lock an instance name or coordinate separate
-launcher sessions. Exclusive ownership and coordinated stop/reset remain tracked
-in [#175](https://github.com/zcashlabs/thus-spoke-zakura/issues/175). Once ready,
+allocation identities. A per-name lock serializes startup, stop, and reset.
+`run` holds that lock until cleanup; ordinary foreground start releases it
+once ready so another command can stop the environment. Once ready,
 the foreground launcher watches the allocated app container and exits when
 another command deletes it, without deleting the environment again.
 
@@ -332,7 +332,9 @@ has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
 `THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS`, and
 `THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
 the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
-endpoint. `ths run` supports non-interactive commands; commands that read from
+endpoint. `ths run` chooses a fresh `run-<UUID>` name unless `--name` is supplied and
+refuses an existing environment. It uses the default loopback ports, so they
+must be free. `ths run` supports non-interactive commands; commands that read from
 the controlling terminal are not supported.
 
 To wait for an environment you started separately:
@@ -527,10 +529,11 @@ request bodies, wallet keys, wallet databases, or configuration directories.
 
 To prove the regression is sensitive, perform the negative control only after a
 successful live run and only in an isolated verification worktree. Temporarily
-remove the `api::payment_confirmation_loop` task from `background_tasks` in
-`crates/ths-server/src/main.rs`, rerun the same explicit live Cargo command,
+remove the `background.spawn(async move { ... })` block that calls
+`crate::payments::progression::payment_confirmation_loop(state)` from
+`background_tasks` in `crates/ths-server/src/bootstrap.rs`, rerun the same explicit live Cargo command,
 and require failure at background activity recovery after the broadcast,
-intercepted auto-mine failure, and real inclusion checks. Restore the exact line
+intercepted auto-mine failure, and real inclusion checks. Restore the exact block
 immediately, including after a failed run; do not retain the temporary
 production-code edit.
 

@@ -1,0 +1,887 @@
+use crate::{
+    intents::IntentJournal,
+    runtime::{Endpoints, InstanceName, Runtime, container_running, prefix},
+};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct MineResult {
+    pub(crate) blocks: usize,
+    pub(crate) hashes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FaucetResult {
+    address: String,
+    amount_zatoshi: u64,
+    txid: String,
+    block_hash: Option<String>,
+    #[serde(default = "confirmed_status")]
+    status: String,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+fn confirmed_status() -> String {
+    "confirmed".to_owned()
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Activity {
+    id: String,
+    kind: String,
+    from_account: Option<u8>,
+    to_account: Option<u8>,
+    to_address: Option<String>,
+    source_pool: String,
+    destination_pool: String,
+    amount_zatoshi: u64,
+    txid: String,
+    block_hash: Option<String>,
+    status: String,
+    last_error: Option<String>,
+}
+
+/// How long one payment command waits for its accepted payments to settle. The environment keeps
+/// processing them after the command stops waiting.
+const PAYMENT_WAIT: Duration = Duration::from_secs(30);
+const PAYMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+trait Payment: serde::de::DeserializeOwned + Serialize {
+    fn status(&self) -> &str;
+
+    fn settled(&self) -> bool {
+        matches!(self.status(), "confirmed" | "failed")
+    }
+}
+
+impl Payment for Activity {
+    fn status(&self) -> &str {
+        &self.status
+    }
+}
+
+impl Payment for FaucetResult {
+    fn status(&self) -> &str {
+        &self.status
+    }
+}
+
+/// What one invocation observed about a payment it followed by its retained key.
+enum Followed<T> {
+    /// `confirmed` or `failed`.
+    Settled(T),
+    Pending(T),
+    /// The environment refused the request (4xx), so it was never accepted.
+    Rejected(anyhow::Error),
+    /// Neither the submission nor any status read returned the operation; it may still exist.
+    Unknown(anyhow::Error),
+}
+
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|left| !left.is_zero())
+}
+
+/// Submits each key once, then reads the status of unsettled ones about once per second until
+/// `deadline`. Status reads never resubmit, and every network wait is bounded by the time left.
+fn follow_payments<T: Payment>(
+    deadline: Instant,
+    keys: &[String],
+    json: bool,
+    mut submit: impl FnMut(&str, Duration) -> reqwest::Result<reqwest::blocking::Response>,
+    mut status: impl FnMut(&str, Duration) -> Result<Option<T>>,
+) -> Vec<Followed<T>> {
+    let mut followed: Vec<_> = keys
+        .iter()
+        .map(|key| {
+            let Some(left) = remaining(deadline) else {
+                return Followed::Unknown(anyhow!(
+                    "the wait ended before this payment was submitted"
+                ));
+            };
+            match submit(key, left) {
+                Ok(response) => {
+                    let refused = response.status().is_client_error();
+                    match decode_response::<T>(response) {
+                        Ok(payment) if payment.settled() => Followed::Settled(payment),
+                        Ok(payment) => Followed::Pending(payment),
+                        Err(error) if refused => Followed::Rejected(error),
+                        Err(error) => Followed::Unknown(error),
+                    }
+                }
+                Err(error) => Followed::Unknown(error.into()),
+            }
+        })
+        .collect();
+    let unsettled =
+        |entry: &Followed<T>| matches!(entry, Followed::Pending(_) | Followed::Unknown(_));
+    // A round runs only when its status reads still have time after the full sleep.
+    let round_time = || remaining(deadline).filter(|left| *left > PAYMENT_POLL_INTERVAL);
+    if !json
+        && followed.iter().any(unsettled)
+        && let Some(left) = round_time()
+    {
+        eprintln!(
+            "Waiting up to {} seconds for confirmation. Ctrl+C stops waiting; the environment keeps processing the payment.",
+            left.as_secs()
+        );
+    }
+    while followed.iter().any(unsettled) && round_time().is_some() {
+        std::thread::sleep(PAYMENT_POLL_INTERVAL);
+        for (key, entry) in keys.iter().zip(&mut followed) {
+            if !unsettled(entry) {
+                continue;
+            }
+            let Some(left) = remaining(deadline) else {
+                break;
+            };
+            match status(key, left) {
+                Ok(Some(payment)) if payment.settled() => *entry = Followed::Settled(payment),
+                Ok(Some(payment)) => *entry = Followed::Pending(payment),
+                // A pending payment keeps its last observed state; a failed read is not a failure.
+                Ok(None) => {
+                    if let Followed::Unknown(_) = entry {
+                        *entry = Followed::Unknown(anyhow!(
+                            "the environment has no record of this payment yet"
+                        ));
+                    }
+                }
+                Err(error) => {
+                    if let Followed::Unknown(_) = entry {
+                        *entry = Followed::Unknown(error);
+                    }
+                }
+            }
+        }
+    }
+    followed
+}
+
+/// Reads an account payment by its idempotency key without resubmitting it.
+fn activity_status(
+    client: &reqwest::blocking::Client,
+    dashboard: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<Option<Activity>> {
+    let mut matches: Vec<Activity> = client
+        .get(format!("{dashboard}/api/v1/activity"))
+        .query(&[("idempotency_key", key)])
+        .timeout(timeout)
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .context("reading payment status")?;
+    if matches.len() > 1 {
+        bail!(
+            "reading payment status: the environment returned {} activities for one idempotency key",
+            matches.len()
+        );
+    }
+    Ok(matches.pop())
+}
+
+/// Reads an address faucet payment by its idempotency key without resubmitting it.
+fn address_faucet_status(
+    client: &reqwest::blocking::Client,
+    dashboard: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<Option<FaucetResult>> {
+    let response = client
+        .get(format!("{dashboard}/api/v1/faucet/address"))
+        .query(&[("idempotency_key", key)])
+        .timeout(timeout)
+        .send()
+        .context("reading payment status")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    decode_response(response)
+        .map(Some)
+        .context("reading payment status")
+}
+
+/// Operation JSON for a payment this invocation could not settle, plus the key that resumes it.
+pub(crate) fn unresolved_json<T: Serialize>(
+    payment: Option<&T>,
+    key: &str,
+) -> Result<serde_json::Value> {
+    let mut value = match payment {
+        Some(payment) => serde_json::to_value(payment)?,
+        None => serde_json::json!({"status": "unknown"}),
+    };
+    value["idempotency_key"] = key.into();
+    Ok(value)
+}
+
+impl Activity {
+    fn recipient(&self) -> String {
+        match (self.to_account, &self.to_address) {
+            (Some(id), _) => format!("account {id}"),
+            (None, Some(address)) => address.clone(),
+            (None, None) => "an unknown recipient".to_owned(),
+        }
+    }
+}
+
+/// A single-payment ZIP-321 URI as resolved by the server.
+#[derive(Deserialize)]
+struct PaymentUri {
+    address: String,
+    destination_pool: String,
+    amount_zatoshi: Option<u64>,
+    memo: Option<String>,
+}
+
+impl Runtime {
+    fn instance_client(&self, name: &InstanceName) -> Result<(String, reqwest::blocking::Client)> {
+        let app_container = format!("{}-app", prefix(name));
+        if !container_running(&app_container)? {
+            bail!("environment {name} is not running; start it with `ths --name {name}`");
+        }
+        let dashboard = self.read_instance(name)?.endpoints.dashboard;
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+        Ok((dashboard, client))
+    }
+
+    pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        let result: MineResult = client
+            .post(format!("{dashboard}/api/v1/mine"))
+            .json(&serde_json::json!({"blocks": blocks}))
+            .send()
+            .map_err(anyhow::Error::from)
+            .and_then(decode_response)
+            .with_context(|| format!("asking environment {name} to mine {blocks} blocks"))?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!("Mined {} blocks on {name}.", result.blocks);
+            if let Some(tip) = result.hashes.last() {
+                println!("New tip: {tip}");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn faucet(
+        &self,
+        name: &InstanceName,
+        address: &str,
+        amount_zatoshi: u64,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        self.faucet_with(
+            name,
+            &dashboard,
+            &client,
+            std::io::stdout().lock(),
+            Instant::now() + PAYMENT_WAIT,
+            address,
+            amount_zatoshi,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn faucet_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        deadline: Instant,
+        address: &str,
+        amount_zatoshi: u64,
+        json: bool,
+    ) -> Result<()> {
+        let journal = IntentJournal::open(&self.instance_dir(name), "faucet")?;
+        let intent = format!("address:{address}:{amount_zatoshi}");
+        let idempotency_key = journal.key_for(&intent)?;
+        let followed = follow_payments(
+            deadline,
+            std::slice::from_ref(&idempotency_key),
+            json,
+            |key, timeout| {
+                client
+                    .post(format!("{dashboard}/api/v1/faucet/address"))
+                    .json(&serde_json::json!({
+                        "address": address,
+                        "amount_zatoshi": amount_zatoshi,
+                        "idempotency_key": key,
+                    }))
+                    .timeout(timeout)
+                    .send()
+            },
+            |key, timeout| address_faucet_status(client, dashboard, key, timeout),
+        )
+        .remove(0);
+        let result = match followed {
+            Followed::Settled(result) => result,
+            Followed::Pending(result) => {
+                if json {
+                    let output = unresolved_json(Some(&result), &idempotency_key)?;
+                    writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+                } else {
+                    if !result.txid.is_empty() {
+                        writeln!(out, "Transaction: {}", result.txid)?;
+                    }
+                    writeln!(
+                        out,
+                        "Payment to {} is pending ({}). Idempotency key: {idempotency_key}",
+                        result.address, result.status
+                    )?;
+                    writeln!(out, "Run the same command to check it again.")?;
+                }
+                bail!("faucet payment is pending; run the same command to check it again")
+            }
+            Followed::Unknown(error) => {
+                if json {
+                    let output = unresolved_json::<FaucetResult>(None, &idempotency_key)?;
+                    writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+                } else {
+                    writeln!(
+                        out,
+                        "Payment to {address} is unknown. Idempotency key: {idempotency_key}"
+                    )?;
+                    writeln!(out, "Run the same command to check it again.")?;
+                }
+                return Err(error.context(format!(
+                    "could not read the faucet payment status from environment {name}; run the same command to check it again"
+                )));
+            }
+            Followed::Rejected(error) => {
+                return Err(error.context(format!("asking environment {name} to fund {address}")));
+            }
+        };
+        if result.status == "confirmed" && result.block_hash.is_none() {
+            bail!("faucet reported confirmation without a block hash; retry the same command");
+        }
+        journal.clear(&[(&intent, &idempotency_key)])?;
+        if json {
+            writeln!(out, "{}", serde_json::to_string_pretty(&result)?)?;
+        }
+        if result.status == "failed" {
+            bail!(
+                "faucet payment to {} failed: {}",
+                result.address,
+                result.last_error.as_deref().unwrap_or("no reason recorded")
+            );
+        }
+        if !json {
+            writeln!(out, "Transaction: {}", result.txid)?;
+            writeln!(
+                out,
+                "Sent {} ZEC to {} on {name}.",
+                format_zec(result.amount_zatoshi),
+                result.address
+            )?;
+            if let Some(block_hash) = &result.block_hash {
+                writeln!(out, "Confirmed in: {block_hash}")?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn wallet_faucet(
+        &self,
+        name: &InstanceName,
+        accounts: &[u8],
+        amount_zatoshi: u64,
+        pool: &str,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        self.wallet_faucet_with(
+            name,
+            &dashboard,
+            &client,
+            std::io::stdout().lock(),
+            Instant::now() + PAYMENT_WAIT,
+            accounts,
+            amount_zatoshi,
+            pool,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wallet_faucet_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        deadline: Instant,
+        accounts: &[u8],
+        amount_zatoshi: u64,
+        pool: &str,
+        json: bool,
+    ) -> Result<()> {
+        let journal = IntentJournal::open(&self.instance_dir(name), "faucet")?;
+        let batch = journal.wallet_batch(pool, amount_zatoshi, accounts)?;
+        let intents: Vec<_> = accounts.iter().map(|id| format!("{batch}:{id}")).collect();
+        // Every component keeps its key until the whole batch settles, so a resumed batch replays
+        // completed components by key instead of paying them again.
+        let keys = intents
+            .iter()
+            .map(|intent| journal.key_for(intent))
+            .collect::<Result<Vec<_>>>()?;
+        let account_for = |key: &str| {
+            keys.iter()
+                .position(|candidate| candidate == key)
+                .map(|index| accounts[index])
+                .expect("followed keys belong to this batch")
+        };
+        let followed = follow_payments(
+            deadline,
+            &keys,
+            json,
+            |key, timeout| {
+                client
+                    .post(format!("{dashboard}/api/v1/faucet"))
+                    .json(&serde_json::json!({
+                        "account_id": account_for(key),
+                        "pool": pool,
+                        "amount_zatoshi": amount_zatoshi,
+                        "idempotency_key": key,
+                    }))
+                    .timeout(timeout)
+                    .send()
+            },
+            |key, timeout| activity_status(client, dashboard, key, timeout),
+        );
+        let mut funded = Vec::new();
+        let mut pending = Vec::new();
+        let mut failures = Vec::new();
+        for ((&account_id, key), outcome) in accounts.iter().zip(&keys).zip(&followed) {
+            match outcome {
+                Followed::Settled(activity) if activity.status == "confirmed" => {
+                    funded.push(activity)
+                }
+                Followed::Settled(activity) => failures.push(format!(
+                    "account {account_id}: payment failed: {}",
+                    activity
+                        .last_error
+                        .as_deref()
+                        .unwrap_or("no reason recorded")
+                )),
+                Followed::Pending(activity) => {
+                    pending.push((account_id, unresolved_json(Some(activity), key)?))
+                }
+                Followed::Unknown(error) => {
+                    let mut unknown = unresolved_json::<Activity>(None, key)?;
+                    unknown["to_account"] = account_id.into();
+                    unknown["error"] = format!("{error:#}").into();
+                    pending.push((account_id, unknown));
+                }
+                Followed::Rejected(error) => {
+                    failures.push(format!("account {account_id}: {error:#}"))
+                }
+            }
+        }
+        if followed
+            .iter()
+            .all(|outcome| matches!(outcome, Followed::Settled(_)))
+        {
+            let settled: Vec<_> = intents
+                .iter()
+                .zip(&keys)
+                .map(|(intent, key)| (intent.as_str(), key.as_str()))
+                .collect();
+            journal.clear(&settled)?;
+        }
+        if json {
+            let pending: Vec<_> = pending.iter().map(|(_, value)| value).collect();
+            writeln!(
+                out,
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"funded": funded, "pending": pending, "failed": failures})
+                )?
+            )?;
+        } else {
+            for activity in &funded {
+                writeln!(
+                    out,
+                    "Funded {} with {} ZEC ({} pool) on {name}.",
+                    activity.recipient(),
+                    format_zec(activity.amount_zatoshi),
+                    activity.destination_pool
+                )?;
+                writeln!(out, "  Transaction: {}", activity.txid)?;
+            }
+            for (account_id, unresolved) in &pending {
+                eprintln!(
+                    "Payment to account {account_id} is {} (idempotency key {}). Run the same command to check it again.",
+                    unresolved["status"].as_str().unwrap_or("pending"),
+                    unresolved["idempotency_key"].as_str().unwrap_or_default()
+                );
+            }
+            for failure in &failures {
+                eprintln!("Failed to fund {failure}");
+            }
+        }
+        if failures.is_empty() && pending.is_empty() {
+            Ok(())
+        } else {
+            bail!(
+                "{} of {} faucet requests are pending or failed",
+                failures.len() + pending.len(),
+                accounts.len()
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wallet_send(
+        &self,
+        name: &InstanceName,
+        from: u8,
+        to: u8,
+        source_pool: &str,
+        destination_pool: &str,
+        amount_zatoshi: u64,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        self.submit_send(
+            name,
+            &dashboard,
+            &client,
+            std::io::stdout().lock(),
+            Instant::now() + PAYMENT_WAIT,
+            from,
+            serde_json::json!({
+                "from_account": from,
+                "to_account": to,
+                "source_pool": source_pool,
+                "destination_pool": destination_pool,
+                "amount_zatoshi": amount_zatoshi,
+                "memo": memo,
+            }),
+            memo,
+            json,
+        )
+    }
+
+    /// Pays a ZIP-321 URI. The server parses it, so the CLI and the dashboard
+    /// accept exactly the same URIs.
+    pub fn wallet_send_uri(
+        &self,
+        name: &InstanceName,
+        from: u8,
+        source_pool: &str,
+        uri: &str,
+        amount_zatoshi: Option<u64>,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        self.wallet_send_uri_with(
+            name,
+            &dashboard,
+            &client,
+            from,
+            source_pool,
+            uri,
+            amount_zatoshi,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wallet_send_uri_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        from: u8,
+        source_pool: &str,
+        uri: &str,
+        amount_zatoshi: Option<u64>,
+        json: bool,
+    ) -> Result<()> {
+        let response = client
+            .post(format!("{dashboard}/api/v1/zip321/parse"))
+            .json(&serde_json::json!({ "uri": uri }))
+            .send()
+            .with_context(|| format!("asking environment {name} to read the payment URI"))?;
+        let request: PaymentUri = decode_response(response)?;
+        let amount_zatoshi = match (request.amount_zatoshi, amount_zatoshi) {
+            (Some(amount), None) | (None, Some(amount)) => amount,
+            (Some(_), Some(_)) => bail!("the payment URI already sets an amount; omit --amount"),
+            (None, None) => bail!("the payment URI has no amount; pass --amount"),
+        };
+        self.submit_send(
+            name,
+            dashboard,
+            client,
+            std::io::stdout().lock(),
+            Instant::now() + PAYMENT_WAIT,
+            from,
+            serde_json::json!({
+                "from_account": from,
+                "to_address": request.address,
+                "source_pool": source_pool,
+                "destination_pool": request.destination_pool,
+                "amount_zatoshi": amount_zatoshi,
+                "memo": request.memo,
+            }),
+            request.memo.as_deref(),
+            json,
+        )
+    }
+
+    /// Submits `body` under the idempotency key saved for it, so running the same command again
+    /// checks the original payment instead of creating another.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit_send(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        deadline: Instant,
+        from: u8,
+        mut body: serde_json::Value,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        let journal = IntentJournal::open(&self.instance_dir(name), "send")?;
+        // serde_json sorts object keys, so the body before its key is added identifies the request
+        // exactly: every field distinguishes intents, and an absent memo (`null`) differs from an
+        // empty one.
+        let fingerprint = serde_json::to_string(&body)?;
+        let resumed = journal.read()?.contains_key(&fingerprint);
+        let idempotency_key = journal.key_for(&fingerprint)?;
+        if resumed && !json {
+            eprintln!("Checking the saved payment with idempotency key {idempotency_key}.");
+        }
+        body["idempotency_key"] = idempotency_key.as_str().into();
+        let followed = follow_payments(
+            deadline,
+            std::slice::from_ref(&idempotency_key),
+            json,
+            |_, timeout| {
+                client
+                    .post(format!("{dashboard}/api/v1/send"))
+                    .json(&body)
+                    .timeout(timeout)
+                    .send()
+            },
+            |key, timeout| activity_status(client, dashboard, key, timeout),
+        )
+        .remove(0);
+        let activity = match followed {
+            Followed::Settled(activity) => activity,
+            Followed::Pending(activity) => {
+                if json {
+                    let output = unresolved_json(Some(&activity), &idempotency_key)?;
+                    writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+                } else {
+                    if !activity.txid.is_empty() {
+                        writeln!(out, "Transaction: {}", activity.txid)?;
+                    }
+                    writeln!(
+                        out,
+                        "Payment from account {from} to {} is pending ({}). Idempotency key: {idempotency_key}",
+                        activity.recipient(),
+                        activity.status
+                    )?;
+                    writeln!(out, "Run the same command to check it again.")?;
+                }
+                bail!("payment is pending; run the same command to check it again")
+            }
+            Followed::Unknown(error) => {
+                if json {
+                    let output = unresolved_json::<Activity>(None, &idempotency_key)?;
+                    writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+                } else {
+                    writeln!(
+                        out,
+                        "Payment from account {from} is unknown. Idempotency key: {idempotency_key}"
+                    )?;
+                    writeln!(out, "Run the same command to check it again.")?;
+                }
+                return Err(error.context(format!(
+                    "could not read the payment status from environment {name}; run the same command to check it again"
+                )));
+            }
+            Followed::Rejected(error) => {
+                return Err(error.context(format!("asking environment {name} to send")));
+            }
+        };
+        journal.clear(&[(&fingerprint, &idempotency_key)])?;
+        if json {
+            writeln!(out, "{}", serde_json::to_string_pretty(&activity)?)?;
+        }
+        if activity.status == "failed" {
+            bail!(
+                "payment from account {from} to {} failed: {}",
+                activity.recipient(),
+                activity
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("no reason recorded")
+            );
+        }
+        if !json {
+            writeln!(
+                out,
+                "Sent {} ZEC from account {} ({} pool) to {} ({} pool) on {name}.",
+                format_zec(activity.amount_zatoshi),
+                from,
+                activity.source_pool,
+                activity.recipient(),
+                activity.destination_pool
+            )?;
+            if let Some(memo) = memo {
+                writeln!(out, "Memo: {memo}")?;
+            }
+            writeln!(out, "Transaction: {}", activity.txid)?;
+            if let Some(block_hash) = &activity.block_hash {
+                writeln!(out, "Confirmed in: {block_hash}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn decode_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::blocking::Response,
+) -> Result<T> {
+    let status = response.status();
+    if !status.is_success() {
+        let detail = response
+            .text()
+            .unwrap_or_else(|_| "response body was unreadable".to_owned());
+        bail!("rejected ({status}): {detail}");
+    }
+    response.json().context("decoding response")
+}
+
+fn format_zec(zatoshi: u64) -> String {
+    let whole = zatoshi / 100_000_000;
+    let fraction = zatoshi % 100_000_000;
+    if fraction == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{fraction:08}")
+            .trim_end_matches('0')
+            .to_owned()
+    }
+}
+
+impl Runtime {
+    pub fn wallet_balances(&self, name: &InstanceName, json: bool) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        let accounts = account_balances(&dashboard, &client, name)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&accounts)?);
+        } else {
+            println!("{}", balance_lines(&accounts));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct Account {
+    pub(crate) id: u8,
+    pub(crate) transparent_address: String,
+    pub(crate) unified_address: String,
+    pub(crate) transparent_zatoshi: u64,
+    pub(crate) ironwood_zatoshi: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServerStatus {
+    wallet_sync: WalletSyncStatus,
+}
+
+#[derive(Debug, Deserialize)]
+struct WalletSyncStatus {
+    state: String,
+    error: Option<String>,
+}
+
+pub(crate) fn account_balances(
+    dashboard: &str,
+    client: &reqwest::blocking::Client,
+    name: &InstanceName,
+) -> Result<Vec<Account>> {
+    let status: ServerStatus = client
+        .get(format!("{dashboard}/api/v1/status"))
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("checking wallet sync for environment {name}"))?;
+    match status.wallet_sync.state.as_str() {
+        "ready" => {}
+        "syncing" => bail!("wallet for environment {name} is still syncing; try again later"),
+        "error" => bail!(
+            "wallet synchronization failed for environment {name}: {}",
+            status
+                .wallet_sync
+                .error
+                .as_deref()
+                .unwrap_or("no error detail was provided")
+        ),
+        state => bail!("wallet for environment {name} has unknown sync state `{state}`"),
+    }
+    client
+        .get(format!("{dashboard}/api/v1/accounts"))
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("asking environment {name} for account balances"))
+}
+
+pub(crate) fn balance_lines(accounts: &[Account]) -> String {
+    accounts
+        .iter()
+        .map(|account| {
+            format!(
+                "Account {}\n  Transparent  {} ZEC  {}\n  Ironwood     {} ZEC  {}",
+                account.id,
+                format_zec(account.transparent_zatoshi),
+                account.transparent_address,
+                format_zec(account.ironwood_zatoshi),
+                account.unified_address
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuntimeStatus {
+    pub(crate) node_height: Option<u64>,
+    pub(crate) lightwalletd_height: Option<u64>,
+    pub(crate) wallet_scanned_height: Option<u64>,
+    pub(crate) wallet_sync_state: String,
+    pub(crate) settled: bool,
+    pub(crate) settlement_blocker: Option<String>,
+}
+pub(crate) fn runtime_status(endpoints: &Endpoints, timeout: Duration) -> Result<RuntimeStatus> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .build()?
+        .get(format!("{}/api/v1/status", endpoints.dashboard))
+        .send()
+        .context("reading runtime status")?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("runtime status returned {status}");
+    }
+    response.json().context("decoding runtime status")
+}
