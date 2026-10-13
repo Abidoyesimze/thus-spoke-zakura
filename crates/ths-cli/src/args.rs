@@ -1,0 +1,243 @@
+mod amount;
+
+use std::{ffi::OsString, path::PathBuf};
+
+use anyhow::{Result, bail};
+use clap::{Parser, Subcommand};
+
+use crate::runtime::InstanceName;
+pub(crate) use amount::{SendAmount, ZecAmount};
+
+#[derive(Parser)]
+#[command(
+    name = "ths",
+    version,
+    about = "A one-command Zakura regtest environment"
+)]
+pub(crate) struct Cli {
+    /// Isolated environment name.
+    #[arg(long, global = true)]
+    pub(crate) name: Option<InstanceName>,
+    /// Print machine-readable output where supported.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Command {
+    /// Start an environment in the foreground; interrupting deletes it.
+    Start {
+        #[arg(long)]
+        no_open: bool,
+        /// Add this many to the default loopback ports. Must be a multiple of 10.
+        #[arg(long, default_value_t = 0)]
+        port_offset: u16,
+    },
+    /// Wait until an existing environment is settled.
+    Wait {
+        /// Maximum time for settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+    },
+    /// Run a command in a fresh, settled environment and delete it afterward.
+    Run {
+        /// Maximum time for startup and settlement, in seconds.
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// Command and arguments to execute.
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<OsString>,
+    },
+    /// Build the runtime images from the current source.
+    Build {
+        /// Keep workspace Rust code unoptimized while optimizing dependencies.
+        #[arg(long)]
+        dev: bool,
+    },
+    /// Pull the exact runtime images for this launcher version.
+    Pull,
+    /// Check for or install a released launcher version.
+    Update {
+        /// Exact version to install, including an intentional rollback.
+        #[arg(value_name = "VERSION", conflicts_with = "check")]
+        version: Option<String>,
+        /// Only report whether a newer stable release is available.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Remove this installed launcher executable.
+    Uninstall,
+    /// Show service and endpoint status.
+    Status,
+    /// Open the dashboard in the default browser.
+    Open,
+    /// Print endpoints for developer tooling.
+    Endpoints,
+    /// Mine blocks on a running development environment.
+    Mine {
+        /// Number of blocks to mine.
+        #[arg(value_parser = clap::value_parser!(u32).range(1..=10_000))]
+        blocks: u32,
+    },
+    /// Send disposable Regtest ZEC to a unified or transparent address.
+    Faucet {
+        /// Regtest unified or transparent destination address.
+        address: String,
+        /// Amount of ZEC to send (maximum 5, up to 8 decimal places).
+        #[arg(long, default_value = "1")]
+        amount: ZecAmount,
+    },
+    /// Act on the development wallet held by the running ths server.
+    Wallet {
+        #[command(subcommand)]
+        action: WalletCommand,
+    },
+    /// Stream or print service logs.
+    Logs {
+        #[arg(value_parser = ["app", "zakura", "lightwalletd"])]
+        service: Option<String>,
+        #[arg(short, long)]
+        follow: bool,
+        /// Print the last LINES lines.
+        #[arg(long, value_name = "LINES", value_parser = clap::value_parser!(u64).range(1..))]
+        tail: Option<u64>,
+        /// Print the first LINES lines and exit.
+        #[arg(
+            long,
+            value_name = "LINES",
+            value_parser = clap::value_parser!(u64).range(1..),
+            conflicts_with_all = ["tail", "follow"]
+        )]
+        head: Option<u64>,
+    },
+    /// Stop and delete an environment.
+    Stop,
+    /// Delete one environment and all of its volumes.
+    Reset {
+        #[arg(long)]
+        force: bool,
+    },
+    /// List known environments.
+    List,
+    /// Check local Docker and configuration prerequisites.
+    Doctor,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WalletCommand {
+    /// Show current account addresses and spendable balances.
+    Balances,
+    /// Send faucet funds from the treasury to one or more accounts.
+    Faucet {
+        /// Account indices to fund (1-5), e.g. --accounts 1,2,3,5.
+        #[arg(
+            long,
+            required = true,
+            value_delimiter = ',',
+            value_parser = clap::value_parser!(u8).range(1..=5)
+        )]
+        accounts: Vec<u8>,
+        /// Amount of ZEC to send to each account (maximum 5, up to 8 decimal places).
+        #[arg(long, default_value = "1")]
+        amount: ZecAmount,
+        /// Pool to fund.
+        #[arg(long, value_enum, default_value = "ironwood")]
+        pool: Pool,
+    },
+    /// Send funds between development accounts or pools.
+    Send(SendArgs),
+    /// Spend transparent funds into an account's ironwood balance.
+    Shield {
+        /// Account index to shield from (1-5).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        from: u8,
+        /// Destination account index (1-5); may match --from.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        to: u8,
+        /// Amount of ZEC to shield, up to 8 decimal places.
+        #[arg(long)]
+        amount: SendAmount,
+        /// Text memo for the recipient (up to 512 bytes).
+        #[arg(long, value_parser = parse_memo)]
+        memo: Option<String>,
+    },
+    /// Spend ironwood funds into an account's transparent balance.
+    Unshield {
+        /// Account index to unshield from (1-5).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        from: u8,
+        /// Destination account index (1-5); may match --from.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        to: u8,
+        /// Amount of ZEC to unshield, up to 8 decimal places.
+        #[arg(long)]
+        amount: SendAmount,
+    },
+}
+
+#[derive(clap::Args)]
+pub(crate) struct SendArgs {
+    /// Source account index (1-5).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+    pub(crate) from: u8,
+    /// Destination account index (1-5); may match --from when pools differ.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(1..=5),
+        required_unless_present = "uri",
+        conflicts_with = "uri"
+    )]
+    pub(crate) to: Option<u8>,
+    /// ZIP-321 payment URI to pay instead of --to. It sets the destination,
+    /// pool, and memo, and the amount unless it omits one.
+    #[arg(long, conflicts_with_all = ["destination_pool", "memo"])]
+    pub(crate) uri: Option<String>,
+    /// Amount of ZEC to send, up to 8 decimal places. With --uri, only for a
+    /// URI that does not set an amount.
+    #[arg(long, required_unless_present = "uri")]
+    pub(crate) amount: Option<SendAmount>,
+    /// Pool to spend from.
+    #[arg(long = "source-pool", value_enum, default_value = "ironwood")]
+    pub(crate) source_pool: Pool,
+    /// Pool the destination account receives into.
+    #[arg(long = "destination-pool", value_enum, default_value = "ironwood")]
+    pub(crate) destination_pool: Pool,
+    /// Text memo for the recipient (up to 512 bytes; ironwood destinations only).
+    #[arg(long, value_parser = parse_memo)]
+    pub(crate) memo: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub(crate) enum Pool {
+    Ironwood,
+    Transparent,
+}
+
+impl Pool {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Pool::Ironwood => "ironwood",
+            Pool::Transparent => "transparent",
+        }
+    }
+}
+
+fn _assert_pathbuf_send(_: PathBuf) {}
+
+/// `--memo ""` is allowed and sends an explicit empty text memo.
+fn parse_memo(value: &str) -> Result<String> {
+    if value.len() > 512 {
+        bail!("memo is {} bytes; the maximum is 512", value.len());
+    }
+    if value.ends_with('\0') {
+        bail!("memo must not end with a NUL character");
+    }
+    Ok(value.to_owned())
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/args/tests.rs"]
+mod tests;

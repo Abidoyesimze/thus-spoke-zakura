@@ -201,6 +201,22 @@ impl QueuedBroadcastProxy {
         Ok(())
     }
 
+    pub fn assert_identical_broadcasts(&self) -> Result<()> {
+        let state = self.shared.broadcasts.lock().unwrap();
+        anyhow::ensure!(
+            !state.requests.is_empty(),
+            "original signed broadcast was not observed"
+        );
+        anyhow::ensure!(
+            state
+                .requests
+                .iter()
+                .all(|request| request == &state.requests[0]),
+            "background progression replaced the signed broadcast"
+        );
+        Ok(())
+    }
+
     pub async fn shutdown(&mut self) -> Result<()> {
         self.server.shutdown().await
     }
