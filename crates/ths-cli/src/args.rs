@@ -183,11 +183,21 @@ pub(crate) struct SendArgs {
     #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
     pub(crate) from: u8,
     /// Destination account index (1-5); may match --from when pools differ.
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
-    pub(crate) to: u8,
-    /// Amount of ZEC to send, up to 8 decimal places.
-    #[arg(long)]
-    pub(crate) amount: SendAmount,
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(1..=5),
+        required_unless_present = "uri",
+        conflicts_with = "uri"
+    )]
+    pub(crate) to: Option<u8>,
+    /// ZIP-321 payment URI to pay instead of --to. It sets the destination,
+    /// pool, and memo, and the amount unless it omits one.
+    #[arg(long, conflicts_with_all = ["destination_pool", "memo"])]
+    pub(crate) uri: Option<String>,
+    /// Amount of ZEC to send, up to 8 decimal places. With --uri, only for a
+    /// URI that does not set an amount.
+    #[arg(long, required_unless_present = "uri")]
+    pub(crate) amount: Option<SendAmount>,
     /// Pool to spend from.
     #[arg(long = "source-pool", value_enum, default_value = "ironwood")]
     pub(crate) source_pool: Pool,

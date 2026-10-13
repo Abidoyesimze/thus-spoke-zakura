@@ -122,7 +122,15 @@ async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
         let claim = store
-            .claim_transfer(1, to, source, destination, 12_000, "same", None)
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(to),
+                source,
+                destination,
+                12_000,
+                "same",
+                None,
+            )
             .unwrap();
         store
             .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -201,7 +209,15 @@ async fn queued_retry_keeps_the_original_payment_pending_until_confirmation() {
     let store = Store::open(&path).unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same-queued", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same-queued",
+            None,
+        )
         .unwrap();
     let prepared = store
         .record_prepared(&claim.id, "original-txid", b"original signed bytes", 140)
@@ -241,7 +257,15 @@ async fn queued_retry_keeps_the_original_payment_pending_until_confirmation() {
         [b"original signed bytes"]
     );
     let same = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same-queued", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same-queued",
+            None,
+        )
         .unwrap();
     assert_eq!(same.id, pending.id);
     assert_eq!(same.txid, pending.txid);
@@ -306,7 +330,15 @@ async fn a_known_transaction_does_not_require_saved_bytes() {
     let store = Store::open(&path).unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     let prepared = store
         .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -336,7 +368,15 @@ async fn a_legacy_broadcast_recovers_bytes_from_the_wallet() {
     let store = Store::open(&path).unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     let prepared = store
         .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -412,7 +452,15 @@ fn prepared_payment(expiry_height: u64) -> (Store, Activity) {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     store
         .record_prepared(&claim.id, "real-txid", b"signed transaction", expiry_height)

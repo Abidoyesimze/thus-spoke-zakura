@@ -155,8 +155,8 @@ fn wallet_send_and_shield_accept_bounded_memos() {
     else {
         panic!("expected ths wallet send");
     };
-    assert_eq!((args.from, args.to), (1, 2));
-    assert_eq!(args.amount.zatoshi(), 150_000_000);
+    assert_eq!((args.from, args.to), (1, Some(2)));
+    assert_eq!(args.amount.unwrap().zatoshi(), 150_000_000);
     assert_eq!(args.source_pool, Pool::Transparent);
     assert_eq!(args.destination_pool, Pool::Ironwood);
     assert_eq!(args.memo.as_deref(), Some("hello"));
@@ -234,4 +234,42 @@ fn parses_wallet_balances_with_global_json_after_subcommand() {
             action: WalletCommand::Balances
         })
     ));
+}
+
+#[test]
+fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
+    let parse = |args: &[&str]| {
+        let mut argv = vec!["ths", "wallet", "send", "--from", "1"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv)
+    };
+    let Ok(Cli {
+        command: Some(Command::Wallet {
+            action: WalletCommand::Send(args),
+        }),
+        ..
+    }) = parse(&["--uri", "zcash:uregtest1abc?amount=1"])
+    else {
+        panic!("expected ths wallet send --uri");
+    };
+    assert_eq!(args.uri.as_deref(), Some("zcash:uregtest1abc?amount=1"));
+    assert_eq!((args.to, args.amount), (None, None));
+
+    // --amount is still accepted for a URI that omits one.
+    assert!(parse(&["--uri", "zcash:uregtest1abc", "--amount", "1"]).is_ok());
+    // The URI already names the destination, its pool, and any memo.
+    assert!(parse(&["--uri", "zcash:uregtest1abc", "--to", "2"]).is_err());
+    assert!(
+        parse(&[
+            "--uri",
+            "zcash:uregtest1abc",
+            "--destination-pool",
+            "ironwood"
+        ])
+        .is_err()
+    );
+    assert!(parse(&["--uri", "zcash:uregtest1abc", "--memo", "hi"]).is_err());
+    // Without a URI, a destination and an amount are required.
+    assert!(parse(&["--amount", "1"]).is_err());
+    assert!(parse(&["--to", "2"]).is_err());
 }

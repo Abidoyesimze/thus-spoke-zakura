@@ -4,8 +4,9 @@ use crate::args::SendAmount;
 fn send_args(from: u8, to: u8, destination_pool: Pool, memo: Option<&str>) -> SendArgs {
     SendArgs {
         from,
-        to,
-        amount: SendAmount(1),
+        to: Some(to),
+        uri: None,
+        amount: Some(SendAmount(1)),
         source_pool: Pool::Ironwood,
         destination_pool,
         memo: memo.map(str::to_owned),

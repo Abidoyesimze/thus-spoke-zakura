@@ -87,7 +87,9 @@ pub(super) async fn address_faucet_retry_after_server_restart_pays_each_destinat
             )
             .await?;
             anyhow::ensure!(
-                replay.status == "confirmed" && replay.txid == first.txid,
+                replay.status == "confirmed"
+                    && replay.txid == first.txid
+                    && replay.last_error.is_none(),
                 "retry constructed another payment instead of confirming the original"
             );
             anyhow::ensure!(
@@ -140,19 +142,20 @@ pub(super) async fn internal_address_faucets_record_confirmed_activity() -> Resu
             (&account.transparent_address, "transparent"),
         ] {
             let before = faucet_activities(&client, &fixture).await?;
-            let response = address_faucet_request(&client, &fixture, address).await?;
+            let key = uuid::Uuid::new_v4().to_string();
+            let response = address_faucet_request(&client, &fixture, address, &key).await?;
             let after = faucet_activities(&client, &fixture).await?;
             let row = new_faucet_activity(&before, &after)?;
             assert_eq!(row.kind, "faucet");
             assert_eq!(row.from_account, None);
-            assert_eq!(row.to_account, 2);
+            assert_eq!(row.to_account, Some(2));
             assert_eq!(row.source_pool, "ironwood");
             assert_eq!(row.destination_pool, pool);
             assert_eq!(row.amount_zatoshi, 100_000_000);
             assert_eq!(row.status, "confirmed");
             assert_eq!(Some(row.txid.as_str()), response["txid"].as_str());
             assert_eq!(row.block_hash.as_deref(), response["block_hash"].as_str());
-            assert_address_faucet_inclusion(&client, &fixture, &response, address).await?;
+            assert_address_faucet_inclusion(&client, &fixture, &response, address, &key).await?;
             payments.push((row.id.clone(), row.txid.clone()));
         }
         assert_ne!(payments[0].0, payments[2].0);
@@ -293,8 +296,9 @@ pub(super) async fn external_address_faucet_behavior_is_unchanged() -> Result<()
                     && account.unified_address != address)
         );
         let before = faucet_activities(&client, &fixture).await?;
-        let response = address_faucet_request(&client, &fixture, &address).await?;
-        assert_address_faucet_inclusion(&client, &fixture, &response, &address).await?;
+        let key = uuid::Uuid::new_v4().to_string();
+        let response = address_faucet_request(&client, &fixture, &address, &key).await?;
+        assert_address_faucet_inclusion(&client, &fixture, &response, &address, &key).await?;
         let after = faucet_activities(&client, &fixture).await?;
         assert_eq!(
             before.iter().map(|row| &row.id).collect::<Vec<_>>(),
@@ -342,12 +346,13 @@ async fn address_faucet_request(
     client: &Client,
     fixture: &RegtestStack,
     address: &str,
+    key: &str,
 ) -> Result<serde_json::Value> {
     request_json(
         client,
         fixture.api_url(),
         "/api/v1/faucet/address",
-        Some(&json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": uuid::Uuid::new_v4().to_string()})),
+        Some(&json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": key})),
         SEND_TIMEOUT,
     )
     .await

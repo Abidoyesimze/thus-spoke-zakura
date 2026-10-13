@@ -5,8 +5,17 @@ fn records_real_transfer_without_mutating_balances() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let activity = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "send", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "send",
+            None,
+        )
         .unwrap();
+    assert_eq!(store.activities(10).unwrap().len(), 1);
     let activity = store
         .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
         .unwrap();
@@ -20,17 +29,41 @@ fn unconfirmed_activities_skip_unprepared_and_confirmed_rows() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 11_000, "preparing-key", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            11_000,
+            "preparing-key",
+            None,
+        )
         .unwrap();
     let pending = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "pending-key", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "pending-key",
+            None,
+        )
         .unwrap();
     let pending = store
         .record_prepared(&pending.id, "txid-pending", b"pending", 140)
         .unwrap();
     let pending = store.mark_broadcast(&pending.id, &pending.txid).unwrap();
     let mined = store
-        .claim_transfer(1, 3, "ironwood", "ironwood", 13_000, "mined-key", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(3),
+            "ironwood",
+            "ironwood",
+            13_000,
+            "mined-key",
+            None,
+        )
         .unwrap();
     let mined = store
         .record_prepared(&mined.id, "txid-mined", b"mined", 140)
@@ -52,7 +85,15 @@ fn confirm_rejects_an_empty_block_hash() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let pending = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "empty-hash",
+            None,
+        )
         .unwrap();
     let pending = store
         .record_prepared(&pending.id, "txid-empty", b"raw", 140)
@@ -61,7 +102,15 @@ fn confirm_rejects_an_empty_block_hash() {
 
     assert!(store.confirm(&pending.id, &pending.txid, "").is_err());
     let again = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "empty-hash", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "empty-hash",
+            None,
+        )
         .unwrap();
     assert_eq!(again.id, pending.id);
     assert_eq!(again.status, "broadcast");
@@ -73,11 +122,27 @@ fn rejects_reusing_a_key_for_a_different_payment() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
 
     let error = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 13_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            13_000,
+            "same",
+            None,
+        )
         .unwrap_err();
 
     assert!(error.to_string().contains("different payment"));
@@ -94,7 +159,15 @@ fn reusing_a_key_conflicts_on_every_payment_field() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "send", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "send",
+            None,
+        )
         .unwrap();
     store.claim_faucet(2, "ironwood", 12_000, "faucet").unwrap();
 
@@ -106,7 +179,15 @@ fn reusing_a_key_conflicts_on_every_payment_field() {
         (1, 2, "ironwood", "ironwood", 13_000),
     ] {
         let error = store
-            .claim_transfer(from, to, source, destination, amount, "send", None)
+            .claim_transfer(
+                from,
+                Recipient::Account(to),
+                source,
+                destination,
+                amount,
+                "send",
+                None,
+            )
             .unwrap_err();
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
     }
@@ -119,7 +200,15 @@ fn reusing_a_key_conflicts_on_every_payment_field() {
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
     }
     let error = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "faucet", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "faucet",
+            None,
+        )
         .unwrap_err();
     assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
 }
@@ -138,7 +227,15 @@ fn send_and_faucet_validate_their_own_requests() {
     ] {
         assert!(
             store
-                .claim_transfer(from, to, source, destination, amount, "send", None)
+                .claim_transfer(
+                    from,
+                    Recipient::Account(to),
+                    source,
+                    destination,
+                    amount,
+                    "send",
+                    None
+                )
                 .is_err()
         );
     }
@@ -170,7 +267,7 @@ fn memo_is_part_of_the_claimed_payment() {
     let first = store
         .claim_transfer(
             1,
-            2,
+            Recipient::Account(2),
             "ironwood",
             "ironwood",
             12_000,
@@ -182,7 +279,7 @@ fn memo_is_part_of_the_claimed_payment() {
         store
             .claim_transfer(
                 1,
-                2,
+                Recipient::Account(2),
                 "ironwood",
                 "ironwood",
                 12_000,
@@ -195,7 +292,15 @@ fn memo_is_part_of_the_claimed_payment() {
     );
     for memo in [None, Some(""), Some("gift")] {
         let error = store
-            .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "memo-key", memo)
+            .claim_transfer(
+                1,
+                Recipient::Account(2),
+                "ironwood",
+                "ironwood",
+                12_000,
+                "memo-key",
+                memo,
+            )
             .unwrap_err();
         assert!(error.downcast_ref::<IdempotencyConflict>().is_some());
     }
@@ -213,7 +318,15 @@ fn concurrent_claims_create_one_payment() {
             std::thread::spawn(move || {
                 barrier.wait();
                 store
-                    .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+                    .claim_transfer(
+                        1,
+                        Recipient::Account(2),
+                        "ironwood",
+                        "ironwood",
+                        12_000,
+                        "same",
+                        None,
+                    )
                     .unwrap()
             })
         })
@@ -225,7 +338,10 @@ fn concurrent_claims_create_one_payment() {
 
     assert_eq!(claims[0].id, claims[1].id);
     assert_eq!(claims[0].status, "preparing");
-    assert!(store.activities(10).unwrap().is_empty());
+    let listed = store.activities(10).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, claims[0].id);
+    assert!(listed[0].txid.is_empty());
 }
 
 #[test]
@@ -233,14 +349,30 @@ fn discarding_a_failed_prepare_removes_its_claim() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let failed = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
 
     store.discard_preparing(&failed.id).unwrap();
 
     assert!(store.activity_for_key("same").unwrap().is_none());
     let retry = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     assert_ne!(retry.id, failed.id);
 }
@@ -250,7 +382,15 @@ fn prepared_payment_can_be_reset_after_expiry() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     store
         .record_prepared(&claim.id, "expired-txid", b"signed transaction", 140)
@@ -261,7 +401,7 @@ fn prepared_payment_can_be_reset_after_expiry() {
     assert_eq!(retry.status, "preparing");
     assert!(retry.txid.is_empty());
     assert!(store.prepared_transaction(&claim.id).is_err());
-    assert!(store.activities(10).unwrap().is_empty());
+    assert_eq!(store.activities(10).unwrap(), [retry]);
 }
 
 #[test]
@@ -269,7 +409,15 @@ fn recording_the_same_prepared_transaction_converges() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     let first = store
         .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -289,7 +437,15 @@ fn recording_prepared_bytes_backfills_a_legacy_broadcast() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     let prepared = store
         .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
@@ -325,7 +481,15 @@ fn stale_retry_does_not_reset_a_replacement_transaction() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     store
         .record_prepared(&claim.id, "old-txid", b"old transaction", 140)
@@ -346,7 +510,15 @@ fn broadcast_reconciliation_preserves_a_concurrent_confirmation() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     store
         .record_prepared(&claim.id, "real-txid", b"transaction", 140)
@@ -368,7 +540,15 @@ fn prepared_transaction_survives_restart() {
     let store = Store::open(&path).unwrap();
     store.initialize().unwrap();
     let claim = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     let id = claim.id.clone();
     store
@@ -379,7 +559,15 @@ fn prepared_transaction_survives_restart() {
     let reopened = Store::open(path).unwrap();
     reopened.initialize().unwrap();
     let recovered = reopened
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
 
     assert_eq!(recovered.txid, "real-txid");
@@ -387,4 +575,546 @@ fn prepared_transaction_survives_restart() {
     let prepared = reopened.prepared_transaction(&id).unwrap();
     assert_eq!(prepared.raw_transaction, b"raw transaction");
     assert_eq!(prepared.expiry_height, 140);
+}
+
+#[test]
+fn records_a_send_to_an_external_address() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let activity = store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmExternal"),
+            "ironwood",
+            "transparent",
+            12_000,
+            "external-key",
+            None,
+        )
+        .unwrap();
+    assert_eq!(activity.to_account, None);
+    assert_eq!(activity.to_address.as_deref(), Some("tmExternal"));
+
+    let replayed = store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmExternal"),
+            "ironwood",
+            "transparent",
+            12_000,
+            "external-key",
+            None,
+        )
+        .unwrap();
+    assert_eq!(replayed.id, activity.id);
+
+    // Reusing the key for a different recipient is a different payment.
+    let conflict = store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmOther"),
+            "ironwood",
+            "transparent",
+            12_000,
+            "external-key",
+            None,
+        )
+        .unwrap_err();
+    assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+}
+
+#[test]
+fn external_recipient_survives_recovery_and_shares_the_faucet_key_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let store = Store::open(&path).unwrap();
+    store.initialize().unwrap();
+    let claimed = store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmExternal"),
+            "ironwood",
+            "transparent",
+            12_000,
+            "external-send",
+            None,
+        )
+        .unwrap();
+    store
+        .record_prepared(&claimed.id, "txid-external", b"signed transaction", 140)
+        .unwrap();
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    store.initialize().unwrap();
+    let replayed = store.activity_for_key("external-send").unwrap().unwrap();
+    assert_eq!(replayed.id, claimed.id);
+    assert_eq!(replayed.to_account, None);
+    assert_eq!(replayed.to_address.as_deref(), Some("tmExternal"));
+    assert_eq!(store.unconfirmed_activities().unwrap()[0].id, claimed.id);
+    assert_eq!(
+        store
+            .prepared_transaction(&claimed.id)
+            .unwrap()
+            .raw_transaction,
+        b"signed transaction"
+    );
+    let broadcast = store.mark_broadcast(&claimed.id, "txid-external").unwrap();
+    assert_eq!(broadcast.to_address.as_deref(), Some("tmExternal"));
+    let confirmed = store
+        .confirm(&claimed.id, "txid-external", "block")
+        .unwrap();
+    assert_eq!(confirmed.to_address.as_deref(), Some("tmExternal"));
+    assert_eq!(store.activities(10).unwrap()[0].to_account, None);
+    assert!(store.unconfirmed_activities().unwrap().is_empty());
+
+    let conflict = store
+        .claim_address_faucet("tmExternal", 12_000, "external-send")
+        .unwrap_err();
+    assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+    store
+        .claim_address_faucet("tmExternal", 12_000, "external-faucet")
+        .unwrap();
+    let conflict = store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmExternal"),
+            "ironwood",
+            "transparent",
+            12_000,
+            "external-faucet",
+            None,
+        )
+        .unwrap_err();
+    assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+}
+
+#[test]
+fn payment_errors_and_failures_never_overwrite_newer_state() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "guarded",
+            None,
+        )
+        .unwrap();
+    let errored = store
+        .record_error(&claim.id, "preparing", "", "wallet is syncing")
+        .unwrap();
+    assert_eq!(errored.last_error.as_deref(), Some("wallet is syncing"));
+    let prepared = store
+        .record_prepared(&claim.id, "txid-1", b"raw", 140)
+        .unwrap();
+    assert_eq!(prepared.last_error, None);
+
+    let stale = store
+        .record_error(&claim.id, "preparing", "", "stale preparation error")
+        .unwrap();
+    assert_eq!(stale.status, "prepared");
+    assert_eq!(stale.last_error, None);
+    assert!(store.fail(&claim.id, "stale insufficient funds").is_err());
+    let current = store.activity_for_key("guarded").unwrap().unwrap();
+    assert_eq!(
+        (
+            current.status.as_str(),
+            current.txid.as_str(),
+            current.last_error
+        ),
+        ("prepared", "txid-1", None)
+    );
+
+    store
+        .record_error(&claim.id, "prepared", "txid-1", "broadcast unavailable")
+        .unwrap();
+    let broadcast = store.mark_broadcast(&claim.id, "txid-1").unwrap();
+    assert_eq!(broadcast.last_error, None);
+    store
+        .record_error(&claim.id, "broadcast", "txid-1", "auto-mine failed")
+        .unwrap();
+    let confirmed = store.confirm(&claim.id, "txid-1", "block").unwrap();
+    assert_eq!(confirmed.last_error, None);
+    let after = store
+        .record_error(&claim.id, "confirmed", "txid-1", "late error")
+        .unwrap();
+    assert_eq!(after.last_error, None);
+    assert!(store.fail(&claim.id, "late failure").is_err());
+    assert_eq!(
+        store.activity_for_key("guarded").unwrap().unwrap().status,
+        "confirmed"
+    );
+
+    let doomed = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            99_000,
+            "doomed",
+            Some(""),
+        )
+        .unwrap();
+    let failed = store.fail(&doomed.id, "insufficient funds").unwrap();
+    assert_eq!(
+        (failed.status.as_str(), failed.txid.as_str()),
+        ("failed", "")
+    );
+    assert_eq!(failed.last_error.as_deref(), Some("insufficient funds"));
+    let again = store.fail(&doomed.id, "a different reason").unwrap();
+    assert_eq!(again.last_error.as_deref(), Some("insufficient funds"));
+    store
+        .record_error(&doomed.id, "failed", "", "overwrite")
+        .unwrap();
+    assert!(
+        store
+            .record_prepared(&doomed.id, "late-txid", b"late", 140)
+            .is_err()
+    );
+    assert!(store.mark_broadcast(&doomed.id, "late-txid").is_err());
+    store.reset_for_retry(&doomed.id, "").unwrap();
+    store.discard_preparing(&doomed.id).unwrap();
+    let replay = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            99_000,
+            "doomed",
+            Some(""),
+        )
+        .unwrap();
+    assert_eq!(replay.id, doomed.id);
+    assert_eq!(replay.status, "failed");
+    assert_eq!(replay.last_error.as_deref(), Some("insufficient funds"));
+    assert!(store.prepared_transaction(&doomed.id).is_err());
+    let conflict = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            99_000,
+            "doomed",
+            None,
+        )
+        .unwrap_err();
+    assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+}
+
+#[test]
+fn unresolved_intents_include_unprepared_claims_and_exclude_terminal_records() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let absent = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            1_000,
+            "absent-memo",
+            None,
+        )
+        .unwrap();
+    let empty = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            2_000,
+            "empty-memo",
+            Some(""),
+        )
+        .unwrap();
+    let text = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "transparent",
+            "ironwood",
+            3_000,
+            "text-memo",
+            Some("rent"),
+        )
+        .unwrap();
+    let faucet = store
+        .claim_faucet(3, "transparent", 4_000, "faucet")
+        .unwrap();
+    let broadcast = store
+        .claim_transfer(
+            2,
+            crate::db::Recipient::Account(1),
+            "ironwood",
+            "transparent",
+            5_000,
+            "broadcast",
+            None,
+        )
+        .unwrap();
+    store
+        .record_prepared(&broadcast.id, "broadcast-txid", b"raw", 140)
+        .unwrap();
+    let broadcast = store
+        .mark_broadcast(&broadcast.id, "broadcast-txid")
+        .unwrap();
+    let confirmed = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(3),
+            "ironwood",
+            "ironwood",
+            6_000,
+            "confirmed",
+            None,
+        )
+        .unwrap();
+    store
+        .record_prepared(&confirmed.id, "confirmed-txid", b"raw", 140)
+        .unwrap();
+    store
+        .confirm(&confirmed.id, "confirmed-txid", "block")
+        .unwrap();
+    let failed = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(4),
+            "ironwood",
+            "ironwood",
+            7_000,
+            "failed",
+            None,
+        )
+        .unwrap();
+    store.fail(&failed.id, "insufficient funds").unwrap();
+
+    let intents = store.unresolved_activities().unwrap();
+    let summary: Vec<_> = intents
+        .iter()
+        .map(|intent| {
+            (
+                intent.activity.id.as_str(),
+                intent.key.as_str(),
+                intent.memo.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (absent.id.as_str(), "absent-memo", None),
+            (empty.id.as_str(), "empty-memo", Some("")),
+            (text.id.as_str(), "text-memo", Some("rent")),
+            (faucet.id.as_str(), "faucet", None),
+            (broadcast.id.as_str(), "broadcast", None),
+        ]
+    );
+    let text = &intents[2].activity;
+    assert_eq!(
+        (
+            text.kind.as_str(),
+            text.from_account,
+            text.to_account,
+            text.source_pool.as_str(),
+            text.destination_pool.as_str(),
+            text.amount_zatoshi,
+            text.txid.as_str(),
+            text.status.as_str(),
+        ),
+        (
+            "send",
+            Some(1),
+            Some(2),
+            "transparent",
+            "ironwood",
+            3_000,
+            "",
+            "preparing"
+        )
+    );
+    assert_eq!(intents[3].activity.kind, "faucet");
+    assert_eq!(intents[3].activity.from_account, None);
+    assert_eq!(intents[3].activity.destination_pool, "transparent");
+    assert_eq!(intents[4].activity, broadcast);
+    assert_eq!(
+        store
+            .unconfirmed_activities()
+            .unwrap()
+            .iter()
+            .map(|activity| activity.id.as_str())
+            .collect::<Vec<_>>(),
+        [broadcast.id.as_str()]
+    );
+
+    let preparing = store
+        .claim_address_faucet("tm-preparing", 10, "address-preparing")
+        .unwrap();
+    let prepared = store
+        .claim_address_faucet("u-prepared", 20, "address-prepared")
+        .unwrap();
+    let prepared = store
+        .record_address_prepared(&prepared.id, "address-txid", b"raw", 140)
+        .unwrap();
+    let confirmed = store
+        .claim_address_faucet("tm-confirmed", 30, "address-confirmed")
+        .unwrap();
+    store
+        .record_address_prepared(&confirmed.id, "confirmed-address-txid", b"raw", 140)
+        .unwrap();
+    store
+        .confirm_address(&confirmed.id, "confirmed-address-txid", "block")
+        .unwrap();
+    let failed = store
+        .claim_address_faucet("tm-failed", 40, "address-failed")
+        .unwrap();
+    store
+        .fail_address(&failed.id, "treasury cannot pay")
+        .unwrap();
+
+    assert_eq!(
+        store.unresolved_address_faucets().unwrap(),
+        [
+            AddressFaucetIntent {
+                payment: preparing,
+                key: "address-preparing".into(),
+            },
+            AddressFaucetIntent {
+                payment: prepared,
+                key: "address-prepared".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn repaired_preparation_never_replaces_a_newer_or_terminal_transaction() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "repair",
+            None,
+        )
+        .unwrap();
+    store
+        .record_prepared(&claim.id, "old-txid", b"old", 140)
+        .unwrap();
+    store.reset_for_retry(&claim.id, "old-txid").unwrap();
+    store
+        .record_prepared(&claim.id, "new-txid", b"new", 180)
+        .unwrap();
+
+    assert!(
+        store
+            .record_prepared(&claim.id, "old-txid", b"old", 140)
+            .is_err()
+    );
+    let current = store.activity_for_key("repair").unwrap().unwrap();
+    assert_eq!(current.txid, "new-txid");
+    assert_eq!(
+        store.prepared_transaction(&claim.id).unwrap(),
+        PreparedTransaction {
+            raw_transaction: b"new".to_vec(),
+            expiry_height: 180
+        }
+    );
+    store
+        .record_prepared(&claim.id, "new-txid", b"different bytes", 999)
+        .unwrap();
+    assert_eq!(
+        store
+            .prepared_transaction(&claim.id)
+            .unwrap()
+            .raw_transaction,
+        b"new"
+    );
+    store.confirm(&claim.id, "new-txid", "block").unwrap();
+    assert!(
+        store
+            .record_prepared(&claim.id, "other-txid", b"other", 200)
+            .is_err()
+    );
+    let confirmed = store.activity_for_key("repair").unwrap().unwrap();
+    assert_eq!(
+        (confirmed.status.as_str(), confirmed.txid.as_str()),
+        ("confirmed", "new-txid")
+    );
+
+    let address = store
+        .claim_address_faucet("tm-external", 5, "address-repair")
+        .unwrap();
+    store
+        .record_address_prepared(&address.id, "address-new", b"new", 180)
+        .unwrap();
+    assert!(
+        store
+            .record_address_prepared(&address.id, "address-old", b"old", 140)
+            .is_err()
+    );
+    store
+        .confirm_address(&address.id, "address-new", "block")
+        .unwrap();
+    assert!(
+        store
+            .record_address_prepared(&address.id, "address-other", b"other", 200)
+            .is_err()
+    );
+    let current = store
+        .address_faucet_for_key("address-repair")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (current.status.as_str(), current.txid.as_str()),
+        ("confirmed", "address-new")
+    );
+    assert_eq!(
+        store
+            .prepared_transaction(&address.id)
+            .unwrap()
+            .raw_transaction,
+        b"new"
+    );
+}
+
+#[test]
+fn unresolved_external_sends_preserve_recipient_key_and_memo_after_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("server.db");
+    let store = Store::open(&path).unwrap();
+    store.initialize().unwrap();
+    store
+        .claim_transfer(
+            1,
+            Recipient::Address("tmExternal"),
+            "ironwood",
+            "transparent",
+            12000,
+            "external-intent",
+            Some(""),
+        )
+        .unwrap();
+    let activity = store.activity_for_key("external-intent").unwrap().unwrap();
+    drop(store);
+    let store = Store::open(&path).unwrap();
+    store.initialize().unwrap();
+    assert_eq!(
+        store.unresolved_activities().unwrap(),
+        vec![ActivityIntent {
+            activity,
+            key: "external-intent".into(),
+            memo: Some("".into())
+        }]
+    );
 }

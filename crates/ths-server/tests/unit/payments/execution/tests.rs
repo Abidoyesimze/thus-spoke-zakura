@@ -14,7 +14,6 @@ use std::{
 struct RecordingPaymentLifecycle {
     store: Store,
     submissions: Mutex<VecDeque<LifecycleSubmission>>,
-    discarded: Mutex<Vec<String>>,
     record_fails: AtomicBool,
     confirm: bool,
 }
@@ -24,7 +23,6 @@ impl RecordingPaymentLifecycle {
         Self {
             store,
             submissions: Mutex::new(submissions.into_iter().collect()),
-            discarded: Mutex::new(Vec::new()),
             record_fails: AtomicBool::new(false),
             confirm: true,
         }
@@ -44,15 +42,22 @@ impl PaymentLifecycle for RecordingPaymentLifecycle {
             LifecycleSubmission::Broadcast => Ok(PreparedSubmission::Broadcast(
                 self.store.mark_broadcast(&activity.id, &activity.txid)?,
             )),
+            LifecycleSubmission::Unavailable => {
+                Err(tonic::Status::unavailable("broadcast unavailable").into())
+            }
+            LifecycleSubmission::LostBroadcast => {
+                self.store.mark_broadcast(&activity.id, &activity.txid)?;
+                Err(tonic::Status::unavailable("broadcast response lost").into())
+            }
             LifecycleSubmission::Expired => Ok(PreparedSubmission::Expired(
                 self.store.reset_for_retry(&activity.id, &activity.txid)?,
             )),
         }
     }
 
-    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
-        self.discarded.lock().unwrap().push(id.to_owned());
-        self.store.discard_preparing(id)
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        self.store.record_error(id, "preparing", "", error)?;
+        Ok(())
     }
 
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
@@ -79,7 +84,15 @@ impl PaymentLifecycle for RecordingPaymentLifecycle {
 
 fn lifecycle_claim(store: &Store, key: &str) -> Activity {
     store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, key, None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            key,
+            None,
+        )
         .unwrap()
 }
 
@@ -190,7 +203,6 @@ async fn payment_lifecycle_does_not_discard_after_recording_failure() {
     .await;
 
     assert!(result.is_err());
-    assert!(runtime.discarded.lock().unwrap().is_empty());
     assert_eq!(
         store
             .activity_for_key("recording-failure")
@@ -228,7 +240,15 @@ async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
     let claim = state
         .0
         .store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     rusqlite::Connection::open(dir.path().join("wallet.db"))
         .unwrap()
@@ -253,25 +273,124 @@ async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
 }
 
 #[tokio::test]
-async fn failed_preparation_discards_a_claim_without_a_wallet_journal() {
+async fn failed_preparation_preserves_the_claim_and_records_the_error() {
     let (state, _dir) = state_with_local_wallet();
     let claim = state
         .0
         .store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
 
     assert!(
-        execute_payment(&state, claim, |_| {
+        execute_payment(&state, claim.clone(), |_| {
             std::future::ready(Err(anyhow::anyhow!("preparation failed")))
         })
         .await
         .is_err()
     );
-    assert!(state.0.store.activity_for_key("same").unwrap().is_none());
+    let retained = state.0.store.activity_for_key("same").unwrap().unwrap();
+    assert_eq!(retained.id, claim.id);
+    assert_eq!(retained.status, "preparing");
+    assert_eq!(retained.last_error.as_deref(), Some("preparation failed"));
 }
 
 enum LifecycleSubmission {
     Broadcast,
     Expired,
+    Unavailable,
+    LostBroadcast,
+}
+
+#[tokio::test]
+async fn payment_lifecycle_returns_failed_replays_without_preparation() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "failed-replay");
+    let failed = store
+        .fail(&claim.id, "insufficient spendable funds")
+        .unwrap();
+    let runtime = RecordingPaymentLifecycle::new(store, []);
+    let result = execute_payment(&runtime, failed.clone(), |_| async {
+        panic!("failed replay must not prepare another payment")
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.id, failed.id);
+    assert_eq!(result.status, "failed");
+    assert_eq!(
+        result.last_error.as_deref(),
+        Some("insufficient spendable funds")
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn startup_funding_retries_the_original_key_and_signed_bytes_across_failure_windows() {
+    for window in ["before-prepare", "after-prepare", "lost-broadcast"] {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        let submissions = match window {
+            "before-prepare" => vec![LifecycleSubmission::Broadcast],
+            "after-prepare" => vec![
+                LifecycleSubmission::Unavailable,
+                LifecycleSubmission::Broadcast,
+            ],
+            _ => vec![
+                LifecycleSubmission::LostBroadcast,
+                LifecycleSubmission::Broadcast,
+            ],
+        };
+        let runtime = RecordingPaymentLifecycle::new(store.clone(), submissions);
+        let prepare_calls = AtomicUsize::new(0);
+        crate::bootstrap::retry_startup(|| async {
+            let pending =
+                store.claim_faucet(1, "ironwood", 500_000_000, "startup-account-1-ironwood-v1")?;
+            let activity = execute_payment(&runtime, pending, |_| async {
+                let attempt = prepare_calls.fetch_add(1, Ordering::SeqCst);
+                if window == "before-prepare" && attempt == 0 {
+                    return Err(
+                        tonic::Status::unavailable("preparation dependency unavailable").into(),
+                    );
+                }
+                Ok(PreparedPayment {
+                    txid: "original-startup-txid".into(),
+                    raw_transaction: b"original signed payment".to_vec(),
+                    expiry_height: 140,
+                })
+            })
+            .await?;
+            assert_eq!(activity.status, "confirmed");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let activity = store
+            .activity_for_key("startup-account-1-ironwood-v1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(activity.status, "confirmed");
+        assert_eq!(activity.txid, "original-startup-txid");
+        assert_eq!(activity.to_account, Some(1));
+        assert_eq!(activity.amount_zatoshi, 500_000_000);
+        assert_eq!(store.activities(100).unwrap().len(), 1);
+        assert_eq!(
+            store.prepared_transaction(&activity.id).unwrap(),
+            crate::db::PreparedTransaction {
+                raw_transaction: b"original signed payment".to_vec(),
+                expiry_height: 140
+            }
+        );
+        assert_eq!(
+            prepare_calls.load(Ordering::SeqCst),
+            if window == "before-prepare" { 2 } else { 1 }
+        );
+    }
 }

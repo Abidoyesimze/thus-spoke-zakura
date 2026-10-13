@@ -353,6 +353,7 @@ async fn mining_adapter_rejects_missing_empty_and_multiple_rpc_hashes() {
         });
         let (mut state, _dir) = state_with_local_wallet();
         Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
+        state.mark_started();
         let app = router(state);
         let (status, _) = mining_request(
             &app,

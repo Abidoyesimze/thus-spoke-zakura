@@ -370,7 +370,7 @@ fn faucet_journal_lock_probe() {
     let Some(dir) = std::env::var_os("THS_FAUCET_JOURNAL_LOCK_PROBE") else {
         return;
     };
-    let error = FaucetJournal::open(std::path::Path::new(&dir))
+    let error = IntentJournal::open(std::path::Path::new(&dir), "faucet")
         .err()
         .expect("overlapping command acquired the lock");
     assert!(
@@ -382,15 +382,20 @@ fn faucet_journal_lock_probe() {
 
 /// answers loopback requests in turn with canned statuses and bodies, passing on each
 /// request body.
-fn serve(responses: Vec<(&'static str, &'static str)>) -> (String, mpsc::Receiver<String>) {
+fn serve<B: Into<String> + Send + 'static>(
+    responses: Vec<(&'static str, B)>,
+) -> (String, mpsc::Receiver<(String, String)>) {
     use std::io::{BufRead, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let (requests, received) = mpsc::channel();
     std::thread::spawn(move || {
         for (status, body) in responses {
+            let body = body.into();
             let (mut stream, _) = listener.accept().unwrap();
             let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
             let mut length = 0;
             loop {
                 let mut line = String::new();
@@ -404,7 +409,20 @@ fn serve(responses: Vec<(&'static str, &'static str)>) -> (String, mpsc::Receive
             }
             let mut request = vec![0; length];
             reader.read_exact(&mut request).unwrap();
-            requests.send(String::from_utf8(request).unwrap()).unwrap();
+            requests
+                .send((
+                    request_line.trim_end().to_owned(),
+                    String::from_utf8(request).unwrap(),
+                ))
+                .unwrap();
+            match status {
+                "drop" => continue,
+                "hang" => {
+                    std::thread::sleep(Duration::from_secs(60));
+                    continue;
+                }
+                _ => {}
+            }
             write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -415,7 +433,6 @@ fn serve(responses: Vec<(&'static str, &'static str)>) -> (String, mpsc::Receive
     });
     (url, received)
 }
-
 struct IdleDocker;
 
 impl DockerResourceCommands for IdleDocker {
@@ -446,3 +463,8 @@ fn with_unreachable_docker<T>(test: impl FnOnce() -> T) -> T {
 
 #[path = "tests/runner.rs"]
 mod runner;
+
+#[test]
+fn send_interruption_probe() {
+    client::send_interruption_probe();
+}

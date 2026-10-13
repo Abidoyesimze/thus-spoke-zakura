@@ -1,9 +1,5 @@
-use std::{
-    fs,
-    net::SocketAddr,
-    path::PathBuf,
-    time::{Duration, Instant},
-};
+use crate::{reconcile, rpc};
+use std::{fs, net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 
@@ -42,47 +38,119 @@ pub(super) async fn serve(data_dir: PathBuf) -> Result<()> {
         std::env::var("THS_ZAKURA_RPC").unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
         std::env::var("THS_INSTANCE").unwrap_or_else(|_| "default".into()),
     );
-    let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        match sync::dependencies_ready(&state).await {
-            Ok(()) => break,
-            Err(error) if Instant::now() < deadline => {
-                tracing::info!(
-                    error = %format_args!("{error:#}"),
-                    "waiting for Zakura and lightwalletd"
-                );
-                tokio::time::sleep(Duration::from_millis(750)).await;
-            }
-            Err(error) => return Err(error).context("waiting for startup dependencies"),
-        }
-    }
-    treasury::provision_initial_balance(&state)
-        .await
-        .context("provisioning Account 1 with 5 Ironwood ZEC")?;
-    let mut background = tokio::task::JoinSet::new();
-    background.spawn(sync::wallet_sync_loop(state.clone()));
-    background.spawn(confirmation::payment_confirmation_loop(state.clone()));
-    let app = api::router(state);
     let address: SocketAddr = std::env::var("THS_LISTEN")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()
         .context("invalid THS_LISTEN")?;
-    tracing::info!(%address, "dashboard ready");
     let listener = tokio::net::TcpListener::bind(address).await?;
-    serve_with_background(listener, app, background).await
+    tracing::info!(%address, "serving stored status while startup continues");
+    serve_with_background(
+        listener,
+        api::router(state.clone()),
+        background_tasks(state),
+    )
+    .await
+}
+
+fn background_tasks(state: AppState) -> tokio::task::JoinSet<Result<()>> {
+    let mut background = tokio::task::JoinSet::new();
+    background.spawn(start_and_sync(state.clone()));
+    background.spawn(async move {
+        confirmation::payment_confirmation_loop(state).await;
+        Ok(())
+    });
+    background
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReadinessError {
+    #[error("chain is below the wallet birthday floor; waiting for canonical block 1")]
+    BelowBirthday,
+    #[error("lightwalletd has not indexed the canonical rewind checkpoint")]
+    RewindCheckpoint,
+    #[error("chain checkpoint changed before wallet publication")]
+    CheckpointChanged,
+    #[error("initial funding is awaiting confirmation")]
+    FundingPending,
+}
+
+pub(crate) fn startup_retryable(error: &anyhow::Error) -> bool {
+    if error.downcast_ref::<rpc::RpcUnavailable>().is_some()
+        || error.downcast_ref::<rpc::RpcTransport>().is_some()
+        || error.downcast_ref::<ReadinessError>().is_some()
+        || error
+            .downcast_ref::<reconcile::ReconciliationDeadline>()
+            .is_some()
+        || error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    {
+        return true;
+    }
+    if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+        return error.is_connect() || error.is_timeout();
+    }
+    if let Some(error) = error.downcast_ref::<rpc::RpcError>() {
+        return error.code == -28;
+    }
+    if let Some(error) = error.downcast_ref::<tonic::Status>() {
+        return matches!(
+            error.code(),
+            tonic::Code::Unavailable
+                | tonic::Code::DeadlineExceeded
+                | tonic::Code::ResourceExhausted
+        );
+    }
+    error.downcast_ref::<tonic::transport::Error>().is_some()
+}
+
+pub(crate) async fn retry_startup<F, Fut>(mut attempt: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    loop {
+        match attempt().await {
+            Ok(()) => return Ok(()),
+            Err(error) if startup_retryable(&error) => {
+                tracing::info!(error = %format_args!("{error:#}"), "waiting for startup readiness");
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn start_and_sync(state: AppState) -> Result<()> {
+    // Network stages have their own deadlines. Await provisioning to completion
+    // so its payment guards remain owned while a wallet worker is running.
+    retry_startup(|| async {
+        sync::dependencies_ready(&state)
+            .await
+            .context("waiting for startup dependencies")?;
+        treasury::provision_initial_balance(&state)
+            .await
+            .context("provisioning Account 1 with 5 Ironwood ZEC")
+    })
+    .await?;
+    state.mark_started();
+    tracing::info!("dashboard ready");
+    sync::wallet_sync_loop(state).await;
+    Ok(())
 }
 
 async fn serve_with_background(
     listener: tokio::net::TcpListener,
     app: axum::Router,
-    mut background: tokio::task::JoinSet<()>,
+    mut background: tokio::task::JoinSet<Result<()>>,
 ) -> Result<()> {
     // A stopped or panicked recovery task must not leave HTTP serving as if
     // server-owned background work were still supervised.
     tokio::select! {
         result = axum::serve(listener, app).into_future() => result?,
         result = background.join_next() => {
-            result.context("background task set unexpectedly empty")??;
+            let task = result.context("background task set unexpectedly empty")?;
+            task??;
             anyhow::bail!("server background task unexpectedly exited");
         }
     }

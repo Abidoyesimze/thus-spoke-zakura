@@ -23,9 +23,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/accounts", get(status::accounts))
         .route("/api/v1/activity", get(status::activity))
         .route("/api/v1/send", post(payments::send))
+        .route("/api/v1/zip321/parse", post(payments::parse_payment_uri))
+        .route("/api/v1/zip321/request", post(payments::payment_request))
         .route("/api/v1/send/quote", post(payments::send_quote))
         .route("/api/v1/faucet", post(payments::faucet))
-        .route("/api/v1/faucet/address", post(payments::faucet_address))
+        .route(
+            "/api/v1/faucet/address",
+            get(payments::faucet_address_status).post(payments::faucet_address),
+        )
         .route("/api/v1/mine", post(mining::mine))
         .route(
             "/api/v1/mining/jobs",

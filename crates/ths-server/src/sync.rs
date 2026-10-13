@@ -13,7 +13,15 @@ impl AppState {
         &self,
         target_height: Option<u64>,
     ) -> anyhow::Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(120);
+        self.synchronize_wallet_until(target_height, Instant::now() + Duration::from_secs(120))
+            .await
+    }
+
+    pub(crate) async fn synchronize_wallet_until(
+        &self,
+        target_height: Option<u64>,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
         let _guard = tokio::time::timeout_at(deadline, self.0.wallet_sync.lock()).await?;
 
         {
@@ -73,10 +81,9 @@ impl AppState {
             rpc.block_hash(height)
         })
         .await?;
-        anyhow::ensure!(
-            publishable,
-            "chain checkpoint changed before wallet publication"
-        );
+        if !publishable {
+            return Err(crate::bootstrap::ReadinessError::CheckpointChanged.into());
+        }
         let changed = self.0.wallet_snapshot.read().await.accounts != accounts;
         {
             let mut snapshot = self.0.wallet_snapshot.write().await;

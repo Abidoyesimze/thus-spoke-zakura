@@ -162,6 +162,17 @@ impl BlockSource for MemoryBlockCache {
     }
 }
 
+fn validate_lightwalletd_endpoint(endpoint: &str) -> Result<()> {
+    let url = reqwest::Url::parse(endpoint).context("invalid THS_LIGHTWALLETD")?;
+    anyhow::ensure!(
+        url.scheme() == "http" && url.host_str().is_some(),
+        "invalid THS_LIGHTWALLETD: expected an HTTP endpoint"
+    );
+    tonic::transport::Endpoint::from_shared(endpoint.to_owned())
+        .context("invalid THS_LIGHTWALLETD")?;
+    Ok(())
+}
+
 impl RealWallet {
     pub fn open(data_dir: &Path, seed_hex: &str) -> Result<Self> {
         let seed = hex::decode(seed_hex).context("invalid wallet seed")?;
@@ -214,11 +225,13 @@ impl RealWallet {
         accounts.sort_by(|a, b| a.0.cmp(&b.0));
         let account_ids = accounts.into_iter().map(|(_, id)| id).collect();
 
+        let lightwalletd =
+            std::env::var("THS_LIGHTWALLETD").unwrap_or_else(|_| "http://127.0.0.1:9067".into());
+        validate_lightwalletd_endpoint(&lightwalletd)?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             account_ids,
-            lightwalletd: std::env::var("THS_LIGHTWALLETD")
-                .unwrap_or_else(|_| "http://127.0.0.1:9067".into()),
+            lightwalletd,
         })
     }
 
@@ -441,15 +454,16 @@ impl RealWallet {
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         };
-        if let Ok(result) = tokio::time::timeout(timeout, wait).await {
-            return result;
-        }
+        let error = match tokio::time::timeout(timeout, wait).await {
+            Ok(result) => return result,
+            Err(error) => error,
+        };
         let latest_indexed =
             latest_indexed.map_or_else(|| "unknown".into(), |height| height.to_string());
-        bail!(
+        Err(error).with_context(|| format!(
             "lightwalletd did not index Zakura height {target} within {} seconds (latest indexed height: {latest_indexed})",
             timeout.as_secs()
-        );
+        ))
     }
 
     pub async fn apply_balances(&self, accounts: &mut [Account]) -> Result<()> {

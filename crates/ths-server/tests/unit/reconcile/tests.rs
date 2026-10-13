@@ -157,20 +157,22 @@ async fn one_attempt_deadline_is_shared_across_network_calls() {
         tokio::time::sleep_until(deadline + Duration::from_millis(50)).await;
         Ok::<_, std::io::Error>(())
     };
+    let error = within_deadline(deadline, "second call", operation)
+        .await
+        .unwrap_err();
     assert!(
-        within_deadline(deadline, "second call", operation)
-            .await
-            .is_err()
+        error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
     );
     let polled = std::cell::Cell::new(false);
-    assert!(
-        within_deadline(deadline, "expired call", async {
-            polled.set(true);
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .is_err()
-    );
+    let error = within_deadline(deadline, "expired call", async {
+        polled.set(true);
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .unwrap_err();
+    assert!(error.downcast_ref::<ReconciliationDeadline>().is_some());
     assert!(
         !polled.get(),
         "expired attempts must not start another call"

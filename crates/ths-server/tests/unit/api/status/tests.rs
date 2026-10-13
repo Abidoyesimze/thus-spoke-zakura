@@ -167,3 +167,280 @@ fn settlement_allows_a_canonical_tip_before_the_wallet_birthday() {
     wallet.observed_hash = Some("orphaned".to_owned());
     assert!(!settlement_status(Some(&tip), Some(&tip), &wallet).settled);
 }
+
+use crate::state::tests::{api_get, counting_rpc};
+use serde_json::json;
+use std::sync::atomic::Ordering;
+
+#[tokio::test]
+async fn activity_lookup_by_key_returns_every_state_regardless_of_list_limits() {
+    let (state, _dir) = state_with_local_wallet();
+    let store = &state.0.store;
+    let preparing = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            1_000,
+            "lookup-preparing",
+            Some(""),
+        )
+        .unwrap();
+    let pending = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "transparent",
+            2_000,
+            "lookup-pending",
+            None,
+        )
+        .unwrap();
+    store
+        .record_prepared(&pending.id, "pending-txid", b"raw", 140)
+        .unwrap();
+    store.mark_broadcast(&pending.id, "pending-txid").unwrap();
+    let failed = store
+        .claim_transfer(
+            2,
+            crate::db::Recipient::Account(1),
+            "ironwood",
+            "ironwood",
+            3_000,
+            "lookup-failed",
+            None,
+        )
+        .unwrap();
+    store.fail(&failed.id, "insufficient funds").unwrap();
+    let confirmed = store
+        .claim_faucet(3, "ironwood", 4_000, "lookup-confirmed")
+        .unwrap();
+    store
+        .record_prepared(&confirmed.id, "confirmed-txid", b"raw", 140)
+        .unwrap();
+    store
+        .confirm(&confirmed.id, "confirmed-txid", "block")
+        .unwrap();
+    store
+        .claim_address_faucet("tm-external", 5, "lookup-external")
+        .unwrap();
+
+    let (status, listed) = api_get(&state, "/api/v1/activity?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| {
+            (
+                row["id"].clone(),
+                row["status"].clone(),
+                row["txid"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            (
+                json!(confirmed.id),
+                json!("confirmed"),
+                json!("confirmed-txid")
+            ),
+            (json!(failed.id), json!("failed"), json!("")),
+            (json!(pending.id), json!("broadcast"), json!("pending-txid")),
+            (json!(preparing.id), json!("preparing"), json!("")),
+        ]
+    );
+
+    for index in 0..101 {
+        store
+            .claim_transfer(
+                1,
+                crate::db::Recipient::Account(3),
+                "ironwood",
+                "ironwood",
+                1,
+                &format!("filler-{index:03}"),
+                None,
+            )
+            .unwrap();
+    }
+    let (_, listed) = api_get(&state, "/api/v1/activity?limit=100").await;
+    assert_eq!(listed.as_array().unwrap().len(), 100);
+    assert!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != json!(preparing.id))
+    );
+
+    for (key, id, status, txid, last_error) in [
+        (
+            "lookup-preparing",
+            &preparing.id,
+            "preparing",
+            "",
+            Value::Null,
+        ),
+        (
+            "lookup-pending",
+            &pending.id,
+            "broadcast",
+            "pending-txid",
+            Value::Null,
+        ),
+        (
+            "lookup-failed",
+            &failed.id,
+            "failed",
+            "",
+            json!("insufficient funds"),
+        ),
+        (
+            "lookup-confirmed",
+            &confirmed.id,
+            "confirmed",
+            "confirmed-txid",
+            Value::Null,
+        ),
+    ] {
+        let (code, found) = api_get(
+            &state,
+            &format!("/api/v1/activity?limit=1&idempotency_key={key}"),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{key}");
+        let found = found.as_array().unwrap();
+        assert_eq!(found.len(), 1, "{key}");
+        assert_eq!(found[0]["id"], json!(id), "{key}");
+        assert_eq!(found[0]["status"], status, "{key}");
+        assert_eq!(found[0]["txid"], txid, "{key}");
+        assert_eq!(found[0]["last_error"], last_error, "{key}");
+    }
+    for key in ["lookup-missing", "lookup-external"] {
+        assert_eq!(
+            api_get(&state, &format!("/api/v1/activity?idempotency_key={key}")).await,
+            (StatusCode::OK, json!([]))
+        );
+    }
+    let (code, _) = api_get(&state, "/api/v1/activity?idempotency_key=").await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn stored_status_reads_have_no_wallet_or_node_side_effects() {
+    let (state, dir) = state_with_local_wallet();
+    let (rpc_url, calls) = counting_rpc(true).await;
+    let state = AppState::new(
+        state.0.store.clone(),
+        state.0.wallet.clone(),
+        rpc_url,
+        "test".into(),
+    );
+    let store = &state.0.store;
+    let send = store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            1_000,
+            "read-send",
+            None,
+        )
+        .unwrap();
+    store
+        .claim_faucet(2, "transparent", 2_000, "read-internal")
+        .unwrap();
+    let external = store
+        .claim_address_faucet("tm-external", 3_000, "read-external")
+        .unwrap();
+    let activities = store.unresolved_activities().unwrap();
+    let faucets = store.unresolved_address_faucets().unwrap();
+
+    for uri in [
+        "/api/v1/activity",
+        "/api/v1/activity?idempotency_key=read-send",
+        "/api/v1/faucet/address?idempotency_key=read-internal",
+        "/api/v1/faucet/address?idempotency_key=read-external",
+        "/api/v1/faucet/address?idempotency_key=read-missing",
+    ] {
+        api_get(&state, uri).await;
+    }
+
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.unresolved_activities().unwrap(), activities);
+    assert_eq!(store.unresolved_address_faucets().unwrap(), faucets);
+    for id in [&send.id, &external.id] {
+        assert!(store.prepared_transaction(id).is_err());
+        assert!(state.0.wallet.prepared(id).await.unwrap().is_none());
+    }
+    drop(dir);
+}
+
+use crate::state::tests::api_request;
+#[tokio::test]
+async fn health_and_chain_effects_wait_until_startup_finishes() {
+    let (state, _dir) = state_with_local_wallet();
+    let (rpc_url, calls) = counting_rpc(true).await;
+    let state = AppState::new(
+        state.0.store.clone(),
+        state.0.wallet.clone(),
+        rpc_url,
+        "test".into(),
+    );
+    state.0.wallet_snapshot.write().await.status.last_success_at = Some(1);
+    let account = state.0.store.account(2).unwrap();
+
+    let (code, health) = api_get(&state, "/api/v1/health").await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(health["ok"], false);
+    assert_eq!(health["node"]["blocks"], 101);
+    let health_calls = calls.load(Ordering::SeqCst);
+
+    for (uri, body) in [
+        ("/api/v1/send", valid_send()),
+        (
+            "/api/v1/faucet",
+            json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 1_000, "idempotency_key": "startup-faucet"}),
+        ),
+        (
+            "/api/v1/faucet/address",
+            json!({"address": account.transparent_address, "amount_zatoshi": 1_000, "idempotency_key": "startup-address"}),
+        ),
+        ("/api/v1/mine", json!({"blocks": 1})),
+        (
+            "/api/v1/mining/jobs",
+            json!({"blocks": 1, "idempotency_key": "startup-mining"}),
+        ),
+    ] {
+        let (code, body) = api_request(&state, "POST", uri, body).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert_eq!(
+            body["error"]["message"],
+            "the environment is still starting"
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), health_calls);
+    assert!(state.0.store.activities(100).unwrap().is_empty());
+    assert!(
+        state
+            .0
+            .store
+            .unresolved_address_faucets()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(state.0.mining.latest().await.is_none());
+
+    state.mark_started();
+    let (code, health) = api_get(&state, "/api/v1/health").await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(health["ok"], true);
+}
+
+use crate::api::payments::tests::valid_send;

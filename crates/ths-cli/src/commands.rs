@@ -70,8 +70,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 &name,
                 SendArgs {
                     from,
-                    to,
-                    amount,
+                    to: Some(to),
+                    amount: Some(amount),
+                    uri: None,
                     source_pool: Pool::Transparent,
                     destination_pool: Pool::Ironwood,
                     memo,
@@ -83,8 +84,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 &name,
                 SendArgs {
                     from,
-                    to,
-                    amount,
+                    to: Some(to),
+                    amount: Some(amount),
+                    uri: None,
                     source_pool: Pool::Ironwood,
                     destination_pool: Pool::Transparent,
                     memo: None,

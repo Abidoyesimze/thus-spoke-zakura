@@ -41,6 +41,14 @@ pub struct RpcError {
     message: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("Zakura returned HTTP {0} while unavailable")]
+pub(crate) struct RpcUnavailable(pub reqwest::StatusCode);
+
+#[derive(Debug, thiserror::Error)]
+#[error("Zakura RPC transport failed")]
+pub(crate) struct RpcTransport(#[source] reqwest::Error);
+
 impl NodeRpc {
     pub fn new(endpoint: String) -> Self {
         Self {
@@ -74,10 +82,31 @@ impl NodeRpc {
                 } else {
                     format!("calling Zakura {method}")
                 };
-                anyhow::Error::new(error).context(context)
+                let error = if error.is_request() || error.is_connect() || error.is_timeout() {
+                    anyhow::Error::new(RpcTransport(error))
+                } else {
+                    anyhow::Error::new(error)
+                };
+                error.context(context)
             })?;
         let status = response.status();
-        let envelope: Value = response.json().await.context("decoding Zakura response")?;
+        if matches!(
+            status,
+            reqwest::StatusCode::BAD_GATEWAY
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE
+                | reqwest::StatusCode::GATEWAY_TIMEOUT
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) {
+            return Err(RpcUnavailable(status).into());
+        }
+        // Reqwest classifies both interrupted bodies and invalid JSON as decode
+        // errors; keep transport failures distinct so startup retries only those.
+        let body = response
+            .bytes()
+            .await
+            .map_err(RpcTransport)
+            .context("reading Zakura response")?;
+        let envelope: Value = serde_json::from_slice(&body).context("decoding Zakura response")?;
         classify_response(status, method, envelope)
     }
 

@@ -43,7 +43,15 @@ fn stale_confirmation_does_not_confirm_a_replacement_transaction() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let claimed = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "same", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
         .unwrap();
     store
         .record_prepared(&claimed.id, "old-txid", b"old transaction", 140)
@@ -74,7 +82,15 @@ fn apply_confirmation_uses_node_blockhash_not_a_generate_hash() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
     let pending = store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, "issue-67", None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "issue-67",
+            None,
+        )
         .unwrap();
     let pending = store
         .record_prepared(&pending.id, "txid-abc", b"raw transaction", 140)
@@ -114,9 +130,17 @@ use std::sync::{
 use std::time::Duration;
 use tokio::sync::broadcast;
 
-fn lifecycle_claim(store: &Store, key: &str) -> Activity {
+pub(crate) fn lifecycle_claim(store: &Store, key: &str) -> Activity {
     store
-        .claim_transfer(1, 2, "ironwood", "ironwood", 12_000, key, None)
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            key,
+            None,
+        )
         .unwrap()
 }
 
@@ -443,4 +467,87 @@ async fn payment_confirmation_does_not_confirm_a_mempool_transaction_or_a_replac
     assert_eq!(replacement.txid, "replacement-txid");
     assert_eq!(replacement.status, "prepared");
     assert!(replacement.block_hash.is_none());
+}
+
+use crate::rpc::RpcError;
+use crate::state::tests::api_request;
+use axum::http::StatusCode;
+#[tokio::test]
+async fn startup_confirmation_preserves_fatal_mining_errors_and_normal_post_pending_behavior() {
+    for mode in ["warmup", "internal", "malformed-block", "store"] {
+        let (local, _dir) = state_with_local_wallet();
+        let app = Router::new().route("/", post(move |Json(request): Json<Value>| async move {
+            let result = match request["method"].as_str().unwrap() {
+                "getrawtransaction" if mode == "store" => json!({"txid":"original-startup-txid", "confirmations":1, "blockhash":"confirmed-block"}),
+                "getrawtransaction" => json!({"txid":"original-startup-txid", "confirmations":0}),
+                "generate" if mode == "warmup" => return Json(json!({"error":{"code":-28,"message":"warming up"},"result":null})),
+                "generate" if mode == "internal" => return Json(json!({"error":{"code":-32603,"message":"internal failure"},"result":null})),
+                "generate" => json!(["mined-block"]),
+                "getblock" => json!({}),
+                method => panic!("unexpected startup method {method}"),
+            };
+            Json(json!({"result":result,"error":null}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let state = AppState::new(
+            local.0.store.clone(),
+            local.0.wallet.clone(),
+            format!("http://{}", listener.local_addr().unwrap()),
+            "test".into(),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let pending = state
+            .0
+            .store
+            .claim_faucet(1, "ironwood", 500_000_000, "startup-account-1-ironwood-v1")
+            .unwrap();
+        let pending = state
+            .0
+            .store
+            .record_prepared(
+                &pending.id,
+                "original-startup-txid",
+                b"original signed bytes",
+                140,
+            )
+            .unwrap();
+        let pending = state
+            .0
+            .store
+            .mark_broadcast(&pending.id, &pending.txid)
+            .unwrap();
+        if mode == "store" {
+            rusqlite::Connection::open(_dir.path().join("server.db"))
+                .unwrap()
+                .execute("DROP TABLE activity", [])
+                .unwrap();
+        }
+        let error = confirm_after_mining(&state, pending.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::bootstrap::startup_retryable(&error),
+            mode == "warmup",
+            "{mode}: {error:#}"
+        );
+        if mode == "warmup" || mode == "internal" {
+            assert_eq!(
+                error.downcast_ref::<RpcError>().unwrap().code,
+                if mode == "warmup" { -28 } else { -32603 }
+            );
+        }
+        if mode == "store" {
+            assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+        } else {
+            let saved = state.0.store.prepared_transaction(&pending.id).unwrap();
+            assert_eq!(saved.raw_transaction, b"original signed bytes");
+            state.mark_started();
+            let (status, response) = api_request(&state, "POST", "/api/v1/faucet", json!({"account_id":1,"pool":"ironwood","amount_zatoshi":500_000_000,"idempotency_key":"startup-account-1-ironwood-v1"})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(response["status"], "broadcast");
+            assert_eq!(response["txid"], "original-startup-txid");
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
 }

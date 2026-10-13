@@ -98,7 +98,12 @@ async fn height_wait_deadline_includes_stalled_lightwalletd_calls() {
     .await;
 
     assert!(result.is_ok(), "height wait ignored its deadline");
-    assert!(result.unwrap().is_err());
+    let error = result.unwrap().unwrap_err();
+    assert!(
+        error
+            .downcast_ref::<tokio::time::error::Elapsed>()
+            .is_some()
+    );
 }
 
 #[tokio::test]

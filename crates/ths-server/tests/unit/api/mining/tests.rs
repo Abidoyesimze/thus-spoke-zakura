@@ -1,7 +1,7 @@
 use crate::api::router;
 use crate::mining::{MiningCoordinator, MiningRuntime};
 use crate::state::AppState;
-use crate::state::tests::state_with_local_wallet;
+use crate::state::tests::started_state_with_local_wallet as state_with_local_wallet;
 use axum::body::Body;
 use axum::{
     Router,

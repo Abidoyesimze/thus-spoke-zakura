@@ -10,7 +10,8 @@ fn activity(created_at: &str) -> Activity {
         id: "9b6a7ddd-8723-4163-b99e-7b16d62efef5".to_owned(),
         kind: "send".to_owned(),
         from_account: Some(1),
-        to_account: 2,
+        to_account: Some(2),
+        to_address: None,
         source_pool: "ironwood".to_owned(),
         destination_pool: "ironwood".to_owned(),
         amount_zatoshi: 1_000_000,
@@ -18,6 +19,7 @@ fn activity(created_at: &str) -> Activity {
         block_hash: None,
         status: "broadcast".to_owned(),
         created_at: created_at.to_owned(),
+        last_error: None,
     }
 }
 

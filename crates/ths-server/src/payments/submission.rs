@@ -15,11 +15,13 @@ pub(crate) trait PaymentSubmitter: Sync {
 #[async_trait::async_trait]
 impl PaymentSubmitter for AppState {
     async fn transaction_known(&self, txid: &str) -> anyhow::Result<bool> {
-        self.0.rpc.transaction_known(txid).await
+        super::progression::bounded_payment_transaction_known(self, txid).await
     }
 
     async fn chain_height(&self) -> anyhow::Result<u64> {
-        Ok(self.0.rpc.chain_info().await?.blocks)
+        Ok(super::progression::bounded_payment_chain_info(self)
+            .await?
+            .blocks)
     }
 
     async fn broadcast(&self, raw_transaction: &[u8]) -> anyhow::Result<()> {

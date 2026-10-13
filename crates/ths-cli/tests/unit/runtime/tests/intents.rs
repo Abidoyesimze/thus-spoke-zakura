@@ -4,12 +4,12 @@ use super::*;
 fn faucet_keys_survive_cli_restart_until_the_whole_intent_is_confirmed() {
     let dir = std::env::temp_dir().join(format!("ths-faucet-journal-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();
-    let first = FaucetJournal::open(&dir).unwrap();
+    let first = IntentJournal::open(&dir, "faucet").unwrap();
     let account_one = first.key_for("wallet:ironwood:100:1,2:1").unwrap();
     let account_two = first.key_for("wallet:ironwood:100:1,2:2").unwrap();
     drop(first);
 
-    let retry = FaucetJournal::open(&dir).unwrap();
+    let retry = IntentJournal::open(&dir, "faucet").unwrap();
     assert_eq!(
         retry.key_for("wallet:ironwood:100:1,2:1").unwrap(),
         account_one
@@ -19,11 +19,14 @@ fn faucet_keys_survive_cli_restart_until_the_whole_intent_is_confirmed() {
         account_two
     );
     retry
-        .clear(&["wallet:ironwood:100:1,2:1", "wallet:ironwood:100:1,2:2"])
+        .clear(&[
+            ("wallet:ironwood:100:1,2:1", &account_one),
+            ("wallet:ironwood:100:1,2:2", &account_two),
+        ])
         .unwrap();
     drop(retry);
 
-    let next = FaucetJournal::open(&dir).unwrap();
+    let next = IntentJournal::open(&dir, "faucet").unwrap();
     assert_ne!(
         next.key_for("wallet:ironwood:100:1,2:1").unwrap(),
         account_one
@@ -34,7 +37,7 @@ fn faucet_keys_survive_cli_restart_until_the_whole_intent_is_confirmed() {
 
 pub(super) fn overlapping_faucet_process_rejects_the_locked_journal() {
     let dir = tempfile::tempdir().unwrap();
-    let journal = FaucetJournal::open(dir.path()).unwrap();
+    let journal = IntentJournal::open(dir.path(), "faucet").unwrap();
     let mut retry = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "runtime::tests::faucet_journal_lock_probe"])
         .env("THS_FAUCET_JOURNAL_LOCK_PROBE", dir.path())
@@ -65,11 +68,11 @@ pub(super) fn overlapping_faucet_process_rejects_the_locked_journal() {
 fn unfinished_wallet_batch_rejects_an_overlapping_subset() {
     let dir = std::env::temp_dir().join(format!("ths-faucet-batch-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();
-    let journal = FaucetJournal::open(&dir).unwrap();
+    let journal = IntentJournal::open(&dir, "faucet").unwrap();
     let batch = journal.wallet_batch("ironwood", 100, &[1, 2]).unwrap();
-    journal.key_for(&format!("{batch}:1")).unwrap();
+    let first = journal.key_for(&format!("{batch}:1")).unwrap();
     assert!(journal.wallet_batch("ironwood", 100, &[2]).is_err());
-    journal.key_for(&format!("{batch}:2")).unwrap();
+    let second = journal.key_for(&format!("{batch}:2")).unwrap();
 
     assert_eq!(
         journal.wallet_batch("ironwood", 100, &[2, 1]).unwrap(),
@@ -77,7 +80,10 @@ fn unfinished_wallet_batch_rejects_an_overlapping_subset() {
     );
     assert!(journal.wallet_batch("ironwood", 100, &[2]).is_err());
     journal
-        .clear(&[&format!("{batch}:1"), &format!("{batch}:2")])
+        .clear(&[
+            (&format!("{batch}:1"), &first),
+            (&format!("{batch}:2"), &second),
+        ])
         .unwrap();
     assert!(journal.wallet_batch("ironwood", 100, &[2]).is_ok());
     drop(journal);
@@ -86,9 +92,10 @@ fn unfinished_wallet_batch_rejects_an_overlapping_subset() {
 
 #[test]
 #[cfg(unix)]
+#[cfg(unix)]
 fn dropping_faucet_journal_releases_lock_with_a_duplicated_handle() {
     let dir = tempfile::tempdir().unwrap();
-    let journal = FaucetJournal::open(dir.path()).unwrap();
+    let journal = IntentJournal::open(dir.path(), "faucet").unwrap();
     let key = journal.key_for("address:recipient:100").unwrap();
     // A concurrent process spawn can temporarily inherit the same open file
     // description. Keep a duplicate alive to reproduce that lifetime without timing.
@@ -103,7 +110,7 @@ fn dropping_faucet_journal_releases_lock_with_a_duplicated_handle() {
     ));
 
     drop(journal);
-    let retry = FaucetJournal::open(dir.path()).unwrap();
+    let retry = IntentJournal::open(dir.path(), "faucet").unwrap();
     assert_eq!(retry.key_for("address:recipient:100").unwrap(), key);
     assert!(matches!(
         contender.try_lock(),
@@ -233,15 +240,16 @@ unsafe extern "C" {
 
 #[cfg(unix)]
 #[test]
+#[cfg(unix)]
 fn dropping_the_journal_releases_the_lock_while_a_child_holds_its_descriptor() {
     let dir = tempfile::tempdir().unwrap();
-    let journal = FaucetJournal::open(dir.path()).unwrap();
+    let journal = IntentJournal::open(dir.path(), "faucet").unwrap();
     let child = InheritedDescriptorChild::spawn();
     drop(journal);
 
-    let reopened = FaucetJournal::open(dir.path())
+    let reopened = IntentJournal::open(dir.path(), "faucet")
         .unwrap_or_else(|error| panic!("inherited descriptor kept the faucet lock: {error:#}"));
-    match FaucetJournal::open(dir.path()) {
+    match IntentJournal::open(dir.path(), "faucet") {
         Err(error) => assert!(
             error
                 .to_string()
@@ -252,4 +260,31 @@ fn dropping_the_journal_releases_the_lock_while_a_child_holds_its_descriptor() {
     }
     drop(reopened);
     child.release();
+}
+
+#[test]
+fn a_running_send_locks_its_journal_without_blocking_faucet_commands() {
+    let dir = tempfile::tempdir().unwrap();
+    let send = IntentJournal::open(dir.path(), "send").unwrap();
+    let error = IntentJournal::open(dir.path(), "send").err().unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains("another send command is running"),
+        "{error}"
+    );
+    IntentJournal::open(dir.path(), "faucet").unwrap();
+    drop(send);
+    IntentJournal::open(dir.path(), "send").unwrap();
+}
+
+#[test]
+fn a_late_result_cannot_clear_a_newer_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let journal = IntentJournal::open(dir.path(), "send").unwrap();
+    let newer = journal.key_for("intent").unwrap();
+    journal.clear(&[("intent", "older-key")]).unwrap();
+    assert_eq!(journal.key_for("intent").unwrap(), newer);
+    journal.clear(&[("intent", &newer)]).unwrap();
+    assert_ne!(journal.key_for("intent").unwrap(), newer);
 }

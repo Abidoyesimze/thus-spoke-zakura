@@ -73,7 +73,7 @@ pub(super) async fn same_account_cross_pool_round_trip_is_replay_safe() -> Resul
             .await?;
             anyhow::ensure!(sent.status == "confirmed", "send did not confirm");
             anyhow::ensure!(sent.from_account == Some(1), "source account changed");
-            anyhow::ensure!(sent.to_account == 1, "destination account changed");
+            anyhow::ensure!(sent.to_account == Some(1), "destination account changed");
             anyhow::ensure!(sent.source_pool == source, "source pool changed");
             anyhow::ensure!(
                 sent.destination_pool == destination,

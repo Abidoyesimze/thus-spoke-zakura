@@ -83,7 +83,8 @@ struct Activity {
     id: String,
     kind: String,
     from_account: Option<u8>,
-    to_account: u8,
+    to_account: Option<u8>,
+    to_address: Option<String>,
     source_pool: String,
     destination_pool: String,
     amount_zatoshi: u64,
@@ -91,6 +92,7 @@ struct Activity {
     block_hash: Option<String>,
     status: String,
     created_at: String,
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +152,7 @@ struct AddressFaucetResult {
     txid: String,
     block_hash: Option<String>,
     status: String,
+    last_error: Option<String>,
 }
 
 #[tokio::test(flavor = "multi_thread")]

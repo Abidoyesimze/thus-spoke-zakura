@@ -2,7 +2,7 @@ use super::activity::activity_for_key;
 use super::*;
 
 /// The order must match `row_address_faucet`.
-const ADDRESS_FAUCET_COLUMNS: &str = "id,address,amount_zatoshi,txid,block_hash,status";
+const ADDRESS_FAUCET_COLUMNS: &str = "id,address,amount_zatoshi,txid,block_hash,status,last_error";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressFaucet {
@@ -12,6 +12,7 @@ pub struct AddressFaucet {
     pub txid: String,
     pub block_hash: Option<String>,
     pub status: String,
+    pub last_error: Option<String>,
 }
 
 impl Store {
@@ -47,6 +48,7 @@ impl Store {
         address_for_key(&db, key)?.context("address faucet claim was not stored")
     }
 
+    #[cfg(test)]
     pub fn discard_address_preparing(&self, id: &str) -> Result<()> {
         self.0.lock().unwrap().execute(
             "DELETE FROM address_faucets WHERE id=?1 AND status='preparing'",
@@ -65,7 +67,7 @@ impl Store {
         let mut db = self.0.lock().unwrap();
         let tx = db.transaction()?;
         let updated = tx.execute(
-            "UPDATE address_faucets SET txid=?1,status='prepared' WHERE id=?2 AND status='preparing'",
+            "UPDATE address_faucets SET txid=?1,status='prepared',last_error=NULL WHERE id=?2 AND status='preparing'",
             params![txid, id],
         )?;
         let payment = address_by_id(&tx, id)?;
@@ -103,7 +105,7 @@ impl Store {
     pub fn mark_address_broadcast(&self, id: &str, txid: &str) -> Result<AddressFaucet> {
         let db = self.0.lock().unwrap();
         let updated = db.execute(
-            "UPDATE address_faucets SET status='broadcast' WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
+            "UPDATE address_faucets SET status='broadcast',last_error=NULL WHERE id=?1 AND txid=?2 AND status IN ('prepared','broadcast')",
             params![id, txid],
         )?;
         let payment = address_by_id(&db, id)?;
@@ -119,10 +121,45 @@ impl Store {
         }
         let db = self.0.lock().unwrap();
         db.execute(
-            "UPDATE address_faucets SET status='confirmed',block_hash=?1 WHERE id=?2 AND txid=?3",
+            "UPDATE address_faucets SET status='confirmed',block_hash=?1,last_error=NULL WHERE id=?2 AND txid=?3",
             params![block_hash, id, txid],
         )?;
         address_by_id(&db, id)
+    }
+
+    pub fn record_address_error(
+        &self,
+        id: &str,
+        status: &str,
+        txid: &str,
+        error: &str,
+    ) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE address_faucets SET last_error=?1 WHERE id=?2 AND status=?3 AND txid=?4 AND status NOT IN ('confirmed','failed')",
+            params![error, id, status, txid],
+        )?;
+        address_by_id(&db, id)
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "server-owned payment progression (#196) uses this"
+        )
+    )]
+    pub fn fail_address(&self, id: &str, error: &str) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        let updated = db.execute(
+            "UPDATE address_faucets SET status='failed',last_error=?1 WHERE id=?2 AND status='preparing' AND txid=''",
+            params![error, id],
+        )?;
+        let payment = address_by_id(&db, id)?;
+        if updated == 0 && payment.status != "failed" {
+            bail!("address faucet {id} is no longer waiting for preparation");
+        }
+        Ok(payment)
     }
 }
 
@@ -151,9 +188,33 @@ fn row_address_faucet(row: &rusqlite::Row<'_>) -> rusqlite::Result<AddressFaucet
         txid: row.get(3)?,
         block_hash: row.get(4)?,
         status: row.get(5)?,
+        last_error: row.get(6)?,
     })
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/db/address_faucet/tests.rs"]
 mod tests;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressFaucetIntent {
+    pub payment: AddressFaucet,
+    pub key: String,
+}
+
+impl Store {
+    pub fn unresolved_address_faucets(&self) -> Result<Vec<AddressFaucetIntent>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ADDRESS_FAUCET_COLUMNS},key FROM address_faucets WHERE status NOT IN ('confirmed','failed') ORDER BY rowid ASC"
+        ))?;
+        Ok(query
+            .query_map([], |row| {
+                Ok(AddressFaucetIntent {
+                    payment: row_address_faucet(row)?,
+                    key: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+}

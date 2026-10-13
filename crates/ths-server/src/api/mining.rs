@@ -1,3 +1,4 @@
+use super::error::require_started;
 use super::{
     error::{ApiError, ApiResult},
     payments::require_key,
@@ -22,6 +23,7 @@ pub(crate) async fn start_mining_job(
     State(state): State<AppState>,
     Json(req): Json<StartMiningRequest>,
 ) -> ApiResult<(StatusCode, Json<MiningJob>)> {
+    require_started(&state)?;
     require_key(&req.idempotency_key)?;
     let admission = state.start_mining(req.blocks, req.idempotency_key).await?;
     Ok((StatusCode::ACCEPTED, Json(admission.job)))
@@ -55,6 +57,7 @@ pub(crate) async fn mine(
     State(state): State<AppState>,
     Json(req): Json<MineRequest>,
 ) -> ApiResult<Json<Value>> {
+    require_started(&state)?;
     if !(1..=10_000).contains(&req.blocks) {
         return Err(ApiError::bad_request("blocks must be between 1 and 10,000"));
     }

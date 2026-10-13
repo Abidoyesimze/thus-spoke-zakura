@@ -9,13 +9,17 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 #[derive(Clone)]
 pub(crate) struct AppState(pub(crate) Arc<Inner>);
 pub(crate) struct Inner {
+    started: AtomicBool,
     pub(crate) mining: Arc<MiningCoordinator>,
     #[cfg(test)]
     pub(crate) mining_runtime: Option<Arc<dyn MiningRuntime>>,
@@ -48,10 +52,19 @@ pub(crate) struct WalletSyncStatus {
 }
 
 impl AppState {
+    pub(crate) fn started(&self) -> bool {
+        self.0.started.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn mark_started(&self) {
+        self.0.started.store(true, Ordering::Release);
+    }
+
     pub(crate) fn new(store: Store, wallet: RealWallet, rpc: String, instance: String) -> Self {
         let (events, _) = broadcast::channel(128);
         let accounts = store.accounts().unwrap_or_default();
         Self(Arc::new(Inner {
+            started: AtomicBool::new(false),
             mining: Arc::new(MiningCoordinator::new()),
             #[cfg(test)]
             mining_runtime: None,

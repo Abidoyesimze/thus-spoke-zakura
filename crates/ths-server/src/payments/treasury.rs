@@ -22,14 +22,41 @@ pub(crate) async fn fund_address_from_treasury(
     idempotency_key: &str,
 ) -> anyhow::Result<AddressFaucet> {
     let _payment = state.0.payments.lock().await;
-    let mut pending =
-        state
-            .0
-            .store
-            .claim_address_faucet(address, amount_zatoshi, idempotency_key)?;
+    let pending = state
+        .0
+        .store
+        .claim_address_faucet(address, amount_zatoshi, idempotency_key)?;
+    resume_address_payment(state, pending, |activity_id| async move {
+        state.synchronize_latest().await?;
+        let seed = state.0.store.seed()?;
+        let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+        let _replenishment = state.0.treasury_replenishment.lock().await;
+        prepare_with_replenishment(
+            state,
+            Some(&activity_id),
+            &seed,
+            &treasury,
+            address,
+            amount_zatoshi,
+            record_prepared_address_payment(&state.0.store, &activity_id),
+        )
+        .await
+    })
+    .await
+}
+
+pub(super) async fn resume_address_payment<Prepare, PrepareFuture>(
+    state: &AppState,
+    mut pending: AddressFaucet,
+    mut prepare: Prepare,
+) -> anyhow::Result<AddressFaucet>
+where
+    Prepare: FnMut(String) -> PrepareFuture,
+    PrepareFuture: std::future::Future<Output = anyhow::Result<PreparedPayment>>,
+{
     loop {
         match pending.status.as_str() {
-            "confirmed" => return Ok(pending),
+            "confirmed" | "failed" => return Ok(pending),
             "prepared" | "broadcast" => {
                 match submit_address_prepared(&state.0.store, state, &pending).await? {
                     AddressSubmission::Broadcast(payment) => {
@@ -40,29 +67,16 @@ pub(crate) async fn fund_address_from_treasury(
                 }
             }
             "preparing" => {
-                let prepared = async {
-                    state.synchronize_latest().await?;
-                    let seed = state.0.store.seed()?;
-                    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-                    let _replenishment = state.0.treasury_replenishment.lock().await;
-                    prepare_with_replenishment(
-                        state,
-                        Some(&pending.id),
-                        &seed,
-                        &treasury,
-                        address,
-                        amount_zatoshi,
-                        record_prepared_address_payment(&state.0.store, &pending.id),
-                    )
-                    .await
-                }
-                .await;
+                let prepared = prepare(pending.id.clone()).await;
                 let prepared = match prepared {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        if !state.0.wallet.has_prepared(&pending.id).await? {
-                            state.0.store.discard_address_preparing(&pending.id)?;
-                        }
+                        state.0.store.record_address_error(
+                            &pending.id,
+                            "preparing",
+                            "",
+                            &error.to_string(),
+                        )?;
                         return Err(error);
                     }
                 };
@@ -119,7 +133,7 @@ pub(crate) async fn fund_from_treasury(
 }
 
 #[async_trait::async_trait]
-trait FaucetRuntime: Sync {
+pub(super) trait FaucetRuntime: Sync {
     async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
@@ -337,7 +351,7 @@ async fn discover_reward(
     Ok(next)
 }
 
-async fn prepare_with_replenishment<R, F>(
+pub(super) async fn prepare_with_replenishment<R, F>(
     runtime: &R,
     activity_id: Option<&str>,
     seed: &str,
@@ -524,7 +538,7 @@ pub(crate) async fn provision_initial_balance(state: &AppState) -> anyhow::Resul
         let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
         replenish_treasury(state, &seed, &treasury, 1).await?;
     }
-    fund_from_treasury(
+    let funding = fund_from_treasury(
         state,
         1,
         "ironwood",
@@ -532,6 +546,9 @@ pub(crate) async fn provision_initial_balance(state: &AppState) -> anyhow::Resul
         INITIAL_FUNDING_KEY,
     )
     .await?;
+    if funding.status != "confirmed" {
+        return Err(crate::bootstrap::ReadinessError::FundingPending.into());
+    }
     let account = state
         .accounts()
         .await
@@ -551,7 +568,7 @@ pub(crate) async fn provision_initial_balance(state: &AppState) -> anyhow::Resul
 #[path = "../../tests/unit/payments/treasury/tests.rs"]
 pub(crate) mod tests;
 
-fn record_prepared_address_payment(
+pub(super) fn record_prepared_address_payment(
     store: &Store,
     id: &str,
 ) -> impl FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static {

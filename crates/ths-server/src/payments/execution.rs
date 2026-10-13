@@ -1,3 +1,4 @@
+use super::progression::{can_fail_insufficient_send, is_insufficient_funds};
 use super::{
     confirmation::confirm_after_mining,
     submission::{PreparedSubmission, submit_prepared},
@@ -5,15 +6,24 @@ use super::{
 use crate::{
     db::{Activity, Store},
     state::AppState,
-    wallet::PreparedPayment,
+    wallet::{PaymentError, PreparedPayment},
 };
 use std::future::Future;
+use zcash_protocol::memo::MemoBytes;
 #[async_trait::async_trait]
 pub(crate) trait PaymentLifecycle: Sync {
     async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission>;
-    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()>;
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()>;
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity>;
     async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity>;
+    async fn fail_insufficient_send(
+        &self,
+        activity: &Activity,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        let _ = (activity, error);
+        Ok(false)
+    }
 }
 
 #[async_trait::async_trait]
@@ -22,8 +32,9 @@ impl PaymentLifecycle for AppState {
         submit_prepared(&self.0.store, self, activity).await
     }
 
-    async fn discard_unprepared_claim(&self, id: &str) -> anyhow::Result<()> {
-        discard_unprepared_claim(self, id).await
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        self.0.store.record_error(id, "preparing", "", error)?;
+        Ok(())
     }
 
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
@@ -37,6 +48,21 @@ impl PaymentLifecycle for AppState {
 
     async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
         confirm_after_mining(self, activity).await
+    }
+
+    async fn fail_insufficient_send(
+        &self,
+        activity: &Activity,
+        error: &str,
+    ) -> anyhow::Result<bool> {
+        if activity.status != "preparing"
+            || !activity.txid.is_empty()
+            || !can_fail_insufficient_send(self, &activity.id).await
+        {
+            return Ok(false);
+        }
+        self.0.store.fail(&activity.id, error)?;
+        Ok(true)
     }
 }
 
@@ -52,7 +78,7 @@ where
 {
     loop {
         match pending.status.as_str() {
-            "confirmed" => return Ok(pending),
+            "confirmed" | "failed" => return Ok(pending),
             "prepared" | "broadcast" => match runtime.submit_prepared(&pending).await? {
                 PreparedSubmission::Broadcast(activity) => {
                     return runtime.confirm_after_mining(activity).await;
@@ -63,7 +89,17 @@ where
                 let prepared = match prepare(pending.id.clone()).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        runtime.discard_unprepared_claim(&pending.id).await?;
+                        if pending.kind == "send"
+                            && is_insufficient_funds(&error)
+                            && runtime
+                                .fail_insufficient_send(&pending, &error.to_string())
+                                .await?
+                        {
+                            // Preserve the current POST error response while
+                            // retaining a terminal, replayable operation.
+                            return Err(error);
+                        }
+                        runtime.record_preparation_error(&pending.id, &error.to_string())?;
                         return Err(error);
                     }
                 };
@@ -72,13 +108,6 @@ where
             status => anyhow::bail!("payment has unsupported status {status}"),
         }
     }
-}
-
-async fn discard_unprepared_claim(state: &AppState, id: &str) -> anyhow::Result<()> {
-    if !state.0.wallet.has_prepared(id).await? {
-        state.0.store.discard_preparing(id)?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -100,4 +129,26 @@ pub(crate) fn record_prepared_payment(
         )?;
         Ok(prepared)
     }
+}
+
+/// An absent (or null) memo is `None`. Any present memo, including `""`, is
+/// encoded as an explicit ZIP-302 text memo and is only valid for ironwood.
+pub(crate) fn parse_payment_memo(
+    memo: Option<&str>,
+    destination_pool: &str,
+) -> Result<Option<MemoBytes>, String> {
+    let Some(text) = memo else {
+        return Ok(None);
+    };
+    if destination_pool != "ironwood" {
+        return Err(PaymentError::TransparentMemo.to_string());
+    }
+    // Text memos are zero-padded to 512 bytes, so a trailing NUL could not be
+    // told apart from padding and would be silently lost on decode.
+    if text.ends_with('\0') {
+        return Err("memo must not end with a NUL (U+0000) character".into());
+    }
+    MemoBytes::from_bytes(text.as_bytes())
+        .map(Some)
+        .map_err(|error| format!("invalid memo: {error}"))
 }

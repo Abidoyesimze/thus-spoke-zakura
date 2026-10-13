@@ -18,6 +18,11 @@ async fn prepared_payment_journal_survives_reopen() {
     let wallet = RealWallet::open(dir.path(), &seed).unwrap();
     assert!(wallet.has_prepared("activity-1").await.unwrap());
     assert!(!wallet.has_prepared("missing").await.unwrap());
+    let journaled = wallet.prepared("activity-1").await.unwrap().unwrap();
+    assert_eq!(journaled.txid, "txid-1");
+    assert_eq!(journaled.raw_transaction, b"signed transaction");
+    assert_eq!(journaled.expiry_height, 140);
+    assert!(wallet.prepared("missing").await.unwrap().is_none());
     let recovered = wallet
         .prepare(
             Some("activity-1"),

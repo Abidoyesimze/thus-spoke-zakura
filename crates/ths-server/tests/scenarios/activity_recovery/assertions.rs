@@ -126,16 +126,30 @@ pub(super) async fn assert_address_faucet_inclusion(
     fixture: &RegtestStack,
     response: &serde_json::Value,
     address: &str,
+    key: &str,
 ) -> Result<()> {
     anyhow::ensure!(
-        response.as_object().is_some_and(|fields| fields.len() == 5),
+        response.as_object().is_some_and(|fields| fields.len() == 6),
         "address faucet response fields changed"
     );
     anyhow::ensure!(
         response["address"] == address
             && response["amount_zatoshi"] == 100_000_000
-            && response["status"] == "confirmed",
+            && response["status"] == "confirmed"
+            && response["last_error"].is_null(),
         "address faucet destination, amount, or confirmation status changed"
+    );
+    let stored: serde_json::Value = request_json(
+        client,
+        fixture.api_url(),
+        &format!("/api/v1/faucet/address?idempotency_key={key}"),
+        None,
+        API_READ_TIMEOUT,
+    )
+    .await?;
+    anyhow::ensure!(
+        &stored == response,
+        "stored address faucet status differs from the response"
     );
     let evidence: TransactionEvidence = rpc(
         client,
@@ -162,7 +176,7 @@ pub(super) fn assert_requested_payment_fields(activity: &Activity) -> Result<()>
         "activity source account changed"
     );
     anyhow::ensure!(
-        activity.to_account == 2,
+        activity.to_account == Some(2),
         "activity destination account changed"
     );
     anyhow::ensure!(
@@ -294,3 +308,5 @@ pub(super) fn preserve_scenario_failure<T>(scenario: Result<T>, cleanup: Result<
         (Err(error), _) => Err(error),
     }
 }
+
+use super::{API_READ_TIMEOUT, request_json};

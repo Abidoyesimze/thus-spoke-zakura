@@ -164,6 +164,9 @@ pub(crate) async fn confirm_after_mining(
     }
     match mine_and_sync(state, 1).await {
         Ok(_) => confirm_from_chain(state, pending).await,
+        // Startup must classify the original failure; replacing it with a
+        // pending result would also retry store errors and broken invariants.
+        Err(error) if !state.started() => Err(error),
         Err(error) => {
             tracing::warn!(
                 error = %format_args!("{error:#}"),
@@ -180,16 +183,33 @@ pub(crate) async fn confirm_after_mining(
 pub(crate) mod tests;
 
 const PAYMENT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const PAYMENT_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
-const PAYMENT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+use super::progression::{
+    PAYMENT_DISPATCH_BUDGET, PAYMENT_LOOKUP_TIMEOUT, progress_payment_intents,
+};
 
 pub(crate) async fn payment_confirmation_loop(state: AppState) {
     let mut cursor = None;
+    let mut activity_cursor = None;
+    let mut address_cursor = None;
     let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
+        if state.started()
+            && let Err(error) = progress_payment_intents(
+                &state,
+                deadline,
+                &mut activity_cursor,
+                &mut address_cursor,
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background payment progression failed"
+            );
+        }
         let rpc = &state.0.rpc;
         match reconcile_unconfirmed_with(&state.0.store, &mut cursor, deadline, |txid| async move {
             rpc.lookup_transaction(&txid).await

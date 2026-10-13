@@ -1,4 +1,5 @@
 use super::error::{ApiError, ApiResult};
+use super::payments::require_key;
 use crate::state::AppState;
 use crate::{
     db::{Account, Activity, USER_ACCOUNT_COUNT},
@@ -17,14 +18,14 @@ use serde_json::{Value, json};
 pub(crate) async fn health(State(state): State<AppState>) -> Response {
     let node = state.0.rpc.chain_info().await.ok();
     let wallet = state.wallet_sync_status().await;
-    let status = if node.is_some() && wallet.last_success_at.is_some() {
+    let status = if state.started() && node.is_some() && wallet.last_success_at.is_some() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (
         status,
-        Json(json!({"ok": node.is_some() && wallet.last_success_at.is_some(), "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
+        Json(json!({"ok": state.started() && node.is_some() && wallet.last_success_at.is_some(), "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
     )
         .into_response()
 }
@@ -158,10 +159,17 @@ pub(crate) mod tests;
 #[derive(Deserialize)]
 pub(crate) struct Page {
     limit: Option<u32>,
+    idempotency_key: Option<String>,
 }
 pub(crate) async fn activity(
     State(state): State<AppState>,
     Query(page): Query<Page>,
 ) -> ApiResult<Json<Vec<Activity>>> {
+    if let Some(key) = page.idempotency_key {
+        require_key(&key)?;
+        return Ok(Json(
+            state.0.store.activity_for_key(&key)?.into_iter().collect(),
+        ));
+    }
     Ok(Json(state.0.store.activities(page.limit.unwrap_or(30))?))
 }

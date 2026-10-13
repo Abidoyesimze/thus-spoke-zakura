@@ -1,12 +1,12 @@
 use anyhow::{Result, bail};
 
 use crate::{
-    args::{Pool, SendArgs},
+    args::{Pool, SendAmount, SendArgs},
     runtime::{InstanceName, Runtime},
 };
 
 fn check_send(args: &SendArgs) -> Result<()> {
-    if args.from == args.to && args.source_pool == args.destination_pool {
+    if args.to == Some(args.from) && args.source_pool == args.destination_pool {
         bail!("choose a different --to account or a different --destination-pool");
     }
     if args.memo.is_some() && args.destination_pool == Pool::Transparent {
@@ -24,13 +24,26 @@ pub(super) fn send(
     json: bool,
 ) -> Result<()> {
     check_send(&args)?;
+    if let Some(uri) = &args.uri {
+        return runtime.wallet_send_uri(
+            name,
+            args.from,
+            args.source_pool.as_str(),
+            uri,
+            args.amount.map(SendAmount::zatoshi),
+            json,
+        );
+    }
+    let (Some(to), Some(amount)) = (args.to, args.amount) else {
+        bail!("--to and --amount are required unless --uri is given");
+    };
     runtime.wallet_send(
         name,
         args.from,
-        args.to,
+        to,
         args.source_pool.as_str(),
         args.destination_pool.as_str(),
-        args.amount.zatoshi(),
+        amount.zatoshi(),
         args.memo.as_deref(),
         json,
     )

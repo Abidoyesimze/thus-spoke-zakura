@@ -18,6 +18,7 @@ pub(crate) fn not_found(error: anyhow::Error, message: &str) -> ApiError {
 }
 
 pub(crate) type ApiResult<T> = Result<T, ApiError>;
+#[derive(Debug)]
 pub(crate) struct ApiError {
     pub(crate) status: StatusCode,
     pub(crate) message: String,
@@ -79,3 +80,14 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 #[path = "../../tests/unit/api/error/tests.rs"]
 pub(crate) mod tests;
+
+pub(super) fn require_started(state: &crate::state::AppState) -> ApiResult<()> {
+    if state.started() {
+        Ok(())
+    } else {
+        Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "the environment is still starting".into(),
+        })
+    }
+}
