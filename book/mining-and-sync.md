@@ -10,18 +10,21 @@ a block hash. That does not instantly make every wallet view current:
 lightwalletd still has
 to index the block, and the wallet still has to scan and reconcile it.
 
-![ths mine N posts to the mine endpoint, which validates the count, asks Zakura to generate the blocks, waits for lightwalletd to index and the wallet to scan, then returns the block hashes. A failure after generate is not a rollback.](images/mining-flow.svg)
+![The dashboard starts a keyed mining job and receives its accepted status; the CLI waits for that server-owned job. Mining advances acknowledged progress, then wallet synchronization completes or fails. Client disconnection does not cancel admitted work, and an uncertain RPC may have generated extra blocks.](images/mining-flow.svg)
 
-1. `ths mine N` or the dashboard Mine dialog calls `POST /api/v1/mine` with
-   `{"blocks":N}`. The server accepts **1–10,000** blocks.
+1. `ths mine N` calls `POST /api/v1/mine` with `{"blocks":N}`. The dashboard
+   Mine dialog calls `POST /api/v1/mining/jobs` with a block count and
+   idempotency key; it receives HTTP **202** and a job before mining finishes.
+   The server accepts **1–10,000** blocks.
 2. Zakura generates blocks and returns their hashes. The server asks Zakura
    for the last returned block's height.
 3. The wallet waits for lightwalletd to index that height, scans compact
    blocks, reconciles against Zakura's canonical block hashes, and publishes
    a fresh user-account snapshot at a matching checkpoint.
-4. The server notifies dashboard clients of a `chain` update and returns
-   `blocks` and `hashes`. If a step after generation fails, the API returns
-   an error even though blocks may already exist.
+4. The server notifies dashboard clients of a `chain` update. After successful
+   synchronization, the CLI returns `blocks` and `hashes`; the dashboard job
+   becomes `completed`. If a step after generation fails, the CLI returns an
+   error and the job becomes `failed`, even though blocks may already exist.
 
 ## Mine and inspect one result
 
@@ -33,12 +36,28 @@ Mined 2 blocks on default.
 New tip: 9ef8f0064e3f088f2012fe04d5d70b42f00ae1e9676cdc3d5384ad31d384b8c4
 ```
 
-The tip hash differs on every run. Two blocks come back in about a second;
-Regtest has no proof-of-work delay, so the wait is wallet scanning, not
-mining. The dashboard's **Mine** dialog performs the same API operation.
+The tip hash differs on every run. Regtest has no proof-of-work delay;
+completion also waits for indexing and wallet scanning. The dashboard's
+**Mine** dialog starts a job and shows its progress.
 Do not run both if you intend to add only two blocks.
 
 ![The Mine blocks dialog over the Wallet page, labelled CHAIN CONTROL, explaining that Regtest mines on demand with no proof-of-work delay, with a Number of blocks field accepting 1 to 10,000 and a Mine blocks button.](images/mine.png)
+
+## Follow mining progress in the dashboard
+
+The **Mine** dialog shows block-generation progress, then `syncing` while the
+wallet catches up. A job becomes `completed` only after synchronization
+succeeds; generation or synchronization errors leave it `failed`. Only one
+manual job can be active, including its synchronization phase.
+
+![The Mine blocks modal during a real 200-block job, with a partially filled progress bar and partial acknowledged count, Mining blocks text, and disabled count and submission controls. A matching progress panel remains visible on the Network page behind the dialog.](images/mining-progress.png)
+
+![The reopened Mine blocks modal after refresh, showing 2 of 2 blocks confirmed, a full progress bar, and Mining completed. Wallet synchronized. The new-admission count has reset to 1; the status still describes the prior two-block job.](images/mining-completed.png)
+
+The dashboard reads `GET /api/v1/mining/jobs` for the latest job, or
+`GET /api/v1/mining/jobs/{id}` for a specific job. Reusing an accepted key with
+the same block count returns the same job within that server lifetime; a
+fresh CLI invocation requests new mining.
 
 Read the node and wallet view through the running instance's API:
 
@@ -52,13 +71,6 @@ curl -fsS "$DASHBOARD_URL/api/v1/accounts"
 `GET /api/v1/status`, `node.blocks` is the node height and
 `node.bestblockhash` is the tip hash.
 
-One field there will look wrong: `node.chain` reads `"test"`, not
-`"regtest"`. That string comes straight from Zakura, which reports Regtest
-under its testnet chain name; the Network page's **Chain** tile shows the
-same raw value. The instance is Regtest — `status.network` says `Regtest`
-and `ths endpoints --json` says `"network": "regtest"`. Ignore `node.chain`
-and use either of those.
-
 The wallet fields mean:
 
 | Field | Meaning |
@@ -69,7 +81,7 @@ The wallet fields mean:
 | `error` | Why the last attempt failed, if it did. |
 | `last_success_at` | Unix time of the last successful snapshot publication. |
 
-After a successful explicit mine on the normal running example, the wallet
+After a successful `ths mine` on the normal running example, the wallet
 has reconciled through the mined tip before the response. An independent
 chain change can happen later, so use the current status fields when making
 a decision. `GET /api/v1/accounts` serves the **last wallet snapshot**; it

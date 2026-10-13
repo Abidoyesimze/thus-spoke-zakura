@@ -329,21 +329,31 @@ def payment_flow():
 
 
 def mining_flow():
-    d = D("mining-flow", 1000, 308, "An explicit mine request",
-          "ths mine N posts to the mine endpoint, which validates the count, asks Zakura to "
-          "generate the blocks, waits for lightwalletd to index and the wallet to scan, then "
-          "returns the block hashes. A failure after generate is not a rollback.")
-    xs, w = d.row(5, gap=24)
-    y, h = 96, 68
-    for x, (t, s) in zip(xs, [("ths mine N", "or the Mine dialog"), ("Validate", "1 to 10,000"),
-                              ("Zakura generates", "blocks + hashes"), ("Index + scan", "then reconcile"),
-                              ("Return", "blocks and hashes")]):
-        d.card(x, y, w, h, t, s, kind="accent" if t == "Zakura generates" else "plain")
-    for a, b in zip(xs, xs[1:]):
-        d.arrow([(a + w, y + h / 2), (b - 8, y + h / 2)])
-    d.card(240, 218, 520, 54, "A failure after generate is not a rollback",
-           "the blocks stay on the chain; the call returns an error", kind="note")
-    d.arrow([(xs[2] + w / 2, y + h), (xs[2] + w / 2, 218)], cls="lead", head=False)
+    d = D("mining-flow", 1000, 420, "An admitted mining job belongs to the server",
+          "The dashboard starts a keyed mining job and receives its accepted status; the "
+          "CLI waits for that server-owned job. Mining advances acknowledged progress, "
+          "then wallet synchronization completes or fails. Client disconnection does not cancel "
+          "admitted work, and an uncertain RPC may have generated extra blocks.")
+    top, tw = d.row(2, gap=32)
+    d.card(top[0], 86, tw, 64, "Dashboard: keyed POST", "202 returns job; read status to follow")
+    d.card(top[1], 86, tw, 64, "CLI: POST /mine", "waits for job + synchronization")
+    xs, w = d.row(3)
+    for x in top:
+        d.arrow([(x + tw / 2, 150), (x + tw / 2, 190),
+                 (xs[0] + w / 2, 190), (xs[0] + w / 2, 224)])
+    d.text(500, 178, "one active manual job, including synchronization", "s")
+    for x, (title, sub) in zip(xs, [("mining", "count acknowledged job hashes"),
+                                   ("syncing", "index, scan, reconcile"),
+                                   ("completed", "synchronization succeeded")]):
+        d.card(x, 232, w, 64, title, sub, kind="accent" if title == "mining" else "plain")
+    for i in range(2):
+        d.arrow([(xs[i] + w, 264), (xs[i + 1] - 8, 264)])
+    d.card(240, 332, 520, 54, "failed is not a rollback",
+           "uncertain RPC: lower bound; sync failure: full count", kind="note")
+    for i in (0, 1):
+        d.arrow([(xs[i] + w / 2, 296), (xs[i] + w / 2, 316),
+                 (500, 316), (500, 332)], cls="lead", head=False)
+    d.text(500, 408, "client loss does not cancel admitted work; job history lasts only for this server process", "s")
     return d
 
 
