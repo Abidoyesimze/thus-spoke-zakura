@@ -1,57 +1,69 @@
-use crate::state::{AppState, notify};
-use crate::{
-    db::{Activity, AddressFaucet, Store},
-    sync::mine_and_sync,
-};
+use super::attempt::PaymentAttempt;
+#[cfg(test)]
+use super::progression::PAYMENT_LOOKUP_TIMEOUT;
+use super::submission::OriginalTransactionState;
+use super::submission::original_presence_from_lookup;
+use crate::db::Activity;
+use crate::db::AddressFaucet;
+#[cfg(test)]
+use crate::db::Store;
+#[cfg(test)]
+use crate::state::AppState;
+use crate::state::notify;
+use anyhow::Context;
 use serde_json::Value;
-use std::{future::Future, time::Duration};
+#[cfg(test)]
+use std::future::Future;
+#[cfg(test)]
 use tokio::time::Instant;
-pub(crate) async fn confirm_address_after_mining(
-    state: &AppState,
+
+pub(crate) async fn confirm_address_after_mining_with_attempt(
+    attempt: &PaymentAttempt<'_>,
     pending: AddressFaucet,
 ) -> anyhow::Result<AddressFaucet> {
-    let check = |payment: AddressFaucet, tx: Value| -> anyhow::Result<AddressFaucet> {
-        match confirmed_block_hash(&tx) {
-            Some(hash) => state
+    let pending = confirm_address_from_chain_with_attempt(attempt, pending).await?;
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
+        return Ok(pending);
+    }
+    attempt
+        .mine_and_sync(1)
+        .await
+        .context("automatically mining and synchronizing address faucet")?;
+    confirm_address_from_chain_with_attempt(attempt, pending).await
+}
+
+pub(crate) async fn confirm_address_from_chain_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: AddressFaucet,
+) -> anyhow::Result<AddressFaucet> {
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
+        return Ok(pending);
+    }
+    let state = attempt.state;
+    let transaction = attempt
+        .lookup_transaction(&pending.txid)
+        .await
+        .context("looking up address faucet confirmation")?;
+    let updated = match original_presence_from_lookup(attempt, &pending.txid, transaction)
+        .await
+        .context("checking address faucet confirmation")?
+    {
+        OriginalTransactionState::Included(hash) => {
+            state
                 .0
                 .store
-                .confirm_address(&payment.id, &payment.txid, hash),
-            None => Ok(payment),
+                .confirm_address(&pending.id, &pending.txid, &hash)?
         }
+        OriginalTransactionState::Missing | OriginalTransactionState::Present => state
+            .0
+            .store
+            .clear_address_error(&pending.id, &pending.status, &pending.txid)?,
+        OriginalTransactionState::Expired => unreachable!(),
     };
-    let pending = match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => check(pending, tx)?,
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not check address faucet confirmation"
-            );
-            pending
-        }
-    };
-    if pending.status == "confirmed" {
-        return Ok(pending);
+    if updated != pending {
+        notify(state, "wallet");
     }
-    if let Err(error) = mine_and_sync(state, 1).await {
-        tracing::warn!(
-            error = %format_args!("{error:#}"),
-            payment = %pending.id,
-            "address faucet recorded but auto-mine failed"
-        );
-        return Ok(pending);
-    }
-    match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => check(pending, tx),
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not check address faucet confirmation"
-            );
-            Ok(pending)
-        }
-    }
+    Ok(updated)
 }
 
 pub(crate) fn confirmed_block_hash(tx: &Value) -> Option<&str> {
@@ -64,37 +76,51 @@ pub(crate) fn confirmed_block_hash(tx: &Value) -> Option<&str> {
         .filter(|hash| !hash.is_empty())
 }
 
-fn apply_confirmation(store: &Store, pending: &Activity, tx: &Value) -> anyhow::Result<Activity> {
+#[cfg(test)]
+pub(crate) fn apply_confirmation(
+    store: &Store,
+    pending: &Activity,
+    tx: &Value,
+) -> anyhow::Result<Activity> {
     match confirmed_block_hash(tx) {
         Some(hash) => store.confirm(&pending.id, &pending.txid, hash),
         None => Ok(pending.clone()),
     }
 }
 
-async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
-    if pending.status == "confirmed" {
+pub(crate) async fn confirm_from_chain_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: Activity,
+) -> anyhow::Result<Activity> {
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
         return Ok(pending);
     }
-    match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => {
-            let updated = apply_confirmation(&state.0.store, &pending, &tx)?;
-            if updated.status == "confirmed" {
-                notify(state, "wallet");
-            }
-            Ok(updated)
+    let state = attempt.state;
+    let transaction = attempt
+        .lookup_transaction(&pending.txid)
+        .await
+        .context("looking up payment confirmation")?;
+    let updated = match original_presence_from_lookup(attempt, &pending.txid, transaction)
+        .await
+        .context("checking payment confirmation")?
+    {
+        OriginalTransactionState::Included(hash) => {
+            state.0.store.confirm(&pending.id, &pending.txid, &hash)?
         }
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not fetch transaction for confirmation"
-            );
-            Ok(pending)
-        }
+        OriginalTransactionState::Missing | OriginalTransactionState::Present => state
+            .0
+            .store
+            .clear_error(&pending.id, &pending.status, &pending.txid)?,
+        OriginalTransactionState::Expired => unreachable!(),
+    };
+    if updated != pending {
+        notify(state, "wallet");
     }
+    Ok(updated)
 }
 
-async fn reconcile_unconfirmed_with<F, Fut>(
+#[cfg(test)]
+pub(crate) async fn reconcile_unconfirmed_with<F, Fut>(
     store: &Store,
     cursor: &mut Option<String>,
     deadline: Instant,
@@ -154,74 +180,36 @@ where
     Ok(changed)
 }
 
+#[cfg(test)]
 pub(crate) async fn confirm_after_mining(
     state: &AppState,
     pending: Activity,
 ) -> anyhow::Result<Activity> {
-    let pending = confirm_from_chain(state, pending).await?;
-    if pending.status == "confirmed" {
+    confirm_after_mining_with_attempt(
+        &PaymentAttempt {
+            state,
+            dispatch_deadline: None,
+        },
+        pending,
+    )
+    .await
+}
+
+pub(crate) async fn confirm_after_mining_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: Activity,
+) -> anyhow::Result<Activity> {
+    let pending = confirm_from_chain_with_attempt(attempt, pending).await?;
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
         return Ok(pending);
     }
-    match mine_and_sync(state, 1).await {
-        Ok(_) => confirm_from_chain(state, pending).await,
-        // Startup must classify the original failure; replacing it with a
-        // pending result would also retry store errors and broken invariants.
-        Err(error) if !state.started() => Err(error),
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                activity = %pending.id,
-                "transaction recorded but auto-mine failed"
-            );
-            Ok(pending)
-        }
-    }
+    attempt
+        .mine_and_sync(1)
+        .await
+        .context("automatically mining and synchronizing payment")?;
+    confirm_from_chain_with_attempt(attempt, pending).await
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/payments/confirmation/tests.rs"]
 pub(crate) mod tests;
-
-const PAYMENT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-use super::progression::{
-    PAYMENT_DISPATCH_BUDGET, PAYMENT_LOOKUP_TIMEOUT, progress_payment_intents,
-};
-
-pub(crate) async fn payment_confirmation_loop(state: AppState) {
-    let mut cursor = None;
-    let mut activity_cursor = None;
-    let mut address_cursor = None;
-    let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    loop {
-        interval.tick().await;
-        let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
-        if state.started()
-            && let Err(error) = progress_payment_intents(
-                &state,
-                deadline,
-                &mut activity_cursor,
-                &mut address_cursor,
-            )
-            .await
-        {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                "background payment progression failed"
-            );
-        }
-        let rpc = &state.0.rpc;
-        match reconcile_unconfirmed_with(&state.0.store, &mut cursor, deadline, |txid| async move {
-            rpc.lookup_transaction(&txid).await
-        })
-        .await
-        {
-            Ok(true) => notify(&state, "wallet"),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = %format_args!("{error:#}"),
-                "background payment confirmation failed"
-            ),
-        }
-    }
-}

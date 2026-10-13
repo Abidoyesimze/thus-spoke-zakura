@@ -43,6 +43,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    #[cfg(test)]
     pub fn unconfirmed_activities(&self) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
@@ -178,20 +179,9 @@ impl Store {
         Ok(activity)
     }
 
+    #[cfg(test)]
     pub fn prepared_transaction(&self, id: &str) -> Result<PreparedTransaction> {
-        self.0
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT raw_transaction,expiry_height FROM prepared_payments WHERE activity_id=?1",
-                [id],
-                |row| {
-                    Ok(PreparedTransaction {
-                        raw_transaction: row.get(0)?,
-                        expiry_height: row.get(1)?,
-                    })
-                },
-            )
+        self.optional_prepared_transaction(id)?
             .with_context(|| format!("prepared transaction {id} is missing"))
     }
 
@@ -386,6 +376,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    #[cfg(test)]
     pub fn prepared_transaction_expiry(&self, id: &str) -> Result<Option<u64>> {
         self.0
             .lock()
@@ -397,5 +388,63 @@ impl Store {
             )
             .optional()
             .map_err(Into::into)
+    }
+}
+
+impl Store {
+    pub fn unconfirmed_legacy_activities(&self) -> Result<Vec<Activity>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.txid!='' AND a.status NOT IN ('confirmed','failed') AND NOT EXISTS (SELECT 1 FROM idempotency i WHERE i.activity_id=a.id) ORDER BY a.rowid ASC"
+        ))?;
+        Ok(query
+            .query_map([], row_activity)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn unconfirmed_legacy_activity(&self, id: &str) -> Result<Option<Activity>> {
+        let db = self.0.lock().unwrap();
+        db.query_row(
+            &format!(
+                "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.id=?1 AND a.txid!='' AND a.status NOT IN ('confirmed','failed') AND NOT EXISTS (SELECT 1 FROM idempotency i WHERE i.activity_id=a.id)"
+            ),
+            [id],
+            row_activity,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+    pub fn activity(&self, id: &str) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        activity_by_id(&db, id).map_err(Into::into)
+    }
+    pub fn clear_error(
+        &self,
+        id: &str,
+        expected_status: &str,
+        expected_txid: &str,
+    ) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE activity SET last_error=NULL WHERE id=?1 AND status=?2 AND txid=?3 AND status IN ('preparing','prepared','broadcast')",
+            params![id, expected_status, expected_txid],
+        )?;
+        activity_by_id(&db, id).map_err(Into::into)
+    }
+    pub fn optional_prepared_transaction(&self, id: &str) -> Result<Option<PreparedTransaction>> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT raw_transaction,expiry_height FROM prepared_payments WHERE activity_id=?1",
+                [id],
+                |row| {
+                    Ok(PreparedTransaction {
+                        raw_transaction: row.get(0)?,
+                        expiry_height: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .with_context(|| format!("reading prepared transaction {id}"))
     }
 }

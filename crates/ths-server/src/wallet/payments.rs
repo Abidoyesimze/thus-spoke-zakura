@@ -202,6 +202,7 @@ impl RealWallet {
     pub async fn prepare<T, F>(
         &self,
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed_hex: &str,
         from_account: u8,
         source_pool: &str,
@@ -215,6 +216,7 @@ impl RealWallet {
         F: FnOnce(PreparedPayment) -> Result<T> + Send + 'static,
     {
         let activity_id = activity_id.map(str::to_owned);
+        let replacement_txid = replacement_txid.map(str::to_owned);
         let seed_hex = seed_hex.to_owned();
         let source_pool = source_pool.to_owned();
         let destination = destination.to_owned();
@@ -224,6 +226,7 @@ impl RealWallet {
                 db,
                 &account_ids,
                 activity_id.as_deref(),
+                replacement_txid.as_deref(),
                 &seed_hex,
                 from_account,
                 &source_pool,
@@ -241,6 +244,7 @@ impl RealWallet {
         db: &mut Db,
         account_ids: &[AccountUuid],
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed_hex: &str,
         from_account: u8,
         source_pool: &str,
@@ -248,14 +252,19 @@ impl RealWallet {
         amount: u64,
         memo: Option<MemoBytes>,
     ) -> Result<PreparedPayment> {
-        if let Some(activity_id) = activity_id
-            && let Some(prepared) = prepared_payment(db, activity_id)?
-            && (prepared.expiry_height == 0
-                || db
-                    .chain_height()?
-                    .is_none_or(|height| u64::from(u32::from(height)) < prepared.expiry_height))
-        {
-            return Ok(prepared);
+        let journal = activity_id
+            .map(|id| prepared_payment(db, id))
+            .transpose()?
+            .flatten();
+        if let Some(prepared) = journal {
+            if replacement_txid != Some(prepared.txid.as_str()) {
+                return Ok(prepared);
+            }
+        } else {
+            anyhow::ensure!(
+                replacement_txid.is_none(),
+                "replacement authorization has no journal"
+            );
         }
         let (account_index, account_id, params, recipient) =
             Self::send_input(account_ids, from_account, destination)?;
@@ -433,23 +442,41 @@ impl RealWallet {
             bail!("source pool must be transparent or ironwood")
         }
     }
+}
 
-    pub async fn shield_coinbase(
+#[cfg(test)]
+#[path = "../../tests/unit/wallet/payments/tests.rs"]
+mod tests;
+
+impl RealWallet {
+    pub(crate) async fn prepare_shield_coinbase(
         &self,
         seed_hex: &str,
         treasury_account: u8,
         from: &str,
         to: &str,
         minimum_net: u64,
-    ) -> Result<String> {
+        replacement_txid: Option<&str>,
+    ) -> Result<PreparedPayment> {
         if treasury_account != crate::db::TREASURY_ACCOUNT_ID {
             bail!("coinbase shielding requires the treasury account");
         }
+        let replacement_txid = replacement_txid.map(str::to_owned);
         let seed_hex = seed_hex.to_owned();
         let from = from.to_owned();
         let to = to.to_owned();
         let prepared = self
             .with_db(move |db| {
+                if let Some(prepared) = prepared_payment(db, TREASURY_SHIELDING_JOURNAL_ID)? {
+                    if replacement_txid.as_deref() != Some(prepared.txid.as_str()) {
+                        return Ok(prepared);
+                    }
+                } else {
+                    anyhow::ensure!(
+                        replacement_txid.is_none(),
+                        "shielding replacement authorization has no journal"
+                    );
+                }
                 let params = regtest_network();
                 let from =
                     match Address::decode(&params, &from).context("invalid treasury address")? {
@@ -500,27 +527,33 @@ impl RealWallet {
                         .map_err(|_| anyhow::anyhow!("invalid treasury account"))?,
                 )
                 .map_err(|e| anyhow::anyhow!("deriving treasury key: {e:?}"))?;
-                Self::build_and_serialize(
-                    db,
-                    &params,
-                    usk,
-                    &proposal,
-                    "shielding transaction",
-                    "shielding transaction was not stored",
-                )
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|wallet, ext| {
+                    let prepared = Self::build_and_serialize(
+                        wallet,
+                        &params,
+                        usk,
+                        &proposal,
+                        "shielding transaction",
+                        "shielding transaction was not stored",
+                    )?;
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height)
+                         VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(activity_id) DO UPDATE SET
+                           txid=excluded.txid,
+                           raw_transaction=excluded.raw_transaction,
+                           expiry_height=excluded.expiry_height",
+                        rusqlite::params![
+                            TREASURY_SHIELDING_JOURNAL_ID,
+                            prepared.txid,
+                            prepared.raw_transaction,
+                            prepared.expiry_height
+                        ],
+                    )?;
+                    Ok(prepared)
+                })
             })
             .await?;
-        let response = self.send_transaction(prepared.raw_transaction).await?;
-        if response.error_code != 0 {
-            bail!(
-                "lightwalletd rejected shielding: {}",
-                response.error_message
-            );
-        }
-        Ok(prepared.txid)
+        Ok(prepared)
     }
 }
-
-#[cfg(test)]
-#[path = "../../tests/unit/wallet/payments/tests.rs"]
-mod tests;

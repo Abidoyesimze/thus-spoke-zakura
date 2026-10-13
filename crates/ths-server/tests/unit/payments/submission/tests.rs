@@ -1,8 +1,20 @@
 use super::*;
+use crate::db::Recipient;
+use crate::payments::progression::PAYMENT_DISPATCH_BUDGET;
+use crate::payments::progression::repair_activity_journal;
+use crate::payments::progression::repair_address_journal;
+use crate::rpc::NodeRpc;
 use crate::{
     db::{Activity, Store},
     wallet::PreparedPayment,
 };
+use crate::{
+    payments::confirmation::tests::lifecycle_claim, state::tests::state_with_local_wallet,
+};
+use axum::{Json, Router, routing::post};
+use serde_json::json;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::{
     collections::VecDeque,
     sync::{
@@ -10,6 +22,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use tokio::time::Instant;
 #[derive(Default)]
 struct RecordingPaymentSubmitter {
     broadcasts: Mutex<Vec<Vec<u8>>>,
@@ -41,6 +54,7 @@ async fn address_faucet_reconciles_the_original_txid_after_a_lost_broadcast_resp
         .unwrap();
     let runtime = RecordingPaymentSubmitter {
         lookups: Mutex::new(VecDeque::from([
+            Ok(false),
             Ok(false),
             Err("node unavailable"),
             Ok(true),
@@ -74,6 +88,19 @@ async fn address_faucet_reconciles_the_original_txid_after_a_lost_broadcast_resp
 
 #[async_trait::async_trait]
 impl PaymentSubmitter for RecordingPaymentSubmitter {
+    async fn lookup_original(&self, txid: &str) -> anyhow::Result<Option<Value>> {
+        Ok(self
+            .transaction_known(txid)
+            .await?
+            .then(|| json!({"txid":txid,"confirmations":0})))
+    }
+    async fn inclusion_height(&self, _hash: &str) -> anyhow::Result<u64> {
+        anyhow::bail!("unexpected inclusion lookup")
+    }
+    async fn canonical_hash(&self, _height: u32) -> anyhow::Result<String> {
+        anyhow::bail!("unexpected canonical lookup")
+    }
+
     async fn transaction_known(&self, _txid: &str) -> anyhow::Result<bool> {
         self.lookups
             .lock()
@@ -124,7 +151,7 @@ async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
         let claim = store
             .claim_transfer(
                 1,
-                crate::db::Recipient::Account(to),
+                Recipient::Account(to),
                 source,
                 destination,
                 12_000,
@@ -139,7 +166,9 @@ async fn retry_submits_the_same_prepared_transaction_after_a_lost_response() {
         let runtime = RecordingPaymentSubmitter {
             lookups: Mutex::new(VecDeque::from([
                 Ok(false),
+                Ok(false),
                 Err("node unavailable"),
+                Ok(false),
                 Ok(false),
             ])),
             height: AtomicU64::new(139),
@@ -467,4 +496,230 @@ fn prepared_payment(expiry_height: u64) -> (Store, Activity) {
         .unwrap();
     let prepared = store.activity_for_key("same").unwrap().unwrap();
     (store, prepared)
+}
+
+#[tokio::test]
+async fn payment_presence_rejects_a_mismatched_transaction_identity() {
+    let (mut state, _dir) = state_with_local_wallet();
+    let app = Router::new().route(
+        "/",
+        post(|| async {
+            Json(json!({"result":{"txid":"another-transaction","confirmations":0},"error":null}))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    Arc::get_mut(&mut state.0).unwrap().rpc =
+        NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let attempt = PaymentAttempt {
+        state: &state,
+        dispatch_deadline: Some(Instant::now() + Duration::from_secs(1)),
+    };
+    assert!(
+        PaymentSubmitter::transaction_known(&attempt, "expected-transaction")
+            .await
+            .is_err()
+    );
+    assert!(
+        PaymentSubmitter::transaction_known(&state, "expected-transaction")
+            .await
+            .is_err()
+    );
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn original_presence_accepts_zakura_mempool_responses_without_confirmations() {
+    let runtime = RecordingPaymentSubmitter::default();
+    let mempool = json!({"txid": "original-txid", "hex": "010203", "vin": [], "vout": []});
+    for confirmations in [None, Some(Value::Null), Some(json!(0))] {
+        for blockhash in [None, Some(Value::Null)] {
+            let mut transaction = mempool.clone();
+            if let Some(confirmations) = &confirmations {
+                transaction["confirmations"] = confirmations.clone();
+            }
+            if let Some(blockhash) = blockhash {
+                transaction["blockhash"] = blockhash;
+            }
+            assert_eq!(
+                original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                    .await
+                    .unwrap(),
+                OriginalTransactionState::Present,
+            );
+        }
+    }
+    for confirmations in [json!("0"), json!(false), json!(0.5), json!([]), json!(-1)] {
+        let mut transaction = mempool.clone();
+        transaction["confirmations"] = confirmations;
+        assert!(
+            original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                .await
+                .is_err()
+        );
+    }
+    for confirmations in [None, Some(Value::Null), Some(json!(0))] {
+        let mut transaction = mempool.clone();
+        transaction["blockhash"] = json!("an-inclusion-block");
+        if let Some(confirmations) = confirmations {
+            transaction["confirmations"] = confirmations;
+        }
+        assert!(
+            original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                .await
+                .is_err()
+        );
+    }
+    let mut wrong_identity = mempool.clone();
+    wrong_identity["txid"] = json!("another-txid");
+    assert!(
+        original_presence_from_lookup(&runtime, "original-txid", Some(wrong_identity))
+            .await
+            .is_err()
+    );
+    let mut unverified_inclusion = mempool;
+    unverified_inclusion["confirmations"] = json!(1);
+    unverified_inclusion["blockhash"] = json!("an-inclusion-block");
+    assert!(
+        original_presence_from_lookup(&runtime, "original-txid", Some(unverified_inclusion))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn saved_original_inclusion_wins_over_expiry_only_on_the_selected_chain() {
+    for (mode, expected_status) in [
+        ("included", "confirmed"),
+        ("boundary", "confirmed"),
+        ("orphan", "prepared"),
+        ("malformed", "prepared"),
+        ("unavailable", "prepared"),
+    ] {
+        let (mut state, dir) = state_with_local_wallet();
+        let claim = lifecycle_claim(&state.0.store, mode);
+        rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',?2,140)", rusqlite::params![claim.id, b"signed original"]).unwrap();
+        repair_activity_journal(&state, &claim)
+            .await
+            .unwrap()
+            .unwrap();
+        let prepared = state.0.store.activity_for_key(mode).unwrap().unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let rpc_lookups = lookups.clone();
+        let app = Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let lookups = Arc::clone(&rpc_lookups);
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getrawtransaction" => {
+                            let index = lookups.fetch_add(1, Ordering::SeqCst);
+                            if (mode == "boundary" || mode == "unavailable") && index == 0 {
+                                return Json(json!({"result":null,"error":{"code":-5,"message":"missing"}}));
+                            }
+                            if mode == "unavailable" {
+                                return Json(json!({"result":null,"error":{"code":-28,"message":"unavailable"}}));
+                            }
+                            if mode == "malformed" { json!({"txid":"original-txid","confirmations":1}) }
+                            else { json!({"txid":"original-txid","confirmations":1,"blockhash":"original-block"}) }
+                        }
+                        "getblockchaininfo" => json!({"chain":"regtest","blocks":140}),
+                        "getblock" => json!({"height":140}),
+                        "getblockhash" => json!(if mode == "orphan" {"different-block"} else {"original-block"}),
+                        method => panic!("unexpected RPC {method}"),
+                    };
+                    Json(json!({"result":result,"error":null}))
+                }
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attempt = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + PAYMENT_DISPATCH_BUDGET),
+        };
+        let result = submit_prepared(&state.0.store, &attempt, &prepared).await;
+        if expected_status == "confirmed" {
+            assert!(result.is_ok(), "{mode}");
+        } else {
+            assert!(result.is_err(), "{mode} must remain pending");
+        }
+        let saved = state.0.store.activity_for_key(mode).unwrap().unwrap();
+        assert_eq!(saved.status, expected_status, "{mode}");
+        assert_eq!(saved.id, claim.id);
+        assert_eq!(saved.txid, "original-txid");
+        assert_eq!(
+            state
+                .0
+                .store
+                .prepared_transaction(&claim.id)
+                .unwrap()
+                .raw_transaction,
+            b"signed original"
+        );
+        let external = state
+            .0
+            .store
+            .claim_address_faucet("external-address", 12_000, &format!("external-{mode}"))
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',?2,140)", rusqlite::params![external.id, b"signed original"]).unwrap();
+        repair_address_journal(&state, &external)
+            .await
+            .unwrap()
+            .unwrap();
+        let external_prepared = state
+            .0
+            .store
+            .address_faucet_for_key(&format!("external-{mode}"))
+            .unwrap()
+            .unwrap();
+        lookups.store(0, Ordering::SeqCst);
+        let result = submit_address_prepared(&state.0.store, &attempt, &external_prepared).await;
+        assert_eq!(
+            result.is_ok(),
+            expected_status == "confirmed",
+            "external {mode}"
+        );
+        let saved_external = state
+            .0
+            .store
+            .address_faucet_for_key(&format!("external-{mode}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved_external.status, expected_status);
+        assert_eq!(saved_external.id, external.id);
+        assert_eq!(saved_external.txid, "original-txid");
+        for id in [&claim.id, &external.id] {
+            let journal = state.0.wallet.prepared(id).await.unwrap().unwrap();
+            assert_eq!(journal.txid, "original-txid");
+            assert_eq!(journal.raw_transaction, b"signed original");
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn zero_expiry_and_mempool_presence_retain_the_original_payment() {
+    for (expiry, present) in [(0, false), (140, true)] {
+        let (store, prepared) = prepared_payment(expiry);
+        let runtime = RecordingPaymentSubmitter {
+            lookups: Mutex::new(VecDeque::from([Ok(present)])),
+            height: AtomicU64::new(500),
+            ..Default::default()
+        };
+        let result = submit_prepared(&store, &runtime, &prepared).await.unwrap();
+        assert!(matches!(result, PreparedSubmission::Broadcast(_)));
+        let saved = store.activity_for_key("same").unwrap().unwrap();
+        assert_eq!(saved.txid, "real-txid");
+        assert_eq!(saved.status, "broadcast");
+        assert_eq!(
+            *runtime.broadcasts.lock().unwrap(),
+            if present {
+                vec![]
+            } else {
+                vec![b"signed transaction".to_vec()]
+            }
+        );
+    }
 }

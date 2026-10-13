@@ -29,6 +29,12 @@ async fn rpc_responses(
                 assert!(stream.read_buf(&mut request).await.unwrap() > 0);
                 if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
                     let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    if headers.starts_with("HEAD ") {
+                        // Local health probes can connect to ephemeral test ports.
+                        stream = listener.accept().await.unwrap().0;
+                        request.clear();
+                        continue;
+                    }
                     let length: usize = headers
                         .lines()
                         .filter_map(|line| line.split_once(':'))

@@ -1,14 +1,11 @@
 use super::error::require_started;
 use super::error::{ApiError, ApiResult};
 use crate::state::AppState;
+use crate::wallet::PaymentError;
 use crate::{
     db::{Activity, AddressFaucet, Recipient, Store, USER_ACCOUNT_COUNT, ZATOSHIS_PER_ZEC},
     mining::validate_idempotency_key,
     network::regtest_network,
-    payments::{
-        execution::{execute_payment, parse_payment_memo, record_prepared_payment},
-        treasury::{fund_address_from_treasury, fund_from_treasury},
-    },
     wallet::SendQuote,
 };
 use anyhow::Context;
@@ -16,6 +13,10 @@ use axum::{
     Json,
     extract::{Query, State},
     http::StatusCode,
+};
+use axum::{
+    http::{HeaderValue, header::LOCATION},
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
 use zcash_keys::address::Address;
@@ -40,27 +41,19 @@ pub(crate) struct SendRequest {
 pub(crate) async fn send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
-) -> ApiResult<Json<Activity>> {
+) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
-    let (recipient, memo) = validate_send(&req)?;
-    let address = match recipient {
-        Recipient::Account(id) => {
-            let destination = state.0.store.account(id)?;
-            match req.destination_pool.as_str() {
-                "transparent" => destination.transparent_address,
-                "ironwood" => destination.unified_address,
-                _ => unreachable!("validate_send checks destination_pool"),
-            }
-        }
-        Recipient::Address(address) => address.to_owned(),
-    };
+    let (recipient, _) = validate_send(&req)?;
     // A pasted address that belongs to a development account is recorded as
     // that account, before the claim, so a replay resolves to the same payment.
     let recipient = match recipient {
         Recipient::Address(address) => {
             development_account_for(&state.0.store, address)?.map_or(recipient, Recipient::Account)
         }
-        recipient => recipient,
+        Recipient::Account(id) => {
+            state.0.store.account(id)?;
+            recipient
+        }
     };
     if recipient == Recipient::Account(req.from_account) && req.source_pool == req.destination_pool
     {
@@ -68,7 +61,6 @@ pub(crate) async fn send(
             "choose a different account or a different destination pool",
         ));
     }
-    let _payment = state.0.payments.lock().await;
     let pending = state.0.store.claim_transfer(
         req.from_account,
         recipient,
@@ -78,32 +70,8 @@ pub(crate) async fn send(
         &req.idempotency_key,
         req.memo.as_deref(),
     )?;
-    Ok(Json(
-        execute_payment(&state, pending, |activity_id| {
-            let state = &state;
-            let memo = memo.clone();
-            let req = &req;
-            let address = &address;
-            async move {
-                state.synchronize_latest().await?;
-                state
-                    .0
-                    .wallet
-                    .prepare(
-                        Some(&activity_id),
-                        &state.0.store.seed()?,
-                        req.from_account,
-                        &req.source_pool,
-                        address,
-                        req.amount_zatoshi,
-                        memo,
-                        record_prepared_payment(&state.0.store, &activity_id),
-                    )
-                    .await
-            }
-        })
-        .await?,
-    ))
+    let status = pending.status.clone();
+    payment_response(&status, pending, "/api/v1/activity", &req.idempotency_key)
 }
 
 #[derive(Deserialize)]
@@ -254,7 +222,7 @@ pub(crate) struct FaucetRequest {
 pub(crate) async fn faucet(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
-) -> ApiResult<Json<Activity>> {
+) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
     require_user_account(req.account_id)?;
@@ -267,16 +235,14 @@ pub(crate) async fn faucet(
         return Err(ApiError::bad_request("amount must be greater than zero"));
     }
     require_pool(&req.pool, "pool")?;
-    Ok(Json(
-        fund_from_treasury(
-            &state,
-            req.account_id,
-            &req.pool,
-            req.amount_zatoshi,
-            &req.idempotency_key,
-        )
-        .await?,
-    ))
+    let pending = state.0.store.claim_faucet(
+        req.account_id,
+        &req.pool,
+        req.amount_zatoshi,
+        &req.idempotency_key,
+    )?;
+    let status = pending.status.clone();
+    payment_response(&status, pending, "/api/v1/activity", &req.idempotency_key)
 }
 
 #[derive(Deserialize)]
@@ -372,7 +338,9 @@ fn stored_address_faucet(
     };
     faucet_address_response(address, activity).map(Some)
 }
+#[cfg(test)]
 #[async_trait::async_trait]
+#[cfg(test)]
 trait AddressFaucetRuntime: Sync {
     async fn fund_internal(
         &self,
@@ -387,33 +355,8 @@ trait AddressFaucetRuntime: Sync {
     ) -> anyhow::Result<FaucetAddressResponse>;
 }
 
-#[async_trait::async_trait]
-impl AddressFaucetRuntime for AppState {
-    async fn fund_internal(
-        &self,
-        account_id: u8,
-        pool: &str,
-        amount_zatoshi: u64,
-        key: &str,
-    ) -> anyhow::Result<Activity> {
-        fund_from_treasury(self, account_id, pool, amount_zatoshi, key).await
-    }
-
-    async fn fund_external(
-        &self,
-        req: FaucetAddressRequest,
-    ) -> anyhow::Result<FaucetAddressResponse> {
-        let payment = fund_address_from_treasury(
-            self,
-            &req.address,
-            req.amount_zatoshi,
-            &req.idempotency_key,
-        )
-        .await?;
-        Ok(external_faucet_response(payment))
-    }
-}
-
+#[cfg(test)]
+#[cfg(test)]
 async fn execute_address_faucet<R: AddressFaucetRuntime>(
     store: &Store,
     runtime: &R,
@@ -445,9 +388,49 @@ async fn execute_address_faucet<R: AddressFaucetRuntime>(
 pub(crate) async fn faucet_address(
     State(state): State<AppState>,
     Json(req): Json<FaucetAddressRequest>,
-) -> ApiResult<Json<FaucetAddressResponse>> {
+) -> ApiResult<PaymentResponse<FaucetAddressResponse>> {
     require_started(&state)?;
-    execute_address_faucet(&state.0.store, &state, req).await
+    require_key(&req.idempotency_key)?;
+    require_faucet_address(&req.address)?;
+    if req.amount_zatoshi == 0 || req.amount_zatoshi > 5 * ZATOSHIS_PER_ZEC {
+        return Err(ApiError::bad_request(
+            "amount must be greater than zero and no more than 5 ZEC",
+        ));
+    }
+    // An existing external claim keeps its store even if the address later
+    // becomes a development-account address.
+    let destination = if state
+        .0
+        .store
+        .address_faucet_for_key(&req.idempotency_key)?
+        .is_some()
+    {
+        None
+    } else {
+        internal_faucet_destination(&state.0.store, &req.address)?
+    };
+    let response = if let Some((account_id, pool)) = destination {
+        let pending = state.0.store.claim_faucet(
+            account_id,
+            pool,
+            req.amount_zatoshi,
+            &req.idempotency_key,
+        )?;
+        faucet_address_response(req.address, pending)?
+    } else {
+        external_faucet_response(state.0.store.claim_address_faucet(
+            &req.address,
+            req.amount_zatoshi,
+            &req.idempotency_key,
+        )?)
+    };
+    let status = response.status.clone();
+    payment_response(
+        &status,
+        response,
+        "/api/v1/faucet/address",
+        &req.idempotency_key,
+    )
 }
 
 pub(crate) fn require_key(key: &str) -> ApiResult<()> {
@@ -511,7 +494,22 @@ fn validate_send(req: &SendRequest) -> ApiResult<(Recipient<'_>, Option<MemoByte
 /// An absent (or null) memo is `None`. Any present memo, including `""`, is
 /// encoded as an explicit ZIP-302 text memo and is only valid for ironwood.
 fn parse_memo(memo: Option<&str>, destination_pool: &str) -> ApiResult<Option<MemoBytes>> {
-    parse_payment_memo(memo, destination_pool).map_err(ApiError::bad_request)
+    let Some(text) = memo else {
+        return Ok(None);
+    };
+    if destination_pool != "ironwood" {
+        return Err(anyhow::Error::new(PaymentError::TransparentMemo).into());
+    }
+    // Text memos are zero-padded to 512 bytes, so a trailing NUL could not be
+    // told apart from padding and would be silently lost on decode.
+    if text.ends_with('\0') {
+        return Err(ApiError::bad_request(
+            "memo must not end with a NUL (U+0000) character",
+        ));
+    }
+    MemoBytes::from_bytes(text.as_bytes())
+        .map(Some)
+        .map_err(|error| ApiError::bad_request(format!("invalid memo: {error}")))
 }
 
 fn require_user_account(id: u8) -> ApiResult<()> {
@@ -572,4 +570,37 @@ pub(crate) async fn faucet_address_status(
             status: StatusCode::NOT_FOUND,
             message: "no address faucet uses that idempotency key".into(),
         })
+}
+
+#[derive(Debug)]
+pub(crate) struct PaymentResponse<T>(T, StatusCode, HeaderValue);
+
+fn payment_response<T>(
+    status: &str,
+    body: T,
+    status_path: &str,
+    key: &str,
+) -> ApiResult<PaymentResponse<T>> {
+    let status = match status {
+        "confirmed" | "failed" => StatusCode::OK,
+        "preparing" | "prepared" | "broadcast" => StatusCode::ACCEPTED,
+        status => return Err(anyhow::anyhow!("payment has unsupported status {status}").into()),
+    };
+    let mut url =
+        reqwest::Url::parse("http://127.0.0.1").context("constructing payment status URL")?;
+    url.set_path(status_path);
+    url.query_pairs_mut().append_pair("idempotency_key", key);
+    let location = HeaderValue::from_str(&format!(
+        "{}?{}",
+        url.path(),
+        url.query()
+            .context("payment status URL omitted its query")?,
+    ))
+    .context("constructing payment status Location header")?;
+    Ok(PaymentResponse(body, status, location))
+}
+impl<T: Serialize> IntoResponse for PaymentResponse<T> {
+    fn into_response(self) -> Response {
+        (self.1, [(LOCATION, self.2)], Json(self.0)).into_response()
+    }
 }

@@ -1,11 +1,10 @@
+use crate::payments::attempt::PaymentAttempt;
 use crate::state::{AppState, notify};
 use crate::{
     rpc::ChainCheckpoint,
     state::{WalletSyncStatus, now_unix, wallet_matches_tip},
     wallet::WALLET_BIRTHDAY_HEIGHT,
 };
-use anyhow::Context;
-use serde_json::Value;
 use std::time::Duration;
 use tokio::time::Instant;
 impl AppState {
@@ -51,7 +50,8 @@ impl AppState {
                 );
             }
             crate::reconcile::sync_wallet(&self.0.wallet, &self.0.rpc, &target, deadline).await?;
-            self.refresh_wallet_snapshot(&target).await
+            self.refresh_wallet_snapshot_until(&target, Some(deadline))
+                .await
         }
         .await;
 
@@ -68,41 +68,12 @@ impl AppState {
         self.synchronize_wallet(None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_wallet_snapshot(
         &self,
         target: &ChainCheckpoint,
     ) -> anyhow::Result<()> {
-        let mut accounts = self.0.store.accounts()?;
-        self.0.wallet.apply_balances(&mut accounts).await?;
-        let scanned = self.0.wallet.scanned_checkpoint().await?;
-        let rpc = &self.0.rpc;
-        let observed = rpc.checkpoint().await?;
-        let publishable = scan_is_publishable(scanned.as_ref(), target, &observed, |height| {
-            rpc.block_hash(height)
-        })
-        .await?;
-        if !publishable {
-            return Err(crate::bootstrap::ReadinessError::CheckpointChanged.into());
-        }
-        let changed = self.0.wallet_snapshot.read().await.accounts != accounts;
-        {
-            let mut snapshot = self.0.wallet_snapshot.write().await;
-            snapshot.accounts = accounts;
-            snapshot.status = WalletSyncStatus {
-                state: "ready",
-                fully_scanned_height: scanned.as_ref().map(|checkpoint| checkpoint.height),
-                fully_scanned_hash: scanned.as_ref().map(|checkpoint| checkpoint.hash.clone()),
-                observed_height: Some(observed.height),
-                observed_hash: Some(observed.hash),
-                last_success_at: Some(now_unix()),
-                error: None,
-            };
-        }
-        notify(self, "sync");
-        if changed {
-            notify(self, "wallet");
-        }
-        Ok(())
+        self.refresh_wallet_snapshot_until(target, None).await
     }
 
     pub(crate) async fn sync_if_chain_advanced(&self) -> anyhow::Result<()> {
@@ -167,27 +138,60 @@ pub(crate) async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
-    let hashes = state.0.rpc.generate(blocks).await?;
-    let tip_hash = hashes
-        .last()
-        .context("Zakura did not return the mined block hash")?;
-    let tip_height = state
-        .0
-        .rpc
-        .block(tip_hash)
-        .await?
-        .pointer("/height")
-        .and_then(Value::as_u64)
-        .context("Zakura mined block omitted its height")?;
-    state.synchronize_wallet(Some(tip_height)).await?;
-    // Every caller here produces blocks, so the chain moved for everyone, not
-    // just the tab that asked. Without this, other dashboards keep the old
-    // height and tip until something else happens to mine.
-    notify(state, "chain");
-    Ok(hashes)
-}
-
 #[cfg(test)]
 #[path = "../tests/unit/sync/tests.rs"]
 pub(crate) mod tests;
+
+impl AppState {
+    pub(crate) async fn refresh_wallet_snapshot_until(
+        &self,
+        target: &ChainCheckpoint,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<()> {
+        let attempt = PaymentAttempt {
+            state: self,
+            dispatch_deadline: deadline,
+        };
+        let mut accounts = self.0.store.accounts()?;
+        self.0.wallet.apply_balances(&mut accounts).await?;
+        let scanned = self.0.wallet.scanned_checkpoint().await?;
+        let rpc = &self.0.rpc;
+        let observed = attempt
+            .network(
+                Duration::from_secs(30),
+                "reading wallet snapshot checkpoint",
+                rpc.checkpoint(),
+            )
+            .await?;
+        let publishable = scan_is_publishable(scanned.as_ref(), target, &observed, |height| {
+            attempt.network(
+                Duration::from_secs(30),
+                "validating wallet snapshot checkpoint",
+                rpc.block_hash(height),
+            )
+        })
+        .await?;
+        if !publishable {
+            return Err(crate::bootstrap::ReadinessError::CheckpointChanged.into());
+        }
+        let changed = self.0.wallet_snapshot.read().await.accounts != accounts;
+        {
+            let mut snapshot = self.0.wallet_snapshot.write().await;
+            snapshot.accounts = accounts;
+            snapshot.status = WalletSyncStatus {
+                state: "ready",
+                fully_scanned_height: scanned.as_ref().map(|checkpoint| checkpoint.height),
+                fully_scanned_hash: scanned.as_ref().map(|checkpoint| checkpoint.hash.clone()),
+                observed_height: Some(observed.height),
+                observed_hash: Some(observed.hash),
+                last_success_at: Some(now_unix()),
+                error: None,
+            };
+        }
+        notify(self, "sync");
+        if changed {
+            notify(self, "wallet");
+        }
+        Ok(())
+    }
+}

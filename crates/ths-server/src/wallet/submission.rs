@@ -19,25 +19,61 @@ pub(crate) fn check_broadcast_response(response: SendResponse) -> Result<()> {
 
 impl RealWallet {
     pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
-        let result = self.send_transaction(raw_transaction.to_vec()).await?;
-        check_broadcast_response(result)
-    }
-
-    pub(super) async fn send_transaction(&self, data: Vec<u8>) -> Result<SendResponse> {
-        tokio::time::timeout(LIGHTWALLETD_BROADCAST_TIMEOUT, async {
-            let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
-            Ok::<_, anyhow::Error>(
-                client
-                    .send_transaction(RawTransaction { data, height: 0 })
-                    .await?
-                    .into_inner(),
-            )
-        })
+        self.broadcast_until(
+            raw_transaction,
+            tokio::time::Instant::now() + LIGHTWALLETD_BROADCAST_TIMEOUT,
+        )
         .await
-        .context("lightwalletd transaction broadcast timed out")?
     }
 }
 
 #[cfg(test)]
 #[path = "../../tests/unit/wallet/submission/tests.rs"]
 mod tests;
+
+impl RealWallet {
+    pub(crate) async fn broadcast_until(
+        &self,
+        raw_transaction: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let result = self
+            .send_transaction_until(raw_transaction.to_vec(), deadline)
+            .await?;
+        check_broadcast_response(result)
+    }
+}
+
+impl RealWallet {
+    async fn send_transaction_until(
+        &self,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<SendResponse> {
+        let result = crate::reconcile::within_deadline(
+            deadline,
+            "broadcasting lightwalletd transaction",
+            async {
+                let mut client =
+                    CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
+                Ok::<_, anyhow::Error>(
+                    client
+                        .send_transaction(RawTransaction { data, height: 0 })
+                        .await?
+                        .into_inner(),
+                )
+            },
+        )
+        .await;
+        match result {
+            Err(error)
+                if error
+                    .downcast_ref::<tokio::time::error::Elapsed>()
+                    .is_some() =>
+            {
+                Err(error.context("lightwalletd transaction broadcast timed out"))
+            }
+            result => result,
+        }
+    }
+}

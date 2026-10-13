@@ -69,15 +69,15 @@ async fn subtree_roots_reject_malformed_data_and_route_by_protocol() {
     );
 }
 
-struct TestWallet {
+pub(super) struct TestWallet {
     _dir: tempfile::TempDir,
-    path: std::path::PathBuf,
-    wallet: RealWallet,
-    seed: String,
-    destination: String,
+    pub(super) path: std::path::PathBuf,
+    pub(super) wallet: RealWallet,
+    pub(super) seed: String,
+    pub(super) destination: String,
 }
 
-fn test_wallet() -> TestWallet {
+pub(super) fn test_wallet() -> TestWallet {
     let dir = tempfile::tempdir().unwrap();
     let store = crate::db::Store::open(dir.path().join("server.db")).unwrap();
     store.initialize().unwrap();
@@ -173,18 +173,18 @@ async fn started_operation_finishes_after_its_caller_is_cancelled() {
         let wallet = test.wallet.clone();
         tokio::spawn(async move {
             wallet
-                .with_db(move |db| {
-                    entered_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                    db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
-                        ext.execute(
-                            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
-                            [],
-                        )?;
-                        Ok(())
+                    .with_db(move |db| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                            ext.execute(
+                                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                                [],
+                            )?;
+                            Ok(())
+                        })
                     })
-                })
-                .await
+                    .await
         })
     };
     entered_rx.await.unwrap();
@@ -207,6 +207,7 @@ async fn started_operation_finishes_after_its_caller_is_cancelled() {
         .wallet
         .prepare(
             Some("activity-1"),
+            None,
             "invalid seed",
             0,
             "invalid pool",
@@ -224,12 +225,12 @@ async fn started_operation_finishes_after_its_caller_is_cancelled() {
 async fn prepared_payment_is_recorded_after_its_caller_is_dropped() {
     let test = test_wallet();
     rusqlite::Connection::open(test.path.join("wallet.db"))
-        .unwrap()
-        .execute(
-            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
-            [],
-        )
-        .unwrap();
+            .unwrap()
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','txid-1',x'00',0)",
+                [],
+            )
+            .unwrap();
     let recorded = Arc::new(std::sync::Mutex::new(None));
     let release = delay_wallet_queries(&test.path, Duration::from_millis(300));
     let caller = {
@@ -239,6 +240,7 @@ async fn prepared_payment_is_recorded_after_its_caller_is_dropped() {
             wallet
                 .prepare(
                     Some("activity-1"),
+                    None,
                     "invalid seed",
                     0,
                     "invalid pool",
@@ -272,6 +274,7 @@ async fn payment_errors_stay_typed_through_the_wallet_worker() {
         .wallet
         .prepare(
             None,
+            None,
             &test.seed,
             1,
             "ironwood",
@@ -290,6 +293,7 @@ async fn payment_errors_stay_typed_through_the_wallet_worker() {
     let unscanned = test
         .wallet
         .prepare(
+            None,
             None,
             &test.seed,
             1,
@@ -314,6 +318,7 @@ async fn delayed_prepare_does_not_block_the_async_executor() {
         test.wallet
             .prepare(
                 Some("activity-1"),
+                None,
                 &test.seed,
                 1,
                 "ironwood",
@@ -385,7 +390,7 @@ async fn startup_keeps_serialization_while_the_real_preparation_worker_records_s
         .claim_faucet(1, "ironwood", 500_000_000, "startup-account-1-ironwood-v1")
         .unwrap();
     rusqlite::Connection::open(test.path.join("wallet.db")).unwrap().execute(
-        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',x'010203',140)", [&claim.id]).unwrap();
+            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',x'010203',140)", [&claim.id]).unwrap();
     let payments = Arc::new(tokio::sync::Mutex::new(()));
     let replenishment = Arc::new(tokio::sync::Mutex::new(()));
     let (entered, ready) = tokio::sync::oneshot::channel();
@@ -413,6 +418,7 @@ async fn startup_keeps_serialization_while_the_real_preparation_worker_records_s
                     wallet
                         .prepare(
                             Some(&id),
+                            None,
                             "invalid seed",
                             0,
                             "invalid pool",

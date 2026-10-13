@@ -1,5 +1,9 @@
 use super::*;
 use crate::db::Store;
+use crate::payments::progression::PAYMENT_DISPATCH_BUDGET;
+use crate::payments::progression::payment_confirmation_loop;
+use crate::payments::submission::submit_prepared;
+use crate::rpc::NodeRpc;
 use serde_json::json;
 #[test]
 fn confirmed_block_hash_requires_confirmations_and_blockhash() {
@@ -160,27 +164,38 @@ async fn payment_confirmation_loop_recovers_reopened_records_without_wallet_sync
     let calls = Arc::new(AtomicUsize::new(0));
     let rpc_calls = calls.clone();
     let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
-        let calls = rpc_calls.clone();
-        async move {
-            if request["method"] == "getblockchaininfo" {
-                return Json(json!({"result": {"chain": "regtest", "blocks": 2, "bestblockhash": "00".repeat(32)}, "error": null, "id": request["id"]}));
+            let calls = rpc_calls.clone();
+            async move {
+                let response = match request["method"].as_str().unwrap() {
+                    "getrawtransaction" => {
+                        assert_eq!(request["params"][0], "reopened-txid");
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            json!({"result": null, "error": {"code": -5, "message": "not found"}, "id": request["id"]})
+                        } else {
+                            json!({"result": {"txid": "reopened-txid", "confirmations": 1, "blockhash": "inclusion-block"}, "error": null, "id": request["id"]})
+                        }
+                    }
+                    "getblockchaininfo" => json!({"result": {"chain": "regtest", "blocks": 100, "bestblockhash": "tip-block"}, "error": null, "id": request["id"]}),
+                    "getblock" => {
+                        assert_eq!(request["params"][0], "inclusion-block");
+                        json!({"result": {"height": 100}, "error": null, "id": request["id"]})
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"][0], 100);
+                        json!({"result": "inclusion-block", "error": null, "id": request["id"]})
+                    }
+                    method => panic!("unexpected recovery RPC {method}"),
+                };
+                Json(response)
             }
-            assert_eq!(request["method"], "getrawtransaction");
-            assert_eq!(request["params"][0], "reopened-txid");
-            let response = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                json!({"result": null, "error": {"code": -5, "message": "not found"}, "id": request["id"]})
-            } else {
-                json!({"result": {"txid": "reopened-txid", "confirmations": 1, "blockhash": "inclusion-block"}, "error": null, "id": request["id"]})
-            };
-            Json(response)
-        }
-    }));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
     let store = Store::open(dir.path().join("server.db")).unwrap();
     let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
     let state = AppState::new(store, wallet, rpc_url, "test".into());
+    state.mark_started();
     let mut updates = state.0.events.subscribe();
     // The production loop must progress even while synchronization owns
     // its guard, and must not require a new block or a payment POST.
@@ -220,37 +235,46 @@ async fn payment_confirmation_loop_survives_request_confirmation_cancellation() 
     let calls = Arc::new(AtomicUsize::new(0));
     let rpc_calls = calls.clone();
     let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
-        let entered = entered.clone();
-        let released = released.clone();
-        let calls = rpc_calls.clone();
-        async move {
-            if request["method"] == "getblockchaininfo" {
-                return Json(json!({"result": {"chain": "regtest", "blocks": 2, "bestblockhash": "00".repeat(32)}, "error": null, "id": request["id"]}));
+            let entered = entered.clone();
+            let released = released.clone();
+            let calls = rpc_calls.clone();
+            async move {
+                match request["method"].as_str().unwrap() {
+                    "getrawtransaction" => {}
+                    "getblock" => {
+                        assert_eq!(request["params"][0], "recovered-block");
+                        return Json(json!({"result": {"height": 100}, "error": null, "id": request["id"]}));
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"][0], 100);
+                        return Json(json!({"result": "recovered-block", "error": null, "id": request["id"]}));
+                    }
+                    method => panic!("unexpected recovery RPC {method}"),
+                }
+                assert_eq!(request["params"][0], "cancelled-request-txid");
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let released = released.lock().unwrap().take().unwrap();
+                    entered.lock().unwrap().take().unwrap().send(()).unwrap();
+                    // Cancellation happens after the request-side lookup starts,
+                    // before it can confirm, auto-mine, or notify subscribers.
+                    tokio::time::timeout(Duration::from_secs(10), released)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                Json(json!({
+                    "result": {"txid": "cancelled-request-txid", "confirmations": 1, "blockhash": "recovered-block"},
+                    "error": null,
+                    "id": request["id"]
+                }))
             }
-            assert_eq!(request["method"], "getrawtransaction");
-            assert_eq!(request["params"][0], "cancelled-request-txid");
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                let released = released.lock().unwrap().take().unwrap();
-                entered.lock().unwrap().take().unwrap().send(()).unwrap();
-                // Cancellation happens after the request-side lookup starts,
-                // before it can confirm, auto-mine, or notify subscribers.
-                tokio::time::timeout(Duration::from_secs(10), released)
-                    .await
-                    .unwrap()
-                    .unwrap();
-            }
-            Json(json!({
-                "result": {"txid": "cancelled-request-txid", "confirmations": 1, "blockhash": "recovered-block"},
-                "error": null,
-                "id": request["id"]
-            }))
-        }
-    }));
+        }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let rpc_url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
     let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
     let state = AppState::new(store, wallet, rpc_url, "test".into());
+    state.mark_started();
     let mut updates = state.0.events.subscribe();
     let request_state = state.clone();
     let request_claim = claim.clone();
@@ -477,17 +501,19 @@ async fn startup_confirmation_preserves_fatal_mining_errors_and_normal_post_pend
     for mode in ["warmup", "internal", "malformed-block", "store"] {
         let (local, _dir) = state_with_local_wallet();
         let app = Router::new().route("/", post(move |Json(request): Json<Value>| async move {
-            let result = match request["method"].as_str().unwrap() {
-                "getrawtransaction" if mode == "store" => json!({"txid":"original-startup-txid", "confirmations":1, "blockhash":"confirmed-block"}),
-                "getrawtransaction" => json!({"txid":"original-startup-txid", "confirmations":0}),
-                "generate" if mode == "warmup" => return Json(json!({"error":{"code":-28,"message":"warming up"},"result":null})),
-                "generate" if mode == "internal" => return Json(json!({"error":{"code":-32603,"message":"internal failure"},"result":null})),
-                "generate" => json!(["mined-block"]),
-                "getblock" => json!({}),
-                method => panic!("unexpected startup method {method}"),
-            };
-            Json(json!({"result":result,"error":null}))
-        }));
+                let result = match request["method"].as_str().unwrap() {
+                    "getrawtransaction" if mode == "store" => json!({"txid":"original-startup-txid", "confirmations":1, "blockhash":"confirmed-block"}),
+                    "getrawtransaction" => json!({"txid":"original-startup-txid", "confirmations":0}),
+                    "generate" if mode == "warmup" => return Json(json!({"error":{"code":-28,"message":"warming up"},"result":null})),
+                    "generate" if mode == "internal" => return Json(json!({"error":{"code":-32603,"message":"internal failure"},"result":null})),
+                    "generate" => json!(["mined-block"]),
+                    "getblock" if mode == "store" => json!({"height":100}),
+                    "getblockhash" if mode == "store" => json!("confirmed-block"),
+                    "getblock" => json!({}),
+                    method => panic!("unexpected startup method {method}"),
+                };
+                Json(json!({"result":result,"error":null}))
+            }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let state = AppState::new(
             local.0.store.clone(),
@@ -543,10 +569,59 @@ async fn startup_confirmation_preserves_fatal_mining_errors_and_normal_post_pend
             assert_eq!(saved.raw_transaction, b"original signed bytes");
             state.mark_started();
             let (status, response) = api_request(&state, "POST", "/api/v1/faucet", json!({"account_id":1,"pool":"ironwood","amount_zatoshi":500_000_000,"idempotency_key":"startup-account-1-ironwood-v1"})).await;
-            assert_eq!(status, StatusCode::OK);
+            assert_eq!(status, StatusCode::ACCEPTED);
             assert_eq!(response["status"], "broadcast");
             assert_eq!(response["txid"], "original-startup-txid");
         }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+}
+
+#[tokio::test]
+async fn canonical_payment_reads_share_the_remaining_attempt_deadline() {
+    for stalled_method in ["getblock", "getblockhash"] {
+        let (mut state, _dir) = state_with_local_wallet();
+        let claim = lifecycle_claim(&state.0.store, stalled_method);
+        let prepared = state
+            .0
+            .store
+            .record_prepared(&claim.id, "original-txid", b"signed original", 140)
+            .unwrap();
+        let app = Router::new().route("/", post(move |Json(request): Json<Value>| async move {
+                let method = request["method"].as_str().unwrap();
+                if method == stalled_method { tokio::time::sleep(Duration::from_secs(5)).await; }
+                let result = match method {
+                    "getrawtransaction" => json!({"txid":"original-txid","confirmations":1,"blockhash":"original-block"}),
+                    "getblock" => json!({"height":140}),
+                    "getblockhash" => json!("original-block"),
+                    _ => panic!("unexpected RPC"),
+                };
+                Json(json!({"result":result,"error":null}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attempt = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        let started = Instant::now();
+        assert!(
+            submit_prepared(&state.0.store, &attempt, &prepared)
+                .await
+                .is_err()
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let saved = state
+            .0
+            .store
+            .activity_for_key(stalled_method)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "prepared");
+        assert_eq!(saved.txid, "original-txid");
         server.abort();
         assert!(server.await.unwrap_err().is_cancelled());
     }

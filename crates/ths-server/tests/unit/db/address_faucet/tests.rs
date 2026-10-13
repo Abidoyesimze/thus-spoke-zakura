@@ -158,3 +158,106 @@ fn address_faucet_errors_and_failures_never_overwrite_newer_state() {
         .unwrap();
     assert_eq!(replay, failed);
 }
+
+#[test]
+fn clearing_address_errors_requires_the_exact_pending_state_and_transaction() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    for status in ["preparing", "prepared", "broadcast"] {
+        let claim = store
+            .claim_address_faucet("external-address", 100, status)
+            .unwrap();
+        let txid = if status == "preparing" {
+            ""
+        } else {
+            "current-txid"
+        };
+        if status != "preparing" {
+            store
+                .record_address_prepared(&claim.id, txid, b"signed bytes", 140)
+                .unwrap();
+        }
+        if status == "broadcast" {
+            store.mark_address_broadcast(&claim.id, txid).unwrap();
+        }
+        let saved = store
+            .record_address_error(&claim.id, status, txid, "current error")
+            .unwrap();
+        let stale_status = if status == "preparing" {
+            "prepared"
+        } else {
+            "preparing"
+        };
+        assert_eq!(
+            store
+                .clear_address_error(&claim.id, stale_status, txid)
+                .unwrap(),
+            saved
+        );
+        assert_eq!(
+            store
+                .clear_address_error(&claim.id, status, "stale-txid")
+                .unwrap(),
+            saved
+        );
+        let cleared = store.clear_address_error(&claim.id, status, txid).unwrap();
+        assert_eq!(cleared.last_error, None);
+        assert_eq!(
+            (cleared.status.as_str(), cleared.txid.as_str()),
+            (status, txid)
+        );
+        assert_eq!(
+            store.clear_address_error(&claim.id, status, txid).unwrap(),
+            cleared
+        );
+    }
+    let failed = store
+        .claim_address_faucet("external-address", 100, "failed-clear")
+        .unwrap();
+    let failed = store.fail_address(&failed.id, "terminal failure").unwrap();
+    assert_eq!(
+        store.clear_address_error(&failed.id, "failed", "").unwrap(),
+        failed
+    );
+    assert_eq!(
+        store
+            .clear_address_error(&failed.id, "preparing", "")
+            .unwrap(),
+        failed
+    );
+
+    let confirmed = store
+        .claim_address_faucet("external-address", 100, "confirmed-clear")
+        .unwrap();
+    store
+        .record_address_prepared(&confirmed.id, "included-txid", b"signed bytes", 140)
+        .unwrap();
+    store
+        .confirm_address(&confirmed.id, "included-txid", "included-block")
+        .unwrap();
+    store
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE address_faucets SET last_error='retained terminal diagnostic' WHERE id=?1",
+            [&confirmed.id],
+        )
+        .unwrap();
+    let confirmed = store
+        .address_faucet_for_key("confirmed-clear")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store
+            .clear_address_error(&confirmed.id, "confirmed", "included-txid")
+            .unwrap(),
+        confirmed
+    );
+    assert_eq!(
+        store
+            .clear_address_error(&confirmed.id, "broadcast", "included-txid")
+            .unwrap(),
+        confirmed
+    );
+}

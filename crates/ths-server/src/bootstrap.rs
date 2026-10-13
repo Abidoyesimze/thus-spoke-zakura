@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use crate::{
     api,
     db::{Store, TREASURY_ACCOUNT_ID},
-    payments::{confirmation, treasury},
+    payments::treasury,
     state::AppState,
     sync, wallet,
 };
@@ -56,7 +56,7 @@ fn background_tasks(state: AppState) -> tokio::task::JoinSet<Result<()>> {
     let mut background = tokio::task::JoinSet::new();
     background.spawn(start_and_sync(state.clone()));
     background.spawn(async move {
-        confirmation::payment_confirmation_loop(state).await;
+        crate::payments::progression::payment_confirmation_loop(state).await;
         Ok(())
     });
     background
@@ -122,13 +122,14 @@ where
 }
 
 async fn start_and_sync(state: AppState) -> Result<()> {
+    let already_provisioned = treasury::initial_balance_provisioned(&state)?;
     // Network stages have their own deadlines. Await provisioning to completion
     // so its payment guards remain owned while a wallet worker is running.
     retry_startup(|| async {
         sync::dependencies_ready(&state)
             .await
             .context("waiting for startup dependencies")?;
-        treasury::provision_initial_balance(&state)
+        treasury::provision_initial_balance_with_history(&state, already_provisioned)
             .await
             .context("provisioning Account 1 with 5 Ironwood ZEC")
     })

@@ -505,3 +505,5 @@ mod treasury_sync_tests;
 #[cfg(test)]
 #[path = "../tests/unit/wallet/tests.rs"]
 mod tests;
+
+const TREASURY_SHIELDING_JOURNAL_ID: &str = "private-treasury-shielding-v1";

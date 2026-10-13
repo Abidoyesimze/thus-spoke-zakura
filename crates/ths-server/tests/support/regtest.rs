@@ -1251,17 +1251,17 @@ impl RecoveryFailureReporter {
     }
 }
 
-/// Linux-only Tokio signal registration for the ignored live target.
+/// Unix Tokio signal registration for the ignored live target.
 pub struct TerminationSignals {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
 }
 
 impl TerminationSignals {
     pub fn install() -> Result<Self> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             let interrupt = signal(SignalKind::interrupt())
@@ -1273,14 +1273,14 @@ impl TerminationSignals {
                 terminate,
             })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
-            bail!("fixture interruption support requires Linux Tokio signals")
+            bail!("fixture interruption support requires Unix Tokio signals")
         }
     }
 
     pub async fn cancelled(&mut self) {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             tokio::select! {
                 _ = self.interrupt.recv() => {}

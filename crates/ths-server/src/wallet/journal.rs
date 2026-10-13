@@ -90,3 +90,23 @@ impl RealWallet {
 #[cfg(test)]
 #[path = "../../tests/unit/wallet/journal/tests.rs"]
 mod tests;
+
+impl RealWallet {
+    pub(crate) async fn prepared_shielding(&self) -> Result<Option<PreparedPayment>> {
+        self.prepared(TREASURY_SHIELDING_JOURNAL_ID).await
+    }
+    pub(crate) async fn retire_shielding(&self, txid: &str) -> Result<()> {
+        let txid = txid.to_owned();
+        self.with_db(move |db| {
+            db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                let retired = ext.execute(
+                    "DELETE FROM ext_tsz_prepared_payments WHERE activity_id=?1 AND txid=?2",
+                    rusqlite::params![TREASURY_SHIELDING_JOURNAL_ID, txid],
+                )?;
+                anyhow::ensure!(retired == 1, "shielding journal changed before retirement");
+                Ok(())
+            })
+        })
+        .await
+    }
+}

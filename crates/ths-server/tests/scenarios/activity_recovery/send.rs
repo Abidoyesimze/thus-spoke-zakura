@@ -1,3 +1,4 @@
+use super::*;
 use super::{
     API_READ_TIMEOUT, AccountBalance, Activity, CONCURRENT_IDEMPOTENCY_KEY, ChainInfo, Client,
     PathBuf, RegtestStack, Result, SEND_TIMEOUT, assert_persisted_send_response, json,
@@ -63,7 +64,7 @@ pub(super) async fn same_account_cross_pool_round_trip_is_replay_safe() -> Resul
                 "destination_pool": destination, "amount_zatoshi": amount,
                 "idempotency_key": key,
             });
-            let sent: Activity = request_json(
+            let sent: Activity = confirmed_payment(
                 &client,
                 fixture.api_url(),
                 "/api/v1/send",
@@ -198,7 +199,7 @@ pub(super) async fn same_account_cross_pool_round_trip_is_replay_safe() -> Resul
             assert_persisted_send_response(&sent, &persisted)?;
             let height_before: ChainInfo =
                 rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
-            let replay: Activity = request_json(
+            let replay: Activity = confirmed_payment(
                 &client,
                 fixture.api_url(),
                 "/api/v1/send",
@@ -303,23 +304,35 @@ pub(super) async fn concurrent_identical_sends_have_one_chain_effect() -> Result
         });
 
         let (first, second) = tokio::join!(
-            request_json::<Activity>(
-                &client,
-                fixture.api_url(),
-                "/api/v1/send",
-                Some(&request),
-                SEND_TIMEOUT,
-            ),
-            request_json::<Activity>(
-                &client,
-                fixture.api_url(),
-                "/api/v1/send",
-                Some(&request),
-                SEND_TIMEOUT,
-            ),
+            admit_payment(&client, fixture.api_url(), "/api/v1/send", &request),
+            admit_payment(&client, fixture.api_url(), "/api/v1/send", &request),
         );
         let first = first?;
         let second = second?;
+        anyhow::ensure!(
+            first.operation["id"] == second.operation["id"],
+            "concurrent admissions returned different activity IDs"
+        );
+        let first: Activity = serde_json::from_value(
+            wait_payment_state(
+                &client,
+                fixture.api_url(),
+                &first.location,
+                "confirmed",
+                Instant::now() + SEND_TIMEOUT,
+            )
+            .await?,
+        )?;
+        let second: Activity = serde_json::from_value(
+            wait_payment_state(
+                &client,
+                fixture.api_url(),
+                &second.location,
+                "confirmed",
+                Instant::now() + SEND_TIMEOUT,
+            )
+            .await?,
+        )?;
         anyhow::ensure!(
             first.id == second.id,
             "requests returned different activities"
@@ -388,9 +401,9 @@ pub(super) async fn external_address_send_progresses_without_caller_replay() -> 
         let address = super::faucet::external_faucet_test_address();
         let key = "external-unprepared-status-only";
         fixture.proxy().set_startup_unavailable(true)?;
-        let response = client.post(format!("{}/api/v1/send",fixture.api_url())).timeout(SEND_TIMEOUT).json(&json!({"from_account":1,"to_address":address,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":1_000_000,"idempotency_key":key,"memo":null})).send().await?;
-        anyhow::ensure!(response.status() == reqwest::StatusCode::INTERNAL_SERVER_ERROR, "pre-prepare outage did not preserve the foreground error");
-        let path = format!("/api/v1/activity?idempotency_key={key}");
+        let admission = admit_payment(&client, fixture.api_url(), "/api/v1/send", &json!({"from_account":1,"to_address":address,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":1_000_000,"idempotency_key":key,"memo":null})).await?;
+        anyhow::ensure!(admission.operation["status"] == "preparing" && admission.operation["txid"] == "", "outage admission did not retain an empty-txid intent");
+        let path = admission.location;
         let pending: Vec<Activity> = request_json(&client, fixture.api_url(), &path, None, API_READ_TIMEOUT).await?;
         anyhow::ensure!(pending.len() == 1, "accepted external claim is not unique");
         let original = &pending[0];
@@ -443,4 +456,220 @@ pub(super) async fn external_address_send_progresses_without_caller_replay() -> 
         );
     }
     preserve_scenario_failure(scenario, cleanup)
+}
+
+pub(super) async fn disconnected_payment_preparation_keeps_the_original_transaction() -> Result<()>
+{
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let mut broadcast_proxy = None;
+    let scenario = async {
+        fixture.start().await?;
+        broadcast_proxy = Some(QueuedBroadcastProxy::start(fixture.lightwalletd_port()?).await?);
+        let proxy = broadcast_proxy.as_ref().unwrap();
+        fixture.restart_with_lightwalletd(proxy.port()).await?;
+        fixture.proxy().reject_payment_mining(true)?;
+        proxy.pause_subtree_roots();
+        let client = Client::new();
+        let key = "disconnected-real-preparation";
+        let body = json!({
+            "from_account": 1, "to_account": 2,
+            "source_pool": "ironwood", "destination_pool": "ironwood",
+            "amount_zatoshi": 1_000_000, "idempotency_key": key,
+        });
+        let lost = lose_payment_response(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        proxy.wait_for_paused_subtree_roots().await?;
+        anyhow::ensure!(
+            lost["status"] == "preparing" && lost["txid"] == "",
+            "disconnected POST did not leave a durable claim"
+        );
+        // Keep the real wallet call paused beyond the ten-second dispatch budget.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        let duplicate = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        anyhow::ensure!(
+            duplicate.operation["id"] == lost["id"] && duplicate.operation["txid"] == "",
+            "deadline or duplicate admission replaced the active preparation"
+        );
+        let mut conflict = body.clone();
+        conflict["amount_zatoshi"] = json!(2_000_000);
+        let rejected = client
+            .post(format!("{}/api/v1/send", fixture.api_url()))
+            .json(&conflict)
+            .send()
+            .await?;
+        anyhow::ensure!(
+            rejected.status() == reqwest::StatusCode::CONFLICT,
+            "conflicting duplicate was accepted"
+        );
+        proxy.resume_subtree_roots();
+        let location = format!("/api/v1/activity?idempotency_key={key}");
+        let pending = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &location,
+            "broadcast",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        let original = pending_payment_snapshot(&fixture, false, key)?;
+        anyhow::ensure!(
+            pending["id"] == lost["id"] && pending["txid"] == original.txid,
+            "wallet/server journals changed the disconnected payment identity"
+        );
+        fixture.restart_server().await?;
+        anyhow::ensure!(
+            pending_payment_snapshot(&fixture, false, key)? == original,
+            "restart changed the signed original"
+        );
+        fixture.proxy().reject_payment_mining(false)?;
+        let confirmed = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &location,
+            "confirmed",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            confirmed["id"] == lost["id"] && confirmed["txid"] == original.txid,
+            "background recovery did not confirm the original"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    if let Some(proxy) = broadcast_proxy.as_ref() {
+        proxy.resume_subtree_roots();
+    }
+    let cleanup = fixture.shutdown().await;
+    let proxy_cleanup = if let Some(proxy) = broadcast_proxy.as_mut() {
+        proxy.shutdown().await
+    } else {
+        Ok(())
+    };
+    preserve_scenario_failure(scenario, preserve_scenario_failure(cleanup, proxy_cleanup))
+}
+
+pub(super) async fn expired_unseen_send_replaces_once_under_the_original_key() -> Result<()> {
+    let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
+    let mut broadcast_proxy = None;
+    let scenario = async {
+        fixture.start().await?;
+        broadcast_proxy = Some(QueuedBroadcastProxy::start(fixture.lightwalletd_port()?).await?);
+        let proxy = broadcast_proxy.as_ref().unwrap();
+        proxy.withhold_broadcasts(true);
+        fixture.restart_with_lightwalletd(proxy.port()).await?;
+        fixture.proxy().reject_payment_mining(true)?;
+        let client = Client::new();
+        let key = "expired-unseen-send";
+        let body = json!({
+            "from_account": 1, "to_account": 2,
+            "source_pool": "ironwood", "destination_pool": "ironwood",
+            "amount_zatoshi": 1_000_000, "idempotency_key": key,
+        });
+        let admission = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        let _ = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &admission.location,
+            "broadcast",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        let original = pending_payment_snapshot(&fixture, false, key)?;
+        let chain: ChainInfo =
+            rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
+        let blocks = original.expiry_height.saturating_sub(chain.blocks) + 1;
+        anyhow::ensure!(
+            blocks > 0 && blocks <= 100,
+            "unexpected expiry distance: {blocks}"
+        );
+        let _: serde_json::Value = rpc_with_timeout(
+            &client,
+            fixture.node_url(),
+            "generate",
+            json!([blocks]),
+            Duration::from_secs(120),
+        )
+        .await?;
+        let mempool: Vec<String> =
+            rpc(&client, fixture.node_url(), "getrawmempool", json!([])).await?;
+        anyhow::ensure!(
+            !mempool.contains(&original.txid),
+            "original transaction reached the chain node"
+        );
+        proxy.withhold_broadcasts(false);
+        fixture.proxy().reject_payment_mining(false)?;
+        let confirmed = wait_payment_state(
+            &client,
+            fixture.api_url(),
+            &admission.location,
+            "confirmed",
+            Instant::now() + SEND_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            confirmed["id"] == original.id && confirmed["txid"] != original.txid,
+            "expired original was not safely replaced under its key"
+        );
+        let replacement = confirmed["txid"]
+            .as_str()
+            .context("replacement has no txid")?;
+        let evidence: serde_json::Value = rpc(
+            &client,
+            fixture.node_url(),
+            "getrawtransaction",
+            json!([replacement, 1]),
+        )
+        .await?;
+        anyhow::ensure!(
+            evidence["confirmations"].as_u64().is_some_and(|n| n > 0)
+                && evidence["blockhash"] == confirmed["block_hash"],
+            "replacement lacks canonical inclusion"
+        );
+        let block: serde_json::Value = rpc(
+            &client,
+            fixture.node_url(),
+            "getblockheader",
+            json!([evidence["blockhash"]]),
+        )
+        .await?;
+        let canonical: String = rpc(
+            &client,
+            fixture.node_url(),
+            "getblockhash",
+            json!([block["height"]]),
+        )
+        .await?;
+        anyhow::ensure!(
+            evidence["blockhash"] == canonical,
+            "replacement is not on the canonical chain"
+        );
+        let accounts: Vec<AccountBalance> = request_json(
+            &client,
+            fixture.api_url(),
+            "/api/v1/accounts",
+            None,
+            API_READ_TIMEOUT,
+        )
+        .await?;
+        anyhow::ensure!(
+            accounts
+                .iter()
+                .any(|a| a.id == 2 && a.ironwood_zatoshi == 1_000_000),
+            "replacement did not produce exactly one SDK payout"
+        );
+        let replay = admit_payment(&client, fixture.api_url(), "/api/v1/send", &body).await?;
+        anyhow::ensure!(
+            replay.operation == confirmed,
+            "terminal replay changed the replacement"
+        );
+        fixture.assert_running().await
+    }
+    .await;
+    let cleanup = fixture.shutdown().await;
+    let proxy_cleanup = if let Some(proxy) = broadcast_proxy.as_mut() {
+        proxy.shutdown().await
+    } else {
+        Ok(())
+    };
+    preserve_scenario_failure(scenario, preserve_scenario_failure(cleanup, proxy_cleanup))
 }

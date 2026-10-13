@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::Recipient;
 use crate::state::tests::state_with_local_wallet;
 use crate::{
     db::{Activity, Store},
@@ -121,7 +122,7 @@ async fn payment_lifecycle_returns_confirmed_replays_without_preparation() {
 
     let result = execute_payment(&runtime, confirmed.clone(), {
         let prepare_calls = prepare_calls.clone();
-        move |_| {
+        move |_, _| {
             prepare_calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(prepared_payment_result("unused", 180)))
         }
@@ -147,7 +148,7 @@ async fn payment_lifecycle_submits_prepared_replays_without_preparation() {
 
     let result = execute_payment(&runtime, prepared, {
         let prepare_calls = prepare_calls.clone();
-        move |_| {
+        move |_, _| {
             prepare_calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(prepared_payment_result("unused", 180)))
         }
@@ -176,7 +177,8 @@ async fn payment_lifecycle_prepares_again_after_expiry() {
 
     let result = execute_payment(&runtime, prepared, {
         let prepare_calls = prepare_calls.clone();
-        move |_| {
+        move |_, replacement_txid| {
+            assert_eq!(replacement_txid.as_deref(), Some("expired-txid"));
             prepare_calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(prepared_payment_result("replacement-txid", 180)))
         }
@@ -197,7 +199,7 @@ async fn payment_lifecycle_does_not_discard_after_recording_failure() {
     let runtime = RecordingPaymentLifecycle::new(store.clone(), []);
     runtime.record_fails.store(true, Ordering::SeqCst);
 
-    let result = execute_payment(&runtime, claim.clone(), |_| {
+    let result = execute_payment(&runtime, claim.clone(), |_, _| {
         std::future::ready(Ok(prepared_payment_result("durable-txid", 180)))
     })
     .await;
@@ -224,7 +226,7 @@ async fn payment_lifecycle_returns_pending_after_confirmation_failure() {
     let mut runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
     runtime.confirm = false;
 
-    let result = execute_payment(&runtime, prepared, |_| {
+    let result = execute_payment(&runtime, prepared, |_, _| {
         std::future::ready(Ok(prepared_payment_result("unused", 180)))
     })
     .await
@@ -242,7 +244,7 @@ async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
         .store
         .claim_transfer(
             1,
-            crate::db::Recipient::Account(2),
+            Recipient::Account(2),
             "ironwood",
             "ironwood",
             12_000,
@@ -251,15 +253,15 @@ async fn failed_recovery_keeps_a_claim_with_a_wallet_journal() {
         )
         .unwrap();
     rusqlite::Connection::open(dir.path().join("wallet.db"))
-        .unwrap()
-        .execute(
-            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
-            rusqlite::params![claim.id, "txid", b"signed transaction", 140_u64],
-        )
-        .unwrap();
+            .unwrap()
+            .execute(
+                "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![claim.id, "txid", b"signed transaction", 140_u64],
+            )
+            .unwrap();
 
     assert!(
-        execute_payment(&state, claim.clone(), |_| {
+        execute_payment(&state, claim.clone(), |_, _| {
             std::future::ready(Err(anyhow::anyhow!("preparation failed")))
         })
         .await
@@ -280,7 +282,7 @@ async fn failed_preparation_preserves_the_claim_and_records_the_error() {
         .store
         .claim_transfer(
             1,
-            crate::db::Recipient::Account(2),
+            Recipient::Account(2),
             "ironwood",
             "ironwood",
             12_000,
@@ -290,7 +292,7 @@ async fn failed_preparation_preserves_the_claim_and_records_the_error() {
         .unwrap();
 
     assert!(
-        execute_payment(&state, claim.clone(), |_| {
+        execute_payment(&state, claim.clone(), |_, _| {
             std::future::ready(Err(anyhow::anyhow!("preparation failed")))
         })
         .await
@@ -299,7 +301,10 @@ async fn failed_preparation_preserves_the_claim_and_records_the_error() {
     let retained = state.0.store.activity_for_key("same").unwrap().unwrap();
     assert_eq!(retained.id, claim.id);
     assert_eq!(retained.status, "preparing");
-    assert_eq!(retained.last_error.as_deref(), Some("preparation failed"));
+    assert_eq!(
+        retained.last_error.as_deref(),
+        Some("preparing payment: preparation failed")
+    );
 }
 
 enum LifecycleSubmission {
@@ -318,7 +323,7 @@ async fn payment_lifecycle_returns_failed_replays_without_preparation() {
         .fail(&claim.id, "insufficient spendable funds")
         .unwrap();
     let runtime = RecordingPaymentLifecycle::new(store, []);
-    let result = execute_payment(&runtime, failed.clone(), |_| async {
+    let result = execute_payment(&runtime, failed.clone(), |_, _| async {
         panic!("failed replay must not prepare another payment")
     })
     .await
@@ -353,7 +358,7 @@ async fn startup_funding_retries_the_original_key_and_signed_bytes_across_failur
         crate::bootstrap::retry_startup(|| async {
             let pending =
                 store.claim_faucet(1, "ironwood", 500_000_000, "startup-account-1-ironwood-v1")?;
-            let activity = execute_payment(&runtime, pending, |_| async {
+            let activity = execute_payment(&runtime, pending, |_, _| async {
                 let attempt = prepare_calls.fetch_add(1, Ordering::SeqCst);
                 if window == "before-prepare" && attempt == 0 {
                     return Err(

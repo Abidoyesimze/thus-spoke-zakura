@@ -84,38 +84,52 @@ async fn wallet_broadcast_accepts_the_lightwalletd_queued_response() {
 
 #[tokio::test]
 async fn broadcast_times_out_after_lightwalletd_accepts_the_request() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut connection = h2::server::handshake(socket).await.unwrap();
-        let (request, response) = connection.accept().await.unwrap().unwrap();
-        assert_eq!(
-            request.uri().path(),
-            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
-        );
-        accepted_tx.send(()).unwrap();
-        let _response = response;
-        std::future::pending::<()>().await;
-    });
+    for remaining in [None, Some(Duration::from_secs(2))] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut connection = h2::server::handshake(socket).await.unwrap();
+            let (request, response) = connection.accept().await.unwrap().unwrap();
+            assert_eq!(
+                request.uri().path(),
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+            );
+            accepted_tx.send(()).unwrap();
+            let _response = response;
+            std::future::pending::<()>().await;
+        });
 
-    let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("server.db")).unwrap();
-    store.initialize().unwrap();
-    let mut wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
-    wallet.lightwalletd = endpoint;
-    let broadcast = tokio::spawn(async move { wallet.broadcast(&[1, 2, 3]).await });
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("server.db")).unwrap();
+        store.initialize().unwrap();
+        let mut wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+        wallet.lightwalletd = endpoint;
+        let broadcast = tokio::spawn(async move {
+            match remaining {
+                Some(budget) => {
+                    wallet
+                        .broadcast_until(&[1, 2, 3], tokio::time::Instant::now() + budget)
+                        .await
+                }
+                None => wallet.broadcast(&[1, 2, 3]).await,
+            }
+        });
 
-    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
-        .await
-        .expect("lightwalletd never received the broadcast")
-        .unwrap();
-    tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(31)).await;
-    tokio::task::yield_now().await;
-    assert!(broadcast.is_finished(), "broadcast ignored its deadline");
-    let error = broadcast.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("timed out"), "{error:#}");
-    server.abort();
+        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+            .await
+            .expect("lightwalletd never received the broadcast")
+            .unwrap();
+        tokio::time::pause();
+        tokio::time::advance(remaining.unwrap_or(Duration::from_secs(30)) + Duration::from_secs(1))
+            .await;
+        tokio::task::yield_now().await;
+        assert!(broadcast.is_finished(), "broadcast ignored its deadline");
+        let error = broadcast.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error:#}");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        tokio::time::resume();
+    }
 }

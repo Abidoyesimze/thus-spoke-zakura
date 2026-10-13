@@ -1,9 +1,9 @@
+use super::*;
 use super::{
     API_READ_TIMEOUT, Activity, Address, AddressFaucetResult, BlockHeight, ChainInfo, Client,
-    FaucetAccount, GenerateCounts, Instant, LocalNetwork, PathBuf, RECOVERY_POLL_INTERVAL,
-    RegtestStack, Result, SEND_TIMEOUT, TransactionEvidence, TransparentAddress,
-    assert_address_faucet_inclusion, json, preserve_scenario_failure,
-    queued_retry_survives_restart, request_json, rpc,
+    FaucetAccount, Instant, LocalNetwork, PathBuf, RECOVERY_POLL_INTERVAL, RegtestStack, Result,
+    SEND_TIMEOUT, TransactionEvidence, TransparentAddress, assert_address_faucet_inclusion, json,
+    preserve_scenario_failure, queued_retry_survives_restart, request_json, rpc,
 };
 
 pub(super) async fn queued_external_faucet_retry_survives_lost_response_and_restart() -> Result<()>
@@ -52,19 +52,23 @@ pub(super) async fn address_faucet_retry_after_server_restart_pays_each_destinat
             (internal, "internal-restart-faucet"),
             (external, "external-restart-faucet"),
         ] {
-            fixture.proxy().fail_next_generate()?;
+            fixture.proxy().reject_payment_mining(true)?;
             let body = json!({
                 "address": address, "amount_zatoshi": 1_000_000,
                 "idempotency_key": key,
             });
-            let first: AddressFaucetResult = request_json(
-                &client,
-                fixture.api_url(),
-                "/api/v1/faucet/address",
-                Some(&body),
-                SEND_TIMEOUT,
-            )
-            .await?;
+            let admission =
+                admit_payment(&client, fixture.api_url(), "/api/v1/faucet/address", &body).await?;
+            let first: AddressFaucetResult = serde_json::from_value(
+                wait_payment_state(
+                    &client,
+                    fixture.api_url(),
+                    &admission.location,
+                    "broadcast",
+                    Instant::now() + SEND_TIMEOUT,
+                )
+                .await?,
+            )?;
             anyhow::ensure!(
                 first.status == "broadcast" && first.block_hash.is_none(),
                 "injected auto-mine failure did not leave the payment pending"
@@ -76,25 +80,26 @@ pub(super) async fn address_faucet_retry_after_server_restart_pays_each_destinat
                 "original transaction is absent from the mempool"
             );
 
-            // Discard the first result as a client with a lost response would, then restart the app.
+            // Recovery after restart must not need another payment POST.
             fixture.restart_server().await?;
-            let replay: AddressFaucetResult = request_json(
-                &client,
-                fixture.api_url(),
-                "/api/v1/faucet/address",
-                Some(&body),
-                SEND_TIMEOUT,
-            )
-            .await?;
+            fixture.proxy().reject_payment_mining(false)?;
+            let confirmed: AddressFaucetResult = serde_json::from_value(
+                wait_payment_state(
+                    &client,
+                    fixture.api_url(),
+                    &admission.location,
+                    "confirmed",
+                    Instant::now() + SEND_TIMEOUT,
+                )
+                .await?,
+            )?;
             anyhow::ensure!(
-                replay.status == "confirmed"
-                    && replay.txid == first.txid
-                    && replay.last_error.is_none(),
-                "retry constructed another payment instead of confirming the original"
+                confirmed.status == "confirmed" && confirmed.txid == first.txid,
+                "background recovery changed the original payment"
             );
             anyhow::ensure!(
-                replay.address == address && replay.amount_zatoshi == 1_000_000,
-                "replayed payment changed its destination or amount"
+                confirmed.address == address && confirmed.amount_zatoshi == 1_000_000,
+                "recovered payment changed its destination or amount"
             );
             let tx: serde_json::Value = rpc(
                 &client,
@@ -104,7 +109,7 @@ pub(super) async fn address_faucet_retry_after_server_restart_pays_each_destinat
             )
             .await?;
             anyhow::ensure!(
-                tx["blockhash"].as_str() == replay.block_hash.as_deref(),
+                tx["blockhash"].as_str() == confirmed.block_hash.as_deref(),
                 "response block hash differs from the confirmed transaction"
             );
             let balance: serde_json::Value = rpc(
@@ -189,7 +194,7 @@ pub(super) async fn internal_address_faucet_recovers_after_auto_mine_failure() -
             .find(|account| account.id == 2)
             .unwrap()
             .transparent_address;
-        let _: serde_json::Value = request_json(
+        let _: serde_json::Value = confirmed_payment(
             &client,
             fixture.api_url(),
             "/api/v1/faucet/address",
@@ -207,28 +212,20 @@ pub(super) async fn internal_address_faucet_recovers_after_auto_mine_failure() -
         let height: ChainInfo =
             rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
         let counts = fixture.proxy().counts();
-        fixture.proxy().fail_next_generate()?;
-        let response = client
-            .post(format!("{}/api/v1/faucet/address", fixture.api_url()))
-            .timeout(SEND_TIMEOUT)
-            .json(&json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": uuid::Uuid::new_v4().to_string()}))
-            .send()
-            .await?;
-        assert_eq!(
-            response.status(),
-            reqwest::StatusCode::OK
-        );
-        assert_eq!(
-            fixture.proxy().counts(),
-            GenerateCounts {
-                rejected: counts.rejected + 1,
-                forwarded: counts.forwarded
-            }
-        );
+        fixture.proxy().reject_payment_mining(true)?;
+        let key = uuid::Uuid::new_v4().to_string();
+        let admission = admit_payment(
+            &client, fixture.api_url(), "/api/v1/faucet/address",
+            &json!({"address": address, "amount_zatoshi": 100_000_000, "idempotency_key": key}),
+        ).await?;
+        let response: AddressFaucetResult = serde_json::from_value(wait_payment_state(
+            &client, fixture.api_url(), &admission.location, "broadcast", Instant::now() + SEND_TIMEOUT,
+        ).await?)?;
+        assert!(fixture.proxy().counts().rejected > counts.rejected);
+        assert_eq!(fixture.proxy().counts().forwarded, counts.forwarded);
         let failed_height: ChainInfo =
             rpc(&client, fixture.node_url(), "getblockchaininfo", json!([])).await?;
         assert_eq!(failed_height.blocks, height.blocks);
-        let response: AddressFaucetResult = response.json().await?;
         assert_eq!(response.status, "broadcast");
         assert_eq!(response.block_hash, None);
         let after = faucet_activities(&client, &fixture).await?;
@@ -348,7 +345,7 @@ async fn address_faucet_request(
     address: &str,
     key: &str,
 ) -> Result<serde_json::Value> {
-    request_json(
+    confirmed_payment(
         client,
         fixture.api_url(),
         "/api/v1/faucet/address",

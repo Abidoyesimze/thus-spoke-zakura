@@ -1,3 +1,4 @@
+use super::*;
 use super::{
     API_READ_TIMEOUT, Activity, ChainInfo, Client, Duration, HeightCheckpoint, Instant,
     LARGE_MINE_TIMEOUT, LiveScenario, RECOVERY_POLL_INTERVAL, RecoveryFailureReporter,
@@ -72,7 +73,7 @@ pub(super) async fn exercise_treasury_sync(
         .and_then(|account| account["ironwood_zatoshi"].as_u64())
         .ok_or_else(|| anyhow::anyhow!("destination balance was missing"))?;
     for request in 0..10 {
-        let payment: Activity = request_json(
+        let payment: Activity = confirmed_payment(
             &client,
             fixture.api_url(),
             "/api/v1/faucet",
@@ -145,14 +146,12 @@ async fn wait_for_wallet_height(
     }
 }
 
-use super::{Connection, Context, OpenFlags, PathBuf, preserve_scenario_failure};
+use super::{Connection, Context, OpenFlags, PathBuf};
 
 pub(super) async fn startup_funding_retry_after_auto_mine_failure_has_one_payout() -> Result<()> {
-    let mut reporter = super::RecoveryFailureReporter::new();
     let mut fixture = RegtestStack::new(PathBuf::from(env!("CARGO_BIN_EXE_ths-server")))?;
     let scenario = async {
         fixture.start_with_funding_fault(true).await?;
-        reporter.phase(super::RecoveryPhase::Recovery);
         anyhow::ensure!(
             fixture.proxy().counts().rejected == 1,
             "startup fault did not execute"
@@ -253,15 +252,6 @@ pub(super) async fn startup_funding_retry_after_auto_mine_failure_has_one_payout
     }
     .await;
     let cleanup = fixture.shutdown().await;
-    if scenario.is_err() || cleanup.is_err() {
-        reporter.emit(
-            Some(&fixture),
-            if scenario.is_ok() {
-                super::FailureRoute::Cleanup
-            } else {
-                super::FailureRoute::Error
-            },
-        );
-    }
-    preserve_scenario_failure(scenario, cleanup)
+    scenario?;
+    cleanup
 }

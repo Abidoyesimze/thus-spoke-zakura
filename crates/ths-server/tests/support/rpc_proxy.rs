@@ -50,6 +50,7 @@ fn startup_payment_snapshot(path: &std::path::Path) -> Result<StartupPaymentSnap
 struct ProxyState {
     startup_unavailable: bool,
     armed: bool,
+    reject_payment_mining: bool,
     rejected: usize,
     forwarded: usize,
     hidden_transaction: Option<String>,
@@ -260,6 +261,15 @@ impl GenerateFaultProxy {
         &self.url
     }
 
+    pub fn reject_payment_mining(&self, reject: bool) -> Result<()> {
+        self.shared
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fixture RPC-proxy state is unavailable"))?
+            .reject_payment_mining = reject;
+        Ok(())
+    }
+
     pub fn fail_next_generate(&self) -> Result<()> {
         let mut state = self
             .shared
@@ -447,7 +457,10 @@ async fn proxy_request(State(shared): State<Arc<SharedProxy>>, request: Request)
                 );
             }
         };
-        if is_fault_target && state.armed {
+        if is_fault_target && state.reject_payment_mining {
+            state.rejected += 1;
+            Some(-32603)
+        } else if is_fault_target && state.armed {
             if let Some(path) = state.startup_snapshot_path.as_ref() {
                 match startup_payment_snapshot(path) {
                     Ok(snapshot) => {

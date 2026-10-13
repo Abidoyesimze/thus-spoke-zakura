@@ -1,5 +1,6 @@
 use super::*;
 use crate::api::{error::ApiResult, router};
+use crate::state::tests::counting_rpc;
 use crate::state::tests::{
     started_offline_state as offline_state,
     started_state_with_local_wallet as state_with_local_wallet,
@@ -16,6 +17,8 @@ use axum::{
     http::{Request, StatusCode},
 };
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tower::ServiceExt;
 use zcash_protocol::value::MAX_MONEY;
 #[test]
@@ -753,7 +756,7 @@ async fn a_valid_replay_returns_the_original_without_the_wallet_or_network() {
         .store
         .claim_transfer(
             1,
-            crate::db::Recipient::Account(2),
+            Recipient::Account(2),
             "ironwood",
             "ironwood",
             100_000,
@@ -792,12 +795,10 @@ async fn a_valid_replay_returns_the_original_without_the_wallet_or_network() {
     }
     assert_eq!(activity_ids(&state), before);
 
-    // Guard for the harness itself: a send that is not a replay must reach
-    // the (unreachable) network and fail, so the 200s above prove none did.
     let mut fresh = valid_send();
     fresh["idempotency_key"] = json!("a-key-never-used-before");
     let (status, _) = post_send(&state, &fresh).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(status, StatusCode::ACCEPTED);
     let after = activity_ids(&state);
     assert_eq!(after.len(), before.len() + 1);
     assert!(before.iter().all(|id| after.contains(id)));
@@ -808,7 +809,17 @@ async fn a_valid_replay_returns_the_original_without_the_wallet_or_network() {
         .unwrap()
         .unwrap();
     assert_eq!(retained.status, "preparing");
-    assert!(retained.last_error.is_some());
+    assert_eq!(retained.last_error, None);
+    assert!(state.0.store.prepared_transaction(&retained.id).is_err());
+    assert!(
+        state
+            .0
+            .wallet
+            .prepared(&retained.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1347,4 +1358,477 @@ async fn payment_request_endpoint_rejects_invalid_accounts_amounts_and_memos() {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
     }
+}
+
+#[tokio::test]
+async fn all_payment_posts_admit_without_execution_while_payments_are_busy() {
+    let (local, _dir) = offline_state();
+    let (rpc_url, calls) = counting_rpc(false).await;
+    let state = AppState::new(
+        local.0.store.clone(),
+        local.0.wallet.clone(),
+        rpc_url,
+        "test".into(),
+    );
+    state.mark_started();
+    let _payment = state.0.payments.lock().await;
+    let internal = state.0.store.account(2).unwrap().transparent_address;
+    let external = state
+        .0
+        .store
+        .account(TREASURY_ACCOUNT_ID)
+        .unwrap()
+        .unified_address;
+    let cases = [
+        ("/api/v1/send", valid_send(), REPLAY_KEY, false),
+        (
+            "/api/v1/faucet",
+            json!({"account_id": 3, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": "busy-account-faucet"}),
+            "busy-account-faucet",
+            false,
+        ),
+        (
+            "/api/v1/faucet/address",
+            json!({"address": internal, "amount_zatoshi": 100_000, "idempotency_key": "busy-internal-address"}),
+            "busy-internal-address",
+            false,
+        ),
+        (
+            "/api/v1/faucet/address",
+            json!({"address": external, "amount_zatoshi": 100_000, "idempotency_key": "busy-external-address"}),
+            "busy-external-address",
+            true,
+        ),
+    ];
+    for (uri, request, key, external) in cases {
+        let (status, location, response) = payment_post(&state, uri, &request).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{uri}");
+        assert_eq!(response["status"], "preparing");
+        assert_eq!(response["last_error"], Value::Null);
+        assert_eq!(response["txid"], "");
+        let id = if external {
+            assert!(state.0.store.activity_for_key(key).unwrap().is_none());
+            let saved = state.0.store.address_faucet_for_key(key).unwrap().unwrap();
+            assert_eq!(saved.address, request["address"].as_str().unwrap());
+            saved.id
+        } else {
+            assert!(state.0.store.address_faucet_for_key(key).unwrap().is_none());
+            let saved = state.0.store.activity_for_key(key).unwrap().unwrap();
+            assert_eq!(saved.amount_zatoshi, 100_000);
+            saved.id
+        };
+        assert!(state.0.store.prepared_transaction(&id).is_err());
+        assert!(state.0.wallet.prepared(&id).await.unwrap().is_none());
+        let before = (
+            state.0.store.unresolved_activities().unwrap(),
+            state.0.store.unresolved_address_faucets().unwrap(),
+        );
+        let durable_response = if uri == "/api/v1/faucet/address" {
+            response
+        } else {
+            let saved = state.0.store.activity_for_key(key).unwrap().unwrap();
+            let mut admitted = response;
+            admitted["created_at"] = json!(saved.created_at);
+            let durable = serde_json::to_value(saved).unwrap();
+            assert_eq!(admitted, durable);
+            durable
+        };
+        assert_eq!(
+            payment_post(&state, uri, &request).await,
+            (status, location, durable_response)
+        );
+        assert_eq!(
+            (
+                state.0.store.unresolved_activities().unwrap(),
+                state.0.store.unresolved_address_faucets().unwrap()
+            ),
+            before,
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.0.store.activities(100).unwrap().len(), 3);
+    assert_eq!(state.0.store.unresolved_address_faucets().unwrap().len(), 1);
+    assert!(state.0.mining.latest().await.is_none());
+}
+
+#[tokio::test]
+async fn payment_replays_use_stored_status_and_exact_encoded_location() {
+    const KEY: &str = "payment-key?x=1&y=+%/#";
+    const ENCODED_KEY: &str = "payment-key%3Fx%3D1%26y%3D%2B%25%2F%23";
+    for endpoint in ["send", "faucet", "internal-address", "external-address"] {
+        for stored_status in ["preparing", "prepared", "broadcast", "confirmed", "failed"] {
+            let (state, _dir) = offline_state();
+            let store = &state.0.store;
+            let external = endpoint == "external-address";
+            let address = store
+                .account(if external { TREASURY_ACCOUNT_ID } else { 2 })
+                .unwrap()
+                .unified_address;
+            let (uri, status_path, request) = match endpoint {
+                "send" => {
+                    let mut body = valid_send();
+                    body["idempotency_key"] = json!(KEY);
+                    body["memo"] = json!("stored memo");
+                    ("/api/v1/send", "/api/v1/activity", body)
+                }
+                "faucet" => (
+                    "/api/v1/faucet",
+                    "/api/v1/activity",
+                    json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": KEY}),
+                ),
+                _ => (
+                    "/api/v1/faucet/address",
+                    "/api/v1/faucet/address",
+                    json!({"address": address, "amount_zatoshi": 100_000, "idempotency_key": KEY}),
+                ),
+            };
+            let id = if external {
+                store
+                    .claim_address_faucet(&address, 100_000, KEY)
+                    .unwrap()
+                    .id
+            } else if endpoint == "send" {
+                store
+                    .claim_transfer(
+                        1,
+                        Recipient::Account(2),
+                        "ironwood",
+                        "ironwood",
+                        100_000,
+                        KEY,
+                        Some("stored memo"),
+                    )
+                    .unwrap()
+                    .id
+            } else {
+                store.claim_faucet(2, "ironwood", 100_000, KEY).unwrap().id
+            };
+            match stored_status {
+                "failed" => {
+                    if external {
+                        store.fail_address(&id, "stored failure").unwrap();
+                    } else {
+                        store.fail(&id, "stored failure").unwrap();
+                    }
+                }
+                "prepared" | "broadcast" | "confirmed" => {
+                    if external {
+                        store
+                            .record_address_prepared(
+                                &id,
+                                "original-txid",
+                                b"original signed bytes",
+                                140,
+                            )
+                            .unwrap();
+                        if stored_status != "prepared" {
+                            store.mark_address_broadcast(&id, "original-txid").unwrap();
+                        }
+                        if stored_status == "confirmed" {
+                            store
+                                .confirm_address(&id, "original-txid", "original-block")
+                                .unwrap();
+                        }
+                    } else {
+                        store
+                            .record_prepared(&id, "original-txid", b"original signed bytes", 140)
+                            .unwrap();
+                        if stored_status != "prepared" {
+                            store.mark_broadcast(&id, "original-txid").unwrap();
+                        }
+                        if stored_status == "confirmed" {
+                            store
+                                .confirm(&id, "original-txid", "original-block")
+                                .unwrap();
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if matches!(stored_status, "preparing" | "prepared" | "broadcast") {
+                let txid = if stored_status == "preparing" {
+                    ""
+                } else {
+                    "original-txid"
+                };
+                if external {
+                    store
+                        .record_address_error(&id, stored_status, txid, "pending execution error")
+                        .unwrap();
+                } else {
+                    store
+                        .record_error(&id, stored_status, txid, "pending execution error")
+                        .unwrap();
+                }
+            }
+            let expected = if endpoint == "send" || endpoint == "faucet" {
+                serde_json::to_value(store.activity_for_key(KEY).unwrap().unwrap()).unwrap()
+            } else if external {
+                serde_json::to_value(external_faucet_response(
+                    store.address_faucet_for_key(KEY).unwrap().unwrap(),
+                ))
+                .unwrap()
+            } else {
+                serde_json::to_value(
+                    faucet_address_response(
+                        address.clone(),
+                        store.activity_for_key(KEY).unwrap().unwrap(),
+                    )
+                    .unwrap(),
+                )
+                .unwrap()
+            };
+            let before = (
+                store.activity_for_key(KEY).unwrap(),
+                store.address_faucet_for_key(KEY).unwrap(),
+            );
+            let _payment = state.0.payments.lock().await;
+            for _ in 0..2 {
+                let (code, location, body) = payment_post(&state, uri, &request).await;
+                let terminal = matches!(stored_status, "confirmed" | "failed");
+                assert_eq!(
+                    code,
+                    if terminal {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::ACCEPTED
+                    },
+                    "{endpoint}: {stored_status}"
+                );
+                assert_eq!(
+                    location,
+                    format!("{status_path}?idempotency_key={ENCODED_KEY}")
+                );
+                assert_eq!(body, expected);
+                let (read_code, read) = api_get(&state, &location).await;
+                assert_eq!(read_code, StatusCode::OK);
+                assert_eq!(
+                    read,
+                    if status_path == "/api/v1/activity" {
+                        json!([body])
+                    } else {
+                        body
+                    }
+                );
+            }
+            assert_eq!(
+                (
+                    store.activity_for_key(KEY).unwrap(),
+                    store.address_faucet_for_key(KEY).unwrap()
+                ),
+                before
+            );
+            if matches!(stored_status, "prepared" | "broadcast" | "confirmed") {
+                assert_eq!(
+                    store.prepared_transaction(&id).unwrap().raw_transaction,
+                    b"original signed bytes"
+                );
+            } else {
+                assert!(store.prepared_transaction(&id).is_err());
+            }
+            assert!(state.0.wallet.prepared(&id).await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn payment_admission_replays_enforce_fingerprints_and_cross_store_identity() {
+    let (state, _dir) = offline_state();
+    let _payment = state.0.payments.lock().await;
+    let mut send_body = valid_send();
+    send_body["memo"] = json!("original memo");
+    payment_post(&state, "/api/v1/send", &send_body).await;
+    let original = state.0.store.activity_for_key(REPLAY_KEY).unwrap().unwrap();
+    for (field, value) in [
+        ("from_account", json!(3)),
+        ("to_account", json!(3)),
+        ("source_pool", json!("transparent")),
+        ("destination_pool", json!("transparent")),
+        ("amount_zatoshi", json!(100_001)),
+        ("memo", json!("changed memo")),
+        ("memo", Value::Null),
+    ] {
+        let mut conflict = send_body.clone();
+        conflict[field] = value;
+        if field == "destination_pool" {
+            conflict.as_object_mut().unwrap().remove("memo");
+        }
+        assert_eq!(
+            api_request(&state, "POST", "/api/v1/send", conflict)
+                .await
+                .0,
+            StatusCode::CONFLICT,
+            "{field}"
+        );
+        assert_eq!(
+            state.0.store.activity_for_key(REPLAY_KEY).unwrap().unwrap(),
+            original
+        );
+    }
+    let faucet_body = json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": "fingerprint-faucet"});
+    payment_post(&state, "/api/v1/faucet", &faucet_body).await;
+    let faucet = state
+        .0
+        .store
+        .activity_for_key("fingerprint-faucet")
+        .unwrap()
+        .unwrap();
+    for (field, value) in [
+        ("account_id", json!(3)),
+        ("pool", json!("transparent")),
+        ("amount_zatoshi", json!(100_001)),
+    ] {
+        let mut conflict = faucet_body.clone();
+        conflict[field] = value;
+        assert_eq!(
+            api_request(&state, "POST", "/api/v1/faucet", conflict)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    let internal_address = state.0.store.account(2).unwrap().unified_address;
+    let address_body = json!({"address": internal_address, "amount_zatoshi": 100_000, "idempotency_key": "fingerprint-faucet"});
+    assert_eq!(
+        payment_post(&state, "/api/v1/faucet/address", &address_body)
+            .await
+            .2["status"],
+        "preparing"
+    );
+    assert_eq!(
+        state
+            .0
+            .store
+            .activity_for_key("fingerprint-faucet")
+            .unwrap()
+            .unwrap(),
+        faucet
+    );
+    let mut wrong_kind = faucet_body.clone();
+    wrong_kind["idempotency_key"] = json!(REPLAY_KEY);
+    assert_eq!(
+        api_request(&state, "POST", "/api/v1/faucet", wrong_kind)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+    let external_address = state
+        .0
+        .store
+        .account(TREASURY_ACCOUNT_ID)
+        .unwrap()
+        .unified_address;
+    let mut wrong_store = address_body.clone();
+    wrong_store["address"] = json!(external_address);
+    assert_eq!(
+        api_request(&state, "POST", "/api/v1/faucet/address", wrong_store)
+            .await
+            .0,
+        StatusCode::CONFLICT
+    );
+
+    let external = state
+        .0
+        .store
+        .claim_address_faucet(&internal_address, 100_000, "external-before-classification")
+        .unwrap();
+    let replay_body = json!({"address": internal_address, "amount_zatoshi": 100_000, "idempotency_key": "external-before-classification"});
+    for terminal in [false, true] {
+        if terminal {
+            state
+                .0
+                .store
+                .fail_address(&external.id, "stored failure")
+                .unwrap();
+        }
+        let (code, location, body) =
+            payment_post(&state, "/api/v1/faucet/address", &replay_body).await;
+        assert_eq!(
+            code,
+            if terminal {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            }
+        );
+        assert_eq!(
+            body["status"],
+            if terminal { "failed" } else { "preparing" }
+        );
+        assert_eq!(api_get(&state, &location).await.1, body);
+        assert!(
+            state
+                .0
+                .store
+                .activity_for_key("external-before-classification")
+                .unwrap()
+                .is_none()
+        );
+        let saved = state
+            .0
+            .store
+            .address_faucet_for_key("external-before-classification")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.id, external.id);
+        for (field, value, expected) in [
+            ("amount_zatoshi", json!(100_001), StatusCode::CONFLICT),
+            ("address", json!(external_address), StatusCode::CONFLICT),
+            ("address", json!("invalid-address"), StatusCode::BAD_REQUEST),
+            ("amount_zatoshi", json!(0), StatusCode::BAD_REQUEST),
+            ("idempotency_key", json!("short"), StatusCode::BAD_REQUEST),
+        ] {
+            let mut conflict = replay_body.clone();
+            conflict[field] = value;
+            assert_eq!(
+                api_request(&state, "POST", "/api/v1/faucet/address", conflict)
+                    .await
+                    .0,
+                expected
+            );
+            assert_eq!(
+                state
+                    .0
+                    .store
+                    .address_faucet_for_key("external-before-classification")
+                    .unwrap()
+                    .unwrap(),
+                saved
+            );
+        }
+        let mut wrong_store = faucet_body.clone();
+        wrong_store["idempotency_key"] = json!("external-before-classification");
+        assert_eq!(
+            api_request(&state, "POST", "/api/v1/faucet", wrong_store)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(state.0.store.activities(100).unwrap().len(), 2);
+    for id in [&original.id, &faucet.id, &external.id] {
+        assert!(state.0.store.prepared_transaction(id).is_err());
+        assert!(state.0.wallet.prepared(id).await.unwrap().is_none());
+    }
+}
+
+async fn payment_post(state: &AppState, uri: &str, body: &Value) -> (StatusCode, String, Value) {
+    let response = tokio::time::timeout(
+        Duration::from_secs(1),
+        router(state.clone()).oneshot(
+            Request::post(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        ),
+    )
+    .await
+    .expect("payment admission waited for execution")
+    .unwrap();
+    let status = response.status();
+    let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, location, serde_json::from_slice(&bytes).unwrap())
 }

@@ -22,7 +22,7 @@ mod schema;
 
 pub use accounts::{Account, DevelopmentAccountSecret, DevelopmentSecrets};
 pub use activity::{Activity, ActivityIntent, PreparedTransaction, Recipient};
-pub use address_faucet::{AddressFaucet, AddressFaucetIntent};
+pub use address_faucet::AddressFaucet;
 
 pub const ZATOSHIS_PER_ZEC: u64 = 100_000_000;
 pub const USER_ACCOUNT_COUNT: u8 = 5;

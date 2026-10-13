@@ -32,6 +32,7 @@ impl FaucetRuntime for RecordingFaucetRuntime {
     async fn prepare_payment<F>(
         &self,
         _activity_id: Option<&str>,
+        _replacement_txid: Option<&str>,
         _seed: &str,
         _destination: &str,
         _amount_zatoshi: u64,
@@ -133,6 +134,7 @@ async fn insufficient_funds_discovers_only_the_needed_mature_reward_and_retries(
 
     let prepared = prepare_with_replenishment(
         &runtime,
+        None,
         None,
         "seed",
         &treasury,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::db::address_faucet::AddressFaucetIntent;
 use std::sync::Barrier;
 #[test]
 fn records_real_transfer_without_mutating_balances() {
@@ -1116,5 +1117,92 @@ fn unresolved_external_sends_preserve_recipient_key_and_memo_after_reopen() {
             key: "external-intent".into(),
             memo: Some("".into())
         }]
+    );
+}
+
+#[test]
+fn clearing_payment_errors_requires_the_exact_pending_state_and_transaction() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    for status in ["preparing", "prepared", "broadcast"] {
+        let claim = store.claim_faucet(2, "ironwood", 100, status).unwrap();
+        let txid = if status == "preparing" {
+            ""
+        } else {
+            "current-txid"
+        };
+        if status != "preparing" {
+            store
+                .record_prepared(&claim.id, txid, b"signed bytes", 140)
+                .unwrap();
+        }
+        if status == "broadcast" {
+            store.mark_broadcast(&claim.id, txid).unwrap();
+        }
+        let saved = store
+            .record_error(&claim.id, status, txid, "current error")
+            .unwrap();
+        let stale_status = if status == "preparing" {
+            "prepared"
+        } else {
+            "preparing"
+        };
+        assert_eq!(
+            store.clear_error(&claim.id, stale_status, txid).unwrap(),
+            saved
+        );
+        assert_eq!(
+            store.clear_error(&claim.id, status, "stale-txid").unwrap(),
+            saved
+        );
+        let cleared = store.clear_error(&claim.id, status, txid).unwrap();
+        assert_eq!(cleared.last_error, None);
+        assert_eq!(
+            (cleared.status.as_str(), cleared.txid.as_str()),
+            (status, txid)
+        );
+        assert_eq!(store.clear_error(&claim.id, status, txid).unwrap(), cleared);
+    }
+    let failed = store
+        .claim_faucet(2, "ironwood", 100, "failed-clear")
+        .unwrap();
+    let failed = store.fail(&failed.id, "terminal failure").unwrap();
+    assert_eq!(store.clear_error(&failed.id, "failed", "").unwrap(), failed);
+    assert_eq!(
+        store.clear_error(&failed.id, "preparing", "").unwrap(),
+        failed
+    );
+
+    let confirmed = store
+        .claim_faucet(2, "ironwood", 100, "confirmed-clear")
+        .unwrap();
+    store
+        .record_prepared(&confirmed.id, "included-txid", b"signed bytes", 140)
+        .unwrap();
+    store
+        .confirm(&confirmed.id, "included-txid", "included-block")
+        .unwrap();
+    // A retained terminal diagnostic must survive an exact-status clear too.
+    store
+        .0
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE activity SET last_error='retained terminal diagnostic' WHERE id=?1",
+            [&confirmed.id],
+        )
+        .unwrap();
+    let confirmed = store.activity_for_key("confirmed-clear").unwrap().unwrap();
+    assert_eq!(
+        store
+            .clear_error(&confirmed.id, "confirmed", "included-txid")
+            .unwrap(),
+        confirmed
+    );
+    assert_eq!(
+        store
+            .clear_error(&confirmed.id, "broadcast", "included-txid")
+            .unwrap(),
+        confirmed
     );
 }

@@ -152,7 +152,6 @@ struct AddressFaucetResult {
     txid: String,
     block_hash: Option<String>,
     status: String,
-    last_error: Option<String>,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -198,12 +197,6 @@ async fn external_address_faucet_behavior_is_unchanged() -> Result<()> {
 #[ignore = "requires Docker and prepared regtest images"]
 async fn prepare_rolls_back_constructed_transaction_when_journal_write_fails() -> Result<()> {
     recovery::prepare_rolls_back_constructed_transaction_when_journal_write_fails().await
-}
-
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires Docker and prepared regtest images"]
-async fn retry_recovers_prepare_interrupted_before_store_recording() -> Result<()> {
-    recovery::retry_recovers_prepare_interrupted_before_store_recording().await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -318,4 +311,179 @@ async fn startup_outage_serves_stored_status_and_recovers() -> Result<()> {
 #[ignore = "requires Docker and prepared regtest images"]
 async fn external_address_send_progresses_without_caller_replay() -> Result<()> {
     send::external_address_send_progresses_without_caller_replay().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn disconnected_payment_preparation_keeps_the_original_transaction() -> Result<()> {
+    send::disconnected_payment_preparation_keeps_the_original_transaction().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn expired_unseen_send_replaces_once_under_the_original_key() -> Result<()> {
+    send::expired_unseen_send_replaces_once_under_the_original_key().await
+}
+
+struct PaymentAdmission {
+    operation: serde_json::Value,
+    location: String,
+}
+
+async fn admit_payment(
+    client: &Client,
+    base: &str,
+    path: &str,
+    body: &serde_json::Value,
+) -> Result<PaymentAdmission> {
+    let response = client
+        .post(format!("{base}{path}"))
+        .timeout(API_READ_TIMEOUT)
+        .json(body)
+        .send()
+        .await?;
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .context("payment admission omitted Location")?
+        .to_str()?
+        .to_owned();
+    let operation: serde_json::Value = response.json().await?;
+    let terminal = matches!(operation["status"].as_str(), Some("confirmed" | "failed"));
+    anyhow::ensure!(
+        status
+            == if terminal {
+                reqwest::StatusCode::OK
+            } else {
+                reqwest::StatusCode::ACCEPTED
+            },
+        "payment admission returned {status}: {operation}"
+    );
+    let expected_path = if path == "/api/v1/faucet/address" {
+        "/api/v1/faucet/address"
+    } else {
+        "/api/v1/activity"
+    };
+    let base_url = reqwest::Url::parse(base)?;
+    let url = base_url.join(&location)?;
+    let query = url.query_pairs().collect::<Vec<_>>();
+    anyhow::ensure!(
+        location.starts_with('/')
+            && !location.starts_with("//")
+            && url.origin() == base_url.origin()
+            && url.path() == expected_path
+            && query.len() == 1
+            && query[0].0 == "idempotency_key"
+            && query[0].1
+                == body["idempotency_key"]
+                    .as_str()
+                    .context("missing request key")?,
+        "payment Location did not preserve the exact request key"
+    );
+    Ok(PaymentAdmission {
+        operation,
+        location,
+    })
+}
+
+async fn wait_payment_state(
+    client: &Client,
+    base: &str,
+    location: &str,
+    status: &str,
+    deadline: Instant,
+) -> Result<serde_json::Value> {
+    loop {
+        let value: serde_json::Value =
+            request_json(client, base, location, None, API_READ_TIMEOUT).await?;
+        let operation = if location.starts_with("/api/v1/activity?") {
+            let activities = value
+                .as_array()
+                .context("activity status is not an array")?;
+            anyhow::ensure!(
+                activities.len() == 1,
+                "exact payment key did not identify one activity"
+            );
+            activities[0].clone()
+        } else {
+            value
+        };
+        anyhow::ensure!(
+            operation["status"] != "failed",
+            "payment failed: {operation}"
+        );
+        if operation["status"] == status
+            && (status != "broadcast"
+                || operation["last_error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("injected auto-mine failure")))
+        {
+            if status == "confirmed" {
+                anyhow::ensure!(
+                    operation["last_error"].is_null(),
+                    "confirmation retained an execution error"
+                );
+            }
+            return Ok(operation);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "payment did not reach {status}: {operation}"
+        );
+        tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
+    }
+}
+
+async fn confirmed_payment<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    base: &str,
+    path: &str,
+    body: Option<&serde_json::Value>,
+    timeout: Duration,
+) -> Result<T> {
+    let admission =
+        admit_payment(client, base, path, body.context("missing payment request")?).await?;
+    let confirmed = wait_payment_state(
+        client,
+        base,
+        &admission.location,
+        "confirmed",
+        Instant::now() + timeout,
+    )
+    .await?;
+    if let Some(id) = admission.operation["id"].as_str() {
+        anyhow::ensure!(
+            confirmed["id"] == id,
+            "confirmation changed admitted activity identity"
+        );
+    }
+    if let Some(txid) = admission.operation["txid"]
+        .as_str()
+        .filter(|txid| !txid.is_empty())
+    {
+        anyhow::ensure!(
+            confirmed["txid"] == txid,
+            "confirmation replaced retained transaction identity"
+        );
+    }
+    Ok(serde_json::from_value(confirmed)?)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn background_recovers_prepare_interrupted_before_store_recording() -> Result<()> {
+    recovery::background_recovers_prepare_interrupted_before_store_recording().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn restart_recovers_claim_before_preparation_without_payment_post() -> Result<()> {
+    recovery::restart_recovers_claim_before_preparation_without_payment_post().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn insufficient_send_stays_failed_after_restart_and_later_funding() -> Result<()> {
+    recovery::insufficient_send_stays_failed_after_restart_and_later_funding().await
 }
