@@ -469,6 +469,10 @@ async fn require_loopback_host(request: Request, next: Next) -> Response {
     }
 }
 
+fn public_dashboard_endpoint(configured: Option<&str>) -> String {
+    configured.unwrap_or("http://127.0.0.1:8080").to_owned()
+}
+
 pub async fn dependencies_ready(state: &AppState) -> anyhow::Result<()> {
     state.0.rpc.chain_info().await?;
     state.synchronize_latest().await?;
@@ -530,7 +534,9 @@ async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
         auto_mine: true,
         network: "Regtest",
         endpoints: PublicEndpoints {
-            dashboard: "http://127.0.0.1:8080".into(),
+            dashboard: public_dashboard_endpoint(
+                std::env::var("THS_PUBLIC_DASHBOARD").ok().as_deref(),
+            ),
             zakura_rpc: std::env::var("THS_PUBLIC_ZAKURA_RPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
             lightwalletd: std::env::var("THS_PUBLIC_LIGHTWALLETD")
@@ -3684,6 +3690,15 @@ mod tests {
             .unwrap();
         let status: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(status["endpoints"]["dashboard"], "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn public_dashboard_endpoint_uses_configured_port_or_loopback_default() {
+        assert_eq!(
+            public_dashboard_endpoint(Some("http://127.0.0.1:32805")),
+            "http://127.0.0.1:32805"
+        );
+        assert_eq!(public_dashboard_endpoint(None), "http://127.0.0.1:8080");
     }
 
     #[tokio::test]
