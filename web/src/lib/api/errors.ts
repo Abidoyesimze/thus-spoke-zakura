@@ -43,6 +43,15 @@ function humanise(status: number, message: string): string {
   return message;
 }
 
+/**
+ * 400/422 reject validation or a proposal before broadcasting a new payment.
+ * A retained wallet journal can still preserve the claim, so look up the key
+ * before releasing it. A 409 identifies a conflicting request and is retained.
+ */
+export function isPaymentRejection(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 400 || error.status === 422);
+}
+
 /** Narrows an unknown thrown value to a displayable message. */
 export function errorMessage(error: unknown): string {
   if (error instanceof ApiError) return error.message;

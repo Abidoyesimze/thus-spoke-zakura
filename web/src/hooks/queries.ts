@@ -22,6 +22,7 @@ export const queryKeys = {
   mining: ['mining'] as const,
   accounts: ['accounts'] as const,
   activity: (limit: number) => ['activity', limit] as const,
+  payment: (key: string) => ['activity', 'payment', key] as const,
   blocks: (before?: number) => ['blocks', before ?? 'tip'] as const,
   block: (id: string) => ['block', id] as const,
   transaction: (txid: string) => ['transaction', txid] as const,
@@ -39,6 +40,24 @@ export function useAccounts(): UseQueryResult<Account[]> {
 
 export function useActivity(limit = 30): UseQueryResult<Activity[]> {
   return useQuery({ queryKey: queryKeys.activity(limit), queryFn: () => api.activity(limit) });
+}
+
+export function isTerminalPayment(activity: Activity | null | undefined): boolean {
+  return activity?.status === 'confirmed' || activity?.status === 'failed';
+}
+
+export function usePaymentStatus(key: string, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.payment(key),
+    queryFn: () => api.payment(key),
+    enabled,
+    retry: false,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
+    refetchOnReconnect: true,
+    refetchInterval: (query) => (isTerminalPayment(query.state.data) ? false : 2_000),
+  });
 }
 
 export function useBlocks(before?: number): UseQueryResult<BlockPage> {

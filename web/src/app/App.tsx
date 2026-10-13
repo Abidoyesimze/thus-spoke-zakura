@@ -9,6 +9,7 @@ import { useStatus } from '@/hooks/queries';
 import { Button } from '@/components/ui/Button';
 import { useWalletActions } from '@/features/wallet/wallet-actions-context';
 import { ThemeToggle } from '@/components/ui/ThemeToggle';
+import { PaymentUpdates } from '@/features/wallet/PaymentUpdates';
 
 const TITLES: Record<string, string> = {
   '/wallet': 'Wallet',
@@ -50,6 +51,7 @@ export function App() {
           <div className="w-28 md:hidden">
             <ThemeToggle />
           </div>
+          <PaymentUpdates />
           <Button variant="ghost" onClick={openMine} className="max-sm:hidden">
             <Pickaxe />
             Mine
