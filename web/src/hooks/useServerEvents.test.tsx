@@ -88,6 +88,29 @@ function requestsTo(path: string): number {
 }
 
 describe('useServerEvents', () => {
+  it.each(['resync', 'unknown-topic'])('invalidates all mapped queries on %s', (topic) => {
+    const client = new QueryClient();
+    const invalidate = vi.spyOn(client, 'invalidateQueries');
+    render(
+      <QueryClientProvider client={client}>
+        <Live>{null}</Live>
+      </QueryClientProvider>,
+    );
+    FakeEventSource.current?.emit(topic);
+    expect(invalidate.mock.calls).toEqual([
+      [{ queryKey: ['accounts'] }],
+      [{ queryKey: ['activity'] }],
+      [{ queryKey: ['send-quote'] }],
+      [{ queryKey: ['status'] }],
+      [{ queryKey: ['blocks'] }],
+      [{ queryKey: ['block'] }],
+      [{ queryKey: ['transaction'] }],
+      [{ queryKey: ['address'] }],
+      [{ queryKey: ['status'] }],
+      [{ queryKey: ['mining'] }],
+    ]);
+  });
+
   it('invalidates only mining on a mining update', () => {
     const client = new QueryClient();
     const invalidate = vi.spyOn(client, 'invalidateQueries');

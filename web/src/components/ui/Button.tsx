@@ -13,7 +13,7 @@ const button = cva(
     variants: {
       variant: {
         primary:
-          'xp-face-accent text-accent-ink font-semibold hover:brightness-108 active:brightness-97',
+          'xp-face-accent text-accent-ink font-semibold hover:bg-accent-hover hover:bg-none active:brightness-97',
         ghost: 'xp-face text-ink hover:bg-accent-soft hover:bg-none',
         subtle:
           'xp-face text-ink-muted hover:bg-accent-soft hover:bg-none hover:text-accent-strong',

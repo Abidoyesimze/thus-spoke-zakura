@@ -807,5 +807,5 @@ fn command_label(command: &Command) -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/lifecycle.rs"]
+#[path = "../tests/unit/lifecycle/tests.rs"]
 mod tests;

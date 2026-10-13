@@ -46,6 +46,7 @@ export const activitySchema = z.object({
   txid: z.string(),
   block_hash: z.string().nullable().default(null),
   status: z.string(),
+  last_error: z.string().nullable().default(null),
   created_at: z.string(),
 });
 export type Activity = z.infer<typeof activitySchema>;

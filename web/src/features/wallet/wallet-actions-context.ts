@@ -1,9 +1,10 @@
 import { createContext, use } from 'react';
+import type { PaymentIdentity } from '@/hooks/payment-identity';
 
 export interface WalletActionsApi {
-  openSend: (accountId?: number) => void;
+  openSend: (accountId?: number, draft?: PaymentIdentity) => void;
+  openFaucet: (accountId?: number, draft?: PaymentIdentity) => void;
   openRequest: () => void;
-  openFaucet: (accountId?: number) => void;
   openMine: () => void;
 }
 
