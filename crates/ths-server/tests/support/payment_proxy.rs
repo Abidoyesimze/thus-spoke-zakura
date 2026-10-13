@@ -16,7 +16,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{Notify, oneshot},
+    sync::{Notify, oneshot, watch},
     task::JoinHandle,
 };
 
@@ -97,6 +97,7 @@ impl Drop for ReleaseWithheldResponse {
 #[derive(Default)]
 struct BroadcastState {
     queued: bool,
+    withhold: bool,
     requests: Vec<Vec<u8>>,
     queued_responses: usize,
 }
@@ -105,6 +106,8 @@ struct Shared {
     upstream: String,
     client: Client,
     broadcasts: Mutex<BroadcastState>,
+    pause_subtree_roots: watch::Sender<bool>,
+    subtree_roots_entered: watch::Sender<bool>,
 }
 
 /// Forwards real gRPC streams, substituting only an explicitly armed broadcast response.
@@ -116,6 +119,8 @@ pub struct QueuedBroadcastProxy {
 
 impl QueuedBroadcastProxy {
     pub async fn start(upstream_port: u16) -> Result<Self> {
+        let (pause_subtree_roots, _) = watch::channel(false);
+        let (subtree_roots_entered, _) = watch::channel(false);
         let shared = Arc::new(Shared {
             upstream: format!("http://127.0.0.1:{upstream_port}"),
             client: Client::builder()
@@ -125,6 +130,8 @@ impl QueuedBroadcastProxy {
                 .timeout(Duration::from_secs(120))
                 .build()?,
             broadcasts: Mutex::new(BroadcastState::default()),
+            pause_subtree_roots,
+            subtree_roots_entered,
         });
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let port = listener.local_addr()?.port();
@@ -145,6 +152,37 @@ impl QueuedBroadcastProxy {
 
     pub fn queue_next_broadcast(&self) {
         self.shared.broadcasts.lock().unwrap().queued = true;
+    }
+
+    pub fn withhold_broadcasts(&self, withhold: bool) {
+        self.shared.broadcasts.lock().unwrap().withhold = withhold;
+    }
+
+    pub fn pause_subtree_roots(&self) {
+        self.shared.subtree_roots_entered.send_replace(false);
+        self.shared.pause_subtree_roots.send_replace(true);
+    }
+
+    pub async fn wait_for_paused_subtree_roots(&self) -> Result<()> {
+        let mut entered = self.shared.subtree_roots_entered.subscribe();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !*entered.borrow_and_update() {
+                entered.changed().await?;
+            }
+            Ok::<_, watch::error::RecvError>(())
+        })
+        .await
+        .context("wallet preparation did not reach the subtree-roots pause")??;
+        Ok(())
+    }
+
+    pub fn resume_subtree_roots(&self) {
+        self.shared.pause_subtree_roots.send_replace(false);
+    }
+
+    pub fn broadcast_counts(&self) -> (usize, usize) {
+        let state = self.shared.broadcasts.lock().unwrap();
+        (state.requests.len(), state.queued_responses)
     }
 
     pub fn assert_identical_retry(&self) -> Result<()> {
@@ -170,6 +208,17 @@ impl QueuedBroadcastProxy {
 
 async fn forward_grpc(State(shared): State<Arc<Shared>>, request: Request) -> Response {
     let path = request.uri().path().to_owned();
+    if path.ends_with("/GetSubtreeRoots") {
+        let mut paused = shared.pause_subtree_roots.subscribe();
+        if *paused.borrow_and_update() {
+            shared.subtree_roots_entered.send_replace(true);
+            while *paused.borrow_and_update() {
+                if paused.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
     let (parts, body) = request.into_parts();
     let bytes = match to_bytes(body, MAX_JSON_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -183,7 +232,7 @@ async fn forward_grpc(State(shared): State<Arc<Shared>>, request: Request) -> Re
     let queued = if path.ends_with("/SendTransaction") {
         let mut state = shared.broadcasts.lock().unwrap();
         state.requests.push(bytes.to_vec());
-        if state.queued {
+        if state.queued || state.withhold {
             state.queued = false;
             state.queued_responses += 1;
             true

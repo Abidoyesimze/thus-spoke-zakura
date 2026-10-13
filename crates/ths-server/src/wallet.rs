@@ -76,6 +76,7 @@ mod recovery;
 
 type Db = WalletDb<rusqlite::Connection, LocalNetwork, SystemClock, UnwrapErr<SysRng>>;
 const LIGHTWALLETD_BROADCAST_TIMEOUT: Duration = Duration::from_secs(30);
+const TREASURY_SHIELDING_JOURNAL_ID: &str = "private-treasury-shielding-v1";
 
 pub(crate) fn check_broadcast_response(response: SendResponse) -> Result<()> {
     // Zakura reports AlreadyQueued for a hash already being downloaded. The
@@ -785,6 +786,7 @@ impl RealWallet {
     pub async fn prepare<T, F>(
         &self,
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed_hex: &str,
         from_account: u8,
         source_pool: &str,
@@ -798,6 +800,7 @@ impl RealWallet {
         F: FnOnce(PreparedPayment) -> Result<T> + Send + 'static,
     {
         let activity_id = activity_id.map(str::to_owned);
+        let replacement_txid = replacement_txid.map(str::to_owned);
         let seed_hex = seed_hex.to_owned();
         let source_pool = source_pool.to_owned();
         let destination = destination.to_owned();
@@ -807,6 +810,7 @@ impl RealWallet {
                 db,
                 &account_ids,
                 activity_id.as_deref(),
+                replacement_txid.as_deref(),
                 &seed_hex,
                 from_account,
                 &source_pool,
@@ -824,6 +828,7 @@ impl RealWallet {
         db: &mut Db,
         account_ids: &[AccountUuid],
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed_hex: &str,
         from_account: u8,
         source_pool: &str,
@@ -831,14 +836,19 @@ impl RealWallet {
         amount: u64,
         memo: Option<MemoBytes>,
     ) -> Result<PreparedPayment> {
-        if let Some(activity_id) = activity_id
-            && let Some(prepared) = prepared_payment(db, activity_id)?
-            && (prepared.expiry_height == 0
-                || db
-                    .chain_height()?
-                    .is_none_or(|height| u64::from(u32::from(height)) < prepared.expiry_height))
-        {
-            return Ok(prepared);
+        let journal = activity_id
+            .map(|id| prepared_payment(db, id))
+            .transpose()?
+            .flatten();
+        if let Some(prepared) = journal {
+            if replacement_txid != Some(prepared.txid.as_str()) {
+                return Ok(prepared);
+            }
+        } else {
+            anyhow::ensure!(
+                replacement_txid.is_none(),
+                "replacement authorization has no journal"
+            );
         }
         let (account_index, account_id, params, recipient) =
             Self::send_input(account_ids, from_account, destination)?;
@@ -917,22 +927,54 @@ impl RealWallet {
     }
 
     pub async fn broadcast(&self, raw_transaction: &[u8]) -> Result<()> {
-        let result = self.send_transaction(raw_transaction.to_vec()).await?;
+        self.broadcast_until(
+            raw_transaction,
+            tokio::time::Instant::now() + LIGHTWALLETD_BROADCAST_TIMEOUT,
+        )
+        .await
+    }
+
+    pub(crate) async fn broadcast_until(
+        &self,
+        raw_transaction: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let result = self
+            .send_transaction_until(raw_transaction.to_vec(), deadline)
+            .await?;
         check_broadcast_response(result)
     }
 
-    async fn send_transaction(&self, data: Vec<u8>) -> Result<SendResponse> {
-        tokio::time::timeout(LIGHTWALLETD_BROADCAST_TIMEOUT, async {
-            let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
-            Ok::<_, anyhow::Error>(
-                client
-                    .send_transaction(RawTransaction { data, height: 0 })
-                    .await?
-                    .into_inner(),
-            )
-        })
-        .await
-        .context("lightwalletd transaction broadcast timed out")?
+    async fn send_transaction_until(
+        &self,
+        data: Vec<u8>,
+        deadline: tokio::time::Instant,
+    ) -> Result<SendResponse> {
+        let result = crate::reconcile::within_deadline(
+            deadline,
+            "broadcasting lightwalletd transaction",
+            async {
+                let mut client =
+                    CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
+                Ok::<_, anyhow::Error>(
+                    client
+                        .send_transaction(RawTransaction { data, height: 0 })
+                        .await?
+                        .into_inner(),
+                )
+            },
+        )
+        .await;
+        match result {
+            Err(error)
+                if error
+                    .downcast_ref::<tokio::time::error::Elapsed>()
+                    .is_some() =>
+            {
+                Err(error.context("lightwalletd transaction broadcast timed out"))
+            }
+            result => result,
+        }
     }
 
     /// Returns the exact fee and maximum spendable amount for emptying a pool.
@@ -1060,22 +1102,53 @@ impl RealWallet {
         }
     }
 
-    pub async fn shield_coinbase(
+    pub(crate) async fn prepared_shielding(&self) -> Result<Option<PreparedPayment>> {
+        self.prepared(TREASURY_SHIELDING_JOURNAL_ID).await
+    }
+
+    pub(crate) async fn retire_shielding(&self, txid: &str) -> Result<()> {
+        let txid = txid.to_owned();
+        self.with_db(move |db| {
+            db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                let retired = ext.execute(
+                    "DELETE FROM ext_tsz_prepared_payments WHERE activity_id=?1 AND txid=?2",
+                    rusqlite::params![TREASURY_SHIELDING_JOURNAL_ID, txid],
+                )?;
+                anyhow::ensure!(retired == 1, "shielding journal changed before retirement");
+                Ok(())
+            })
+        })
+        .await
+    }
+
+    pub(crate) async fn prepare_shield_coinbase(
         &self,
         seed_hex: &str,
         treasury_account: u8,
         from: &str,
         to: &str,
         minimum_net: u64,
-    ) -> Result<String> {
+        replacement_txid: Option<&str>,
+    ) -> Result<PreparedPayment> {
         if treasury_account != crate::db::TREASURY_ACCOUNT_ID {
             bail!("coinbase shielding requires the treasury account");
         }
+        let replacement_txid = replacement_txid.map(str::to_owned);
         let seed_hex = seed_hex.to_owned();
         let from = from.to_owned();
         let to = to.to_owned();
         let prepared = self
             .with_db(move |db| {
+                if let Some(prepared) = prepared_payment(db, TREASURY_SHIELDING_JOURNAL_ID)? {
+                    if replacement_txid.as_deref() != Some(prepared.txid.as_str()) {
+                        return Ok(prepared);
+                    }
+                } else {
+                    anyhow::ensure!(
+                        replacement_txid.is_none(),
+                        "shielding replacement authorization has no journal"
+                    );
+                }
                 let params = regtest_network();
                 let from =
                     match Address::decode(&params, &from).context("invalid treasury address")? {
@@ -1126,24 +1199,34 @@ impl RealWallet {
                         .map_err(|_| anyhow::anyhow!("invalid treasury account"))?,
                 )
                 .map_err(|e| anyhow::anyhow!("deriving treasury key: {e:?}"))?;
-                Self::build_and_serialize(
-                    db,
-                    &params,
-                    usk,
-                    &proposal,
-                    "shielding transaction",
-                    "shielding transaction was not stored",
-                )
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|wallet, ext| {
+                    let prepared = Self::build_and_serialize(
+                        wallet,
+                        &params,
+                        usk,
+                        &proposal,
+                        "shielding transaction",
+                        "shielding transaction was not stored",
+                    )?;
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height)
+                         VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(activity_id) DO UPDATE SET
+                           txid=excluded.txid,
+                           raw_transaction=excluded.raw_transaction,
+                           expiry_height=excluded.expiry_height",
+                        rusqlite::params![
+                            TREASURY_SHIELDING_JOURNAL_ID,
+                            prepared.txid,
+                            prepared.raw_transaction,
+                            prepared.expiry_height
+                        ],
+                    )?;
+                    Ok(prepared)
+                })
             })
             .await?;
-        let response = self.send_transaction(prepared.raw_transaction).await?;
-        if response.error_code != 0 {
-            bail!(
-                "lightwalletd rejected shielding: {}",
-                response.error_message
-            );
-        }
-        Ok(prepared.txid)
+        Ok(prepared)
     }
 }
 
@@ -1254,40 +1337,56 @@ mod treasury_sync_tests {
 
     #[tokio::test]
     async fn broadcast_times_out_after_lightwalletd_accepts_the_request() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut connection = h2::server::handshake(socket).await.unwrap();
-            let (request, response) = connection.accept().await.unwrap().unwrap();
-            assert_eq!(
-                request.uri().path(),
-                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
-            );
-            accepted_tx.send(()).unwrap();
-            let _response = response;
-            std::future::pending::<()>().await;
-        });
+        for remaining in [None, Some(Duration::from_secs(2))] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let (request, response) = connection.accept().await.unwrap().unwrap();
+                assert_eq!(
+                    request.uri().path(),
+                    "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction"
+                );
+                accepted_tx.send(()).unwrap();
+                let _response = response;
+                std::future::pending::<()>().await;
+            });
 
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("server.db")).unwrap();
-        store.initialize().unwrap();
-        let mut wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
-        wallet.lightwalletd = endpoint;
-        let broadcast = tokio::spawn(async move { wallet.broadcast(&[1, 2, 3]).await });
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("server.db")).unwrap();
+            store.initialize().unwrap();
+            let mut wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+            wallet.lightwalletd = endpoint;
+            let broadcast = tokio::spawn(async move {
+                match remaining {
+                    Some(budget) => {
+                        wallet
+                            .broadcast_until(&[1, 2, 3], tokio::time::Instant::now() + budget)
+                            .await
+                    }
+                    None => wallet.broadcast(&[1, 2, 3]).await,
+                }
+            });
 
-        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
-            .await
-            .expect("lightwalletd never received the broadcast")
-            .unwrap();
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(31)).await;
-        tokio::task::yield_now().await;
-        assert!(broadcast.is_finished(), "broadcast ignored its deadline");
-        let error = broadcast.await.unwrap().unwrap_err();
-        assert!(error.to_string().contains("timed out"), "{error:#}");
-        server.abort();
+            tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+                .await
+                .expect("lightwalletd never received the broadcast")
+                .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(
+                remaining.unwrap_or(Duration::from_secs(30)) + Duration::from_secs(1),
+            )
+            .await;
+            tokio::task::yield_now().await;
+            assert!(broadcast.is_finished(), "broadcast ignored its deadline");
+            let error = broadcast.await.unwrap().unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{error:#}");
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+            tokio::time::resume();
+        }
     }
 
     #[tokio::test]
@@ -1715,6 +1814,7 @@ mod tests {
         let recovered = wallet
             .prepare(
                 Some("activity-1"),
+                None,
                 "invalid seed",
                 0,
                 "invalid pool",
@@ -1728,6 +1828,256 @@ mod tests {
         assert_eq!(recovered.txid, "txid-1");
         assert_eq!(recovered.raw_transaction, b"signed transaction");
         assert_eq!(recovered.expiry_height, 140);
+    }
+
+    #[tokio::test]
+    async fn scanned_expiry_does_not_authorize_replacing_a_journal() {
+        let test = test_wallet();
+        rusqlite::Connection::open(test.path.join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','original-txid',x'010203',140)", []).unwrap();
+        test.wallet.update_chain_tip(140).await.unwrap();
+        let prepared = test
+            .wallet
+            .prepare(
+                Some("activity-1"),
+                None,
+                "invalid seed",
+                0,
+                "invalid pool",
+                "invalid address",
+                0,
+                None,
+                Ok,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.txid, "original-txid");
+        assert_eq!(prepared.raw_transaction, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn replacement_authorization_requires_the_original_journal() {
+        let test = test_wallet();
+        let error = test
+            .wallet
+            .prepare(
+                Some("missing"),
+                Some("expired-txid"),
+                "invalid seed",
+                0,
+                "invalid pool",
+                "invalid address",
+                0,
+                None,
+                Ok,
+            )
+            .await
+            .err()
+            .expect("replacement must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("replacement authorization has no journal"),
+            "{error:#}"
+        );
+        assert!(test.wallet.prepared("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn replacement_authorization_rechecks_the_journal_inside_the_worker() {
+        let test = test_wallet();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet.with_db(move |db| {
+                    entered.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                        ext.execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','newer-txid',x'040506',140)", [])?;
+                        Ok(())
+                    })
+                }).await
+            })
+        };
+        entered_rx.await.unwrap();
+        let preparing = {
+            let wallet = test.wallet.clone();
+            tokio::spawn(async move {
+                wallet
+                    .prepare(
+                        Some("activity-1"),
+                        Some("expired-txid"),
+                        "invalid seed",
+                        0,
+                        "invalid pool",
+                        "invalid address",
+                        0,
+                        None,
+                        Ok,
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!preparing.is_finished());
+        release.send(()).unwrap();
+        holder.await.unwrap().unwrap();
+        let prepared = preparing.await.unwrap().unwrap();
+        assert_eq!(prepared.txid, "newer-txid");
+        assert_eq!(prepared.raw_transaction, [4, 5, 6]);
+        assert_eq!(
+            test.wallet
+                .prepared("activity-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .txid,
+            "newer-txid"
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_replacement_authorization_keeps_the_journal_after_proposal_failure() {
+        let test = test_wallet();
+        rusqlite::Connection::open(test.path.join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('activity-1','expired-txid',x'010203',140)", []).unwrap();
+        let error = test
+            .wallet
+            .prepare(
+                Some("activity-1"),
+                Some("expired-txid"),
+                "invalid seed",
+                0,
+                "invalid pool",
+                "invalid address",
+                0,
+                None,
+                Ok,
+            )
+            .await
+            .err()
+            .expect("replacement must fail");
+        assert_eq!(error.to_string(), "invalid source account");
+        let journal = test.wallet.prepared("activity-1").await.unwrap().unwrap();
+        assert_eq!(journal.txid, "expired-txid");
+        assert_eq!(journal.raw_transaction, [1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn shielding_scanned_expiry_preserves_retained_signed_bytes_without_authorization() {
+        let test = test_wallet();
+        test.wallet
+            .with_db(|db| {
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'shielding-original',x'010203',140)",
+                        [TREASURY_SHIELDING_JOURNAL_ID],
+                    )?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        test.wallet.update_chain_tip(141).await.unwrap();
+        let prepared = test
+            .wallet
+            .prepare_shield_coinbase(
+                "invalid seed",
+                crate::db::TREASURY_ACCOUNT_ID,
+                "invalid address",
+                "invalid address",
+                1,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.txid, "shielding-original");
+        assert_eq!(prepared.raw_transaction, [1, 2, 3]);
+        assert_eq!(prepared.expiry_height, 140);
+        let retained = test.wallet.prepared_shielding().await.unwrap().unwrap();
+        assert_eq!(retained.txid, prepared.txid);
+        assert_eq!(retained.raw_transaction, prepared.raw_transaction);
+        assert_eq!(retained.expiry_height, prepared.expiry_height);
+    }
+
+    #[tokio::test]
+    async fn shielding_stale_replacement_authorization_returns_the_newer_journal() {
+        let test = test_wallet();
+        test.wallet
+            .with_db(|db| {
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'shielding-newer',x'040506',180)",
+                        [TREASURY_SHIELDING_JOURNAL_ID],
+                    )?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let prepared = test
+            .wallet
+            .prepare_shield_coinbase(
+                "invalid seed",
+                crate::db::TREASURY_ACCOUNT_ID,
+                "invalid address",
+                "invalid address",
+                1,
+                Some("shielding-expired"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.txid, "shielding-newer");
+        assert_eq!(prepared.raw_transaction, [4, 5, 6]);
+        assert_eq!(prepared.expiry_height, 180);
+        let retained = test.wallet.prepared_shielding().await.unwrap().unwrap();
+        assert_eq!(retained.txid, prepared.txid);
+        assert_eq!(retained.raw_transaction, prepared.raw_transaction);
+        assert_eq!(retained.expiry_height, prepared.expiry_height);
+    }
+
+    #[tokio::test]
+    async fn shielding_retirement_cannot_remove_a_newer_journal_or_user_payment() {
+        let test = test_wallet();
+        test.wallet
+            .with_db(|db| {
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|_, ext| {
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'shielding-newer',x'040506',180)",
+                        [TREASURY_SHIELDING_JOURNAL_ID],
+                    )?;
+                    ext.execute(
+                        "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES('user-payment','shielding-newer',x'070809',180)",
+                        [],
+                    )?;
+                    Ok(())
+                })
+            })
+            .await
+            .unwrap();
+        let error = test
+            .wallet
+            .retire_shielding("shielding-expired")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("journal changed before retirement"),
+            "{error:#}"
+        );
+        let retained = test.wallet.prepared_shielding().await.unwrap().unwrap();
+        assert_eq!(retained.txid, "shielding-newer");
+        assert_eq!(retained.raw_transaction, [4, 5, 6]);
+        assert_eq!(retained.expiry_height, 180);
+        test.wallet
+            .retire_shielding("shielding-newer")
+            .await
+            .unwrap();
+        assert!(test.wallet.prepared_shielding().await.unwrap().is_none());
+        let user = test.wallet.prepared("user-payment").await.unwrap().unwrap();
+        assert_eq!(user.txid, "shielding-newer");
+        assert_eq!(user.raw_transaction, [7, 8, 9]);
     }
 
     struct TestWallet {
@@ -1861,6 +2211,7 @@ mod tests {
                         wallet
                             .prepare(
                                 Some(&id),
+                                None,
                                 "invalid seed",
                                 0,
                                 "invalid pool",
@@ -1973,6 +2324,7 @@ mod tests {
             .wallet
             .prepare(
                 Some("activity-1"),
+                None,
                 "invalid seed",
                 0,
                 "invalid pool",
@@ -2005,6 +2357,7 @@ mod tests {
                 wallet
                     .prepare(
                         Some("activity-1"),
+                        None,
                         "invalid seed",
                         0,
                         "invalid pool",
@@ -2038,6 +2391,7 @@ mod tests {
             .wallet
             .prepare(
                 None,
+                None,
                 &test.seed,
                 1,
                 "ironwood",
@@ -2056,6 +2410,7 @@ mod tests {
         let unscanned = test
             .wallet
             .prepare(
+                None,
                 None,
                 &test.seed,
                 1,
@@ -2080,6 +2435,7 @@ mod tests {
             test.wallet
                 .prepare(
                     Some("activity-1"),
+                    None,
                     &test.seed,
                     1,
                     "ironwood",

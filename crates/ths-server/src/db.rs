@@ -235,6 +235,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    #[cfg(test)]
     pub fn unconfirmed_activities(&self) -> Result<Vec<Activity>> {
         let db = self.0.lock().unwrap();
         let mut query = db.prepare(&format!(
@@ -243,6 +244,29 @@ impl Store {
         Ok(query
             .query_map([], row_activity)?
             .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn unconfirmed_legacy_activities(&self) -> Result<Vec<Activity>> {
+        let db = self.0.lock().unwrap();
+        let mut query = db.prepare(&format!(
+            "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.txid!='' AND a.status NOT IN ('confirmed','failed') AND NOT EXISTS (SELECT 1 FROM idempotency i WHERE i.activity_id=a.id) ORDER BY a.rowid ASC"
+        ))?;
+        Ok(query
+            .query_map([], row_activity)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn unconfirmed_legacy_activity(&self, id: &str) -> Result<Option<Activity>> {
+        let db = self.0.lock().unwrap();
+        db.query_row(
+            &format!(
+                "SELECT {ACTIVITY_COLUMNS} FROM activity a WHERE a.id=?1 AND a.txid!='' AND a.status NOT IN ('confirmed','failed') AND NOT EXISTS (SELECT 1 FROM idempotency i WHERE i.activity_id=a.id)"
+            ),
+            [id],
+            row_activity,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn unresolved_activities(&self) -> Result<Vec<ActivityIntent>> {
@@ -279,6 +303,11 @@ impl Store {
     pub fn activity_for_key(&self, key: &str) -> Result<Option<Activity>> {
         let db = self.0.lock().unwrap();
         activity_for_key(&db, key)
+    }
+
+    pub fn activity(&self, id: &str) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        activity_by_id(&db, id).map_err(Into::into)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -481,6 +510,20 @@ impl Store {
         address_by_id(&db, id)
     }
 
+    pub fn clear_address_error(
+        &self,
+        id: &str,
+        expected_status: &str,
+        expected_txid: &str,
+    ) -> Result<AddressFaucet> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE address_faucets SET last_error=NULL WHERE id=?1 AND status=?2 AND txid=?3 AND status IN ('preparing','prepared','broadcast')",
+            params![id, expected_status, expected_txid],
+        )?;
+        address_by_id(&db, id)
+    }
+
     #[cfg_attr(
         not(test),
         expect(
@@ -512,6 +555,20 @@ impl Store {
         db.execute(
             "UPDATE activity SET last_error=?1 WHERE id=?2 AND status=?3 AND txid=?4 AND status NOT IN ('confirmed','failed')",
             params![error, id, status, txid],
+        )?;
+        activity_by_id(&db, id).map_err(Into::into)
+    }
+
+    pub fn clear_error(
+        &self,
+        id: &str,
+        expected_status: &str,
+        expected_txid: &str,
+    ) -> Result<Activity> {
+        let db = self.0.lock().unwrap();
+        db.execute(
+            "UPDATE activity SET last_error=NULL WHERE id=?1 AND status=?2 AND txid=?3 AND status IN ('preparing','prepared','broadcast')",
+            params![id, expected_status, expected_txid],
         )?;
         activity_by_id(&db, id).map_err(Into::into)
     }
@@ -575,7 +632,13 @@ impl Store {
         Ok(activity)
     }
 
+    #[cfg(test)]
     pub fn prepared_transaction(&self, id: &str) -> Result<PreparedTransaction> {
+        self.optional_prepared_transaction(id)?
+            .with_context(|| format!("prepared transaction {id} is missing"))
+    }
+
+    pub fn optional_prepared_transaction(&self, id: &str) -> Result<Option<PreparedTransaction>> {
         self.0
             .lock()
             .unwrap()
@@ -589,9 +652,11 @@ impl Store {
                     })
                 },
             )
-            .with_context(|| format!("prepared transaction {id} is missing"))
+            .optional()
+            .with_context(|| format!("reading prepared transaction {id}"))
     }
 
+    #[cfg(test)]
     pub fn prepared_transaction_expiry(&self, id: &str) -> Result<Option<u64>> {
         self.0
             .lock()
@@ -2324,6 +2389,196 @@ mod tests {
             )
             .unwrap_err();
         assert!(conflict.downcast_ref::<IdempotencyConflict>().is_some());
+    }
+
+    #[test]
+    fn clearing_payment_errors_requires_the_exact_pending_state_and_transaction() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        for status in ["preparing", "prepared", "broadcast"] {
+            let claim = store.claim_faucet(2, "ironwood", 100, status).unwrap();
+            let txid = if status == "preparing" {
+                ""
+            } else {
+                "current-txid"
+            };
+            if status != "preparing" {
+                store
+                    .record_prepared(&claim.id, txid, b"signed bytes", 140)
+                    .unwrap();
+            }
+            if status == "broadcast" {
+                store.mark_broadcast(&claim.id, txid).unwrap();
+            }
+            let saved = store
+                .record_error(&claim.id, status, txid, "current error")
+                .unwrap();
+            let stale_status = if status == "preparing" {
+                "prepared"
+            } else {
+                "preparing"
+            };
+            assert_eq!(
+                store.clear_error(&claim.id, stale_status, txid).unwrap(),
+                saved
+            );
+            assert_eq!(
+                store.clear_error(&claim.id, status, "stale-txid").unwrap(),
+                saved
+            );
+            let cleared = store.clear_error(&claim.id, status, txid).unwrap();
+            assert_eq!(cleared.last_error, None);
+            assert_eq!(
+                (cleared.status.as_str(), cleared.txid.as_str()),
+                (status, txid)
+            );
+            assert_eq!(store.clear_error(&claim.id, status, txid).unwrap(), cleared);
+        }
+        let failed = store
+            .claim_faucet(2, "ironwood", 100, "failed-clear")
+            .unwrap();
+        let failed = store.fail(&failed.id, "terminal failure").unwrap();
+        assert_eq!(store.clear_error(&failed.id, "failed", "").unwrap(), failed);
+        assert_eq!(
+            store.clear_error(&failed.id, "preparing", "").unwrap(),
+            failed
+        );
+
+        let confirmed = store
+            .claim_faucet(2, "ironwood", 100, "confirmed-clear")
+            .unwrap();
+        store
+            .record_prepared(&confirmed.id, "included-txid", b"signed bytes", 140)
+            .unwrap();
+        store
+            .confirm(&confirmed.id, "included-txid", "included-block")
+            .unwrap();
+        // A retained terminal diagnostic must survive an exact-status clear too.
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE activity SET last_error='retained terminal diagnostic' WHERE id=?1",
+                [&confirmed.id],
+            )
+            .unwrap();
+        let confirmed = store.activity_for_key("confirmed-clear").unwrap().unwrap();
+        assert_eq!(
+            store
+                .clear_error(&confirmed.id, "confirmed", "included-txid")
+                .unwrap(),
+            confirmed
+        );
+        assert_eq!(
+            store
+                .clear_error(&confirmed.id, "broadcast", "included-txid")
+                .unwrap(),
+            confirmed
+        );
+    }
+
+    #[test]
+    fn clearing_address_errors_requires_the_exact_pending_state_and_transaction() {
+        let store = Store::open(":memory:").unwrap();
+        store.initialize().unwrap();
+        for status in ["preparing", "prepared", "broadcast"] {
+            let claim = store
+                .claim_address_faucet("external-address", 100, status)
+                .unwrap();
+            let txid = if status == "preparing" {
+                ""
+            } else {
+                "current-txid"
+            };
+            if status != "preparing" {
+                store
+                    .record_address_prepared(&claim.id, txid, b"signed bytes", 140)
+                    .unwrap();
+            }
+            if status == "broadcast" {
+                store.mark_address_broadcast(&claim.id, txid).unwrap();
+            }
+            let saved = store
+                .record_address_error(&claim.id, status, txid, "current error")
+                .unwrap();
+            let stale_status = if status == "preparing" {
+                "prepared"
+            } else {
+                "preparing"
+            };
+            assert_eq!(
+                store
+                    .clear_address_error(&claim.id, stale_status, txid)
+                    .unwrap(),
+                saved
+            );
+            assert_eq!(
+                store
+                    .clear_address_error(&claim.id, status, "stale-txid")
+                    .unwrap(),
+                saved
+            );
+            let cleared = store.clear_address_error(&claim.id, status, txid).unwrap();
+            assert_eq!(cleared.last_error, None);
+            assert_eq!(
+                (cleared.status.as_str(), cleared.txid.as_str()),
+                (status, txid)
+            );
+            assert_eq!(
+                store.clear_address_error(&claim.id, status, txid).unwrap(),
+                cleared
+            );
+        }
+        let failed = store
+            .claim_address_faucet("external-address", 100, "failed-clear")
+            .unwrap();
+        let failed = store.fail_address(&failed.id, "terminal failure").unwrap();
+        assert_eq!(
+            store.clear_address_error(&failed.id, "failed", "").unwrap(),
+            failed
+        );
+        assert_eq!(
+            store
+                .clear_address_error(&failed.id, "preparing", "")
+                .unwrap(),
+            failed
+        );
+
+        let confirmed = store
+            .claim_address_faucet("external-address", 100, "confirmed-clear")
+            .unwrap();
+        store
+            .record_address_prepared(&confirmed.id, "included-txid", b"signed bytes", 140)
+            .unwrap();
+        store
+            .confirm_address(&confirmed.id, "included-txid", "included-block")
+            .unwrap();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE address_faucets SET last_error='retained terminal diagnostic' WHERE id=?1",
+                [&confirmed.id],
+            )
+            .unwrap();
+        let confirmed = store
+            .address_faucet_for_key("confirmed-clear")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .clear_address_error(&confirmed.id, "confirmed", "included-txid")
+                .unwrap(),
+            confirmed
+        );
+        assert_eq!(
+            store
+                .clear_address_error(&confirmed.id, "broadcast", "included-txid")
+                .unwrap(),
+            confirmed
+        );
     }
 
     #[test]

@@ -220,13 +220,14 @@ where
 }
 
 async fn start_and_sync(state: api::AppState) -> Result<()> {
+    let already_provisioned = api::initial_balance_provisioned(&state)?;
     // Network stages have their own deadlines. Await provisioning to completion
     // so its payment guards remain owned while a wallet worker is running.
     retry_startup(|| async {
         api::dependencies_ready(&state)
             .await
             .context("waiting for startup dependencies")?;
-        api::provision_initial_balance(&state)
+        api::provision_initial_balance_with_history(&state, already_provisioned)
             .await
             .context("provisioning Account 1 with 5 Ironwood ZEC")
     })
@@ -288,6 +289,12 @@ mod tests {
                     assert!(stream.read_buf(&mut request).await.unwrap() > 0);
                     if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
                         let headers = std::str::from_utf8(&request[..end]).unwrap();
+                        if headers.starts_with("HEAD ") {
+                            // Local health probes can connect to ephemeral test ports.
+                            stream = listener.accept().await.unwrap().0;
+                            request.clear();
+                            continue;
+                        }
                         let length: usize = headers
                             .lines()
                             .filter_map(|line| line.split_once(':'))

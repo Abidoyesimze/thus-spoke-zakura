@@ -13,7 +13,10 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     handler::HandlerWithoutStateExt,
-    http::{HeaderMap, StatusCode, Uri, header::HOST},
+    http::{
+        HeaderMap, HeaderValue, StatusCode, Uri,
+        header::{HOST, LOCATION},
+    },
     response::{
         Html, IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -139,6 +142,111 @@ fn wallet_matches_tip(wallet: &WalletSyncStatus, tip: &ChainCheckpoint) -> bool 
                 && wallet.observed_hash.as_deref() == Some(&tip.hash)))
 }
 
+struct PaymentAttempt<'a> {
+    state: &'a AppState,
+    dispatch_deadline: Option<Instant>,
+}
+
+impl PaymentAttempt<'_> {
+    fn check_can_start(&self) -> anyhow::Result<()> {
+        if let Some(deadline) = self.dispatch_deadline {
+            crate::reconcile::check_deadline(deadline)?;
+        }
+        Ok(())
+    }
+
+    fn network_deadline(&self, stage_limit: Duration) -> Instant {
+        let stage_deadline = Instant::now() + stage_limit;
+        self.dispatch_deadline
+            .map_or(stage_deadline, |deadline| deadline.min(stage_deadline))
+    }
+
+    async fn network<T, E>(
+        &self,
+        stage_limit: Duration,
+        label: &str,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> anyhow::Result<T>
+    where
+        E: Into<anyhow::Error>,
+    {
+        self.check_can_start()?;
+        crate::reconcile::within_deadline(self.network_deadline(stage_limit), label, future).await
+    }
+
+    async fn lock<'a>(
+        &self,
+        mutex: &'a Mutex<()>,
+    ) -> anyhow::Result<tokio::sync::MutexGuard<'a, ()>> {
+        self.check_can_start()?;
+        match self.dispatch_deadline {
+            Some(deadline) => Ok(tokio::time::timeout_at(deadline, mutex.lock()).await?),
+            None => Ok(mutex.lock().await),
+        }
+    }
+
+    async fn lookup_transaction(&self, txid: &str) -> anyhow::Result<Option<Value>> {
+        let limit = if self.dispatch_deadline.is_some() {
+            PAYMENT_LOOKUP_TIMEOUT
+        } else {
+            Duration::from_secs(30)
+        };
+        self.network(
+            limit,
+            "looking up payment transaction",
+            self.state.0.rpc.lookup_transaction(txid),
+        )
+        .await
+    }
+
+    async fn synchronize_wallet(&self, height: Option<u64>) -> anyhow::Result<()> {
+        self.check_can_start()?;
+        self.state
+            .synchronize_wallet_until(height, self.network_deadline(Duration::from_secs(120)))
+            .await
+    }
+
+    async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<Vec<String>> {
+        self.check_can_start()?;
+        let hashes = if self.dispatch_deadline.is_none() {
+            self.state
+                .0
+                .rpc
+                .generate(blocks)
+                .await
+                .context("automatically mining payment blocks")?
+        } else {
+            self.network(
+                Duration::from_secs(3600),
+                "automatically mining payment blocks",
+                self.state.0.rpc.generate(blocks),
+            )
+            .await?
+        };
+        let tip_hash = hashes
+            .last()
+            .context("Zakura did not return the mined block hash")?;
+        let block = self
+            .network(
+                Duration::from_secs(30),
+                "reading automatically mined block",
+                self.state.0.rpc.block(tip_hash),
+            )
+            .await?;
+        let height = block
+            .get("height")
+            .and_then(Value::as_u64)
+            .context("Zakura mined block omitted its height")?;
+        self.synchronize_wallet(Some(height))
+            .await
+            .context("synchronizing automatically mined payment blocks")?;
+        // Automatic mining moves the chain for every dashboard, including
+        // clients that did not initiate this payment.
+        notify(self.state, "chain");
+        Ok(hashes)
+    }
+}
+
 impl AppState {
     pub fn new(store: Store, wallet: RealWallet, rpc: String, instance: String) -> Self {
         let (events, _) = broadcast::channel(128);
@@ -226,7 +334,8 @@ impl AppState {
                 );
             }
             crate::reconcile::sync_wallet(&self.0.wallet, &self.0.rpc, &target, deadline).await?;
-            self.refresh_wallet_snapshot(&target).await
+            self.refresh_wallet_snapshot_until(&target, Some(deadline))
+                .await
         }
         .await;
 
@@ -243,14 +352,37 @@ impl AppState {
         self.synchronize_wallet(None).await
     }
 
+    #[cfg(test)]
     async fn refresh_wallet_snapshot(&self, target: &ChainCheckpoint) -> anyhow::Result<()> {
+        self.refresh_wallet_snapshot_until(target, None).await
+    }
+
+    async fn refresh_wallet_snapshot_until(
+        &self,
+        target: &ChainCheckpoint,
+        deadline: Option<Instant>,
+    ) -> anyhow::Result<()> {
+        let attempt = PaymentAttempt {
+            state: self,
+            dispatch_deadline: deadline,
+        };
         let mut accounts = self.0.store.accounts()?;
         self.0.wallet.apply_balances(&mut accounts).await?;
         let scanned = self.0.wallet.scanned_checkpoint().await?;
         let rpc = &self.0.rpc;
-        let observed = rpc.checkpoint().await?;
+        let observed = attempt
+            .network(
+                Duration::from_secs(30),
+                "reading wallet snapshot checkpoint",
+                rpc.checkpoint(),
+            )
+            .await?;
         let publishable = scan_is_publishable(scanned.as_ref(), target, &observed, |height| {
-            rpc.block_hash(height)
+            attempt.network(
+                Duration::from_secs(30),
+                "validating wallet snapshot checkpoint",
+                rpc.block_hash(height),
+            )
         })
         .await?;
         if !publishable {
@@ -346,146 +478,271 @@ const PAYMENT_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const PAYMENT_DISPATCH_BUDGET: Duration = Duration::from_secs(10);
 const PAYMENT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
-async fn bounded_payment_chain_info(state: &AppState) -> anyhow::Result<ChainInfo> {
-    bounded_payment_chain_info_until(state, Instant::now() + PAYMENT_LOOKUP_TIMEOUT).await
+#[derive(Clone, Copy, Default)]
+enum PaymentCollection {
+    #[default]
+    Activity,
+    Address,
 }
 
-async fn bounded_payment_chain_info_until(
-    state: &AppState,
-    deadline: Instant,
-) -> anyhow::Result<ChainInfo> {
-    let lookup_deadline = deadline.min(Instant::now() + PAYMENT_LOOKUP_TIMEOUT);
-    tokio::time::timeout_at(lookup_deadline, state.0.rpc.chain_info())
-        .await
-        .context("payment progression chain lookup timed out")?
+#[derive(Default)]
+struct PaymentTraversal {
+    activity_cursor: Option<String>,
+    address_cursor: Option<String>,
+    next_collection: PaymentCollection,
 }
 
-async fn bounded_payment_transaction_known(state: &AppState, txid: &str) -> anyhow::Result<bool> {
-    tokio::time::timeout(PAYMENT_LOOKUP_TIMEOUT, state.0.rpc.transaction_known(txid))
-        .await
-        .context("payment progression transaction lookup timed out")?
+enum ActivityRecovery {
+    Intent(crate::db::ActivityIntent),
+    Legacy(Activity),
+}
+
+impl ActivityRecovery {
+    fn id(&self) -> &str {
+        match self {
+            Self::Intent(intent) => &intent.activity.id,
+            Self::Legacy(activity) => &activity.id,
+        }
+    }
 }
 
 pub async fn payment_confirmation_loop(state: AppState) {
-    let mut cursor = None;
-    let mut activity_cursor = None;
-    let mut address_cursor = None;
+    let mut traversal = PaymentTraversal::default();
     let mut interval = tokio::time::interval(PAYMENT_RETRY_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
         let deadline = Instant::now() + PAYMENT_DISPATCH_BUDGET;
         if state.started()
-            && let Err(error) = progress_payment_intents(
-                &state,
-                deadline,
-                &mut activity_cursor,
-                &mut address_cursor,
-            )
-            .await
+            && let Err(error) =
+                progress_payment_intents_with_traversal(&state, deadline, &mut traversal).await
         {
             tracing::warn!(
                 error = %format_args!("{error:#}"),
                 "background payment progression failed"
             );
         }
-        let rpc = &state.0.rpc;
-        match reconcile_unconfirmed_with(&state.0.store, &mut cursor, deadline, |txid| async move {
-            rpc.lookup_transaction(&txid).await
-        })
-        .await
-        {
-            Ok(true) => notify(&state, "wallet"),
-            Ok(false) => {}
-            Err(error) => tracing::warn!(
-                error = %format_args!("{error:#}"),
-                "background payment confirmation failed"
-            ),
-        }
     }
 }
 
+#[cfg(test)]
 async fn progress_payment_intents(
     state: &AppState,
     deadline: Instant,
     activity_cursor: &mut Option<String>,
     address_cursor: &mut Option<String>,
 ) -> anyhow::Result<()> {
-    let mut activities = state.0.store.unresolved_activities()?;
-    activities.sort_by(|left, right| left.activity.id.cmp(&right.activity.id));
+    let mut traversal = PaymentTraversal {
+        activity_cursor: activity_cursor.take(),
+        address_cursor: address_cursor.take(),
+        next_collection: PaymentCollection::Activity,
+    };
+    let result = progress_payment_intents_with_traversal(state, deadline, &mut traversal).await;
+    *activity_cursor = traversal.activity_cursor;
+    *address_cursor = traversal.address_cursor;
+    result
+}
+
+async fn progress_payment_intents_with_traversal(
+    state: &AppState,
+    deadline: Instant,
+    traversal: &mut PaymentTraversal,
+) -> anyhow::Result<()> {
+    let attempt = PaymentAttempt {
+        state,
+        dispatch_deadline: Some(deadline),
+    };
+    let mut activities: Vec<_> = state
+        .0
+        .store
+        .unresolved_activities()?
+        .into_iter()
+        .map(ActivityRecovery::Intent)
+        .collect();
+    activities.extend(
+        state
+            .0
+            .store
+            .unconfirmed_legacy_activities()?
+            .into_iter()
+            .map(ActivityRecovery::Legacy),
+    );
+    activities.sort_by(|left, right| left.id().cmp(right.id()));
     let mut address_faucets = state.0.store.unresolved_address_faucets()?;
     address_faucets.sort_by(|left, right| left.payment.id.cmp(&right.payment.id));
-    if activities.is_empty() {
-        *activity_cursor = None;
-    }
-    if address_faucets.is_empty() {
-        *address_cursor = None;
-    }
-    let activity_start = activity_cursor.as_ref().map_or(0, |id| {
-        activities.partition_point(|intent| intent.activity.id.as_str() <= id.as_str())
+    let activity_start = traversal.activity_cursor.as_ref().map_or(0, |id| {
+        activities.partition_point(|activity| activity.id() <= id.as_str())
             % activities.len().max(1)
     });
-    let address_start = address_cursor.as_ref().map_or(0, |id| {
+    let address_start = traversal.address_cursor.as_ref().map_or(0, |id| {
         address_faucets.partition_point(|intent| intent.payment.id.as_str() <= id.as_str())
             % address_faucets.len().max(1)
     });
-
-    // Alternate between the internal and external queues. A slow internal
-    // lookup must not consume the whole dispatch budget before external
-    // faucets get a turn.
-    for offset in 0..activities.len().max(address_faucets.len()) {
+    let mut activity_offset = 0;
+    let mut address_offset = 0;
+    while activity_offset < activities.len() || address_offset < address_faucets.len() {
         if Instant::now() >= deadline {
             break;
         }
-        if offset < activities.len()
-            && let Some(intent) = activities.get((activity_start + offset) % activities.len())
-        {
-            let _payment = state.0.payments.lock().await;
-            if Instant::now() >= deadline {
-                break;
+        let collection = match traversal.next_collection {
+            PaymentCollection::Activity if activity_offset < activities.len() => {
+                PaymentCollection::Activity
             }
-            *activity_cursor = Some(intent.activity.id.clone());
-            if let Some(activity) = state.0.store.activity_for_key(&intent.key)?
-                && !matches!(activity.status.as_str(), "confirmed" | "failed")
-                && let Err(error) =
-                    progress_activity_until(state, intent, activity.clone(), deadline).await
-            {
-                // Progression may have persisted one or more state changes
-                // before failing. Reload before applying the guarded error
-                // update so it is associated with the current state and txid.
-                record_current_activity_error(&state.0.store, &intent.key, &error.to_string())?;
-                tracing::warn!(
-                    error = %format_args!("{error:#}"),
-                    activity = %activity.id,
-                    "accepted payment remains pending"
-                );
+            PaymentCollection::Address if address_offset < address_faucets.len() => {
+                PaymentCollection::Address
+            }
+            _ if activity_offset < activities.len() => PaymentCollection::Activity,
+            _ => PaymentCollection::Address,
+        };
+        match collection {
+            PaymentCollection::Activity => {
+                let activity = &activities[(activity_start + activity_offset) % activities.len()];
+                activity_offset += 1;
+                // Persist the resume point before lock or execution waits, including
+                // an attempt that uses the rest of this pass's dispatch budget.
+                traversal.activity_cursor = Some(activity.id().to_owned());
+                traversal.next_collection = PaymentCollection::Address;
+                let mut observed = match activity {
+                    ActivityRecovery::Intent(intent) => intent.activity.clone(),
+                    ActivityRecovery::Legacy(legacy) => legacy.clone(),
+                };
+                let result: anyhow::Result<()> = async {
+                    let _payment = attempt.lock(&state.0.payments).await?;
+                    attempt.check_can_start()?;
+                    match activity {
+                        ActivityRecovery::Intent(intent) => {
+                            if let Some(current) = state.0.store.activity_for_key(&intent.key)?
+                                && !matches!(current.status.as_str(), "confirmed" | "failed")
+                            {
+                                observed = current.clone();
+                                progress_activity_until(state, intent, current, deadline).await?;
+                            }
+                        }
+                        ActivityRecovery::Legacy(legacy) => {
+                            if let Some(current) =
+                                state.0.store.unconfirmed_legacy_activity(&legacy.id)?
+                            {
+                                observed = current.clone();
+                                confirm_from_chain_with_attempt(&attempt, current).await?;
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    let error_message = format!("{error:#}");
+                    let persistence = match activity {
+                        ActivityRecovery::Intent(intent) => record_current_activity_error(
+                            &state.0.store,
+                            &intent.key,
+                            &error_message,
+                        ),
+                        ActivityRecovery::Legacy(legacy) => record_current_legacy_activity_error(
+                            &state.0.store,
+                            &legacy.id,
+                            &error_message,
+                        ),
+                    };
+                    if let Err(persistence_error) = persistence {
+                        tracing::warn!(
+                            error = %format_args!("{persistence_error:#}"),
+                            execution_error = %error_message,
+                            activity = %activity.id(),
+                            "could not record pending payment error"
+                        );
+                    }
+                    tracing::warn!(
+                        error = %error_message,
+                        activity = %activity.id(),
+                        "accepted payment remains pending"
+                    );
+                }
+                if let Err(error) = notify_activity_change(state, &observed) {
+                    tracing::warn!(
+                        error = %format_args!("{error:#}"),
+                        activity = %activity.id(),
+                        "could not reload payment after progression"
+                    );
+                }
+            }
+            PaymentCollection::Address => {
+                let intent =
+                    &address_faucets[(address_start + address_offset) % address_faucets.len()];
+                address_offset += 1;
+                traversal.address_cursor = Some(intent.payment.id.clone());
+                traversal.next_collection = PaymentCollection::Activity;
+                let mut observed = intent.payment.clone();
+                let result: anyhow::Result<()> = async {
+                    let _payment = attempt.lock(&state.0.payments).await?;
+                    attempt.check_can_start()?;
+                    if let Some(current) = state.0.store.address_faucet_for_key(&intent.key)?
+                        && !matches!(current.status.as_str(), "confirmed" | "failed")
+                    {
+                        observed = current.clone();
+                        progress_address_faucet(state, current, deadline).await?;
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = result {
+                    let error_message = format!("{error:#}");
+                    if let Err(persistence_error) =
+                        record_current_address_error(&state.0.store, &intent.key, &error_message)
+                    {
+                        tracing::warn!(
+                            error = %format_args!("{persistence_error:#}"),
+                            execution_error = %error_message,
+                            payment = %intent.payment.id,
+                            "could not record pending address faucet error"
+                        );
+                    }
+                    tracing::warn!(
+                        error = %error_message,
+                        payment = %intent.payment.id,
+                        "accepted address faucet remains pending"
+                    );
+                }
+                if let Err(error) = notify_address_change(state, &intent.key, &observed) {
+                    tracing::warn!(
+                        error = %format_args!("{error:#}"),
+                        payment = %intent.payment.id,
+                        "could not reload address faucet after progression"
+                    );
+                }
             }
         }
+    }
+    Ok(())
+}
 
-        if Instant::now() >= deadline {
-            break;
-        }
-        if offset < address_faucets.len()
-            && let Some(intent) =
-                address_faucets.get((address_start + offset) % address_faucets.len())
-        {
-            let _payment = state.0.payments.lock().await;
-            if Instant::now() >= deadline {
-                break;
-            }
-            *address_cursor = Some(intent.payment.id.clone());
-            if let Some(payment) = state.0.store.address_faucet_for_key(&intent.key)?
-                && !matches!(payment.status.as_str(), "confirmed" | "failed")
-                && let Err(error) = progress_address_faucet(state, payment.clone(), deadline).await
-            {
-                record_current_address_error(&state.0.store, &intent.key, &error.to_string())?;
-                tracing::warn!(
-                    error = %format_args!("{error:#}"),
-                    payment = %payment.id,
-                    "accepted address faucet remains pending"
-                );
-            }
-        }
+fn notify_activity_change(state: &AppState, previous: &Activity) -> anyhow::Result<()> {
+    let current = state.0.store.activity(&previous.id)?;
+    if current != *previous {
+        notify(state, "wallet");
+    }
+    Ok(())
+}
+
+fn notify_address_change(
+    state: &AppState,
+    key: &str,
+    previous: &AddressFaucet,
+) -> anyhow::Result<()> {
+    let current = state.0.store.address_faucet_for_key(key)?;
+    if current.as_ref() != Some(previous) {
+        notify(state, "wallet");
+    }
+    Ok(())
+}
+
+fn record_current_legacy_activity_error(
+    store: &Store,
+    id: &str,
+    error: &str,
+) -> anyhow::Result<()> {
+    if let Some(current) = store.unconfirmed_legacy_activity(id)? {
+        store.record_error(&current.id, &current.status, &current.txid, error)?;
     }
     Ok(())
 }
@@ -522,52 +779,26 @@ async fn progress_activity(
 async fn progress_activity_until(
     state: &AppState,
     intent: &crate::db::ActivityIntent,
-    mut activity: Activity,
+    activity: Activity,
     deadline: Instant,
 ) -> anyhow::Result<()> {
-    loop {
-        match activity.status.as_str() {
-            "confirmed" | "failed" => return Ok(()),
-            "prepared" | "broadcast" => {
-                match submit_prepared(&state.0.store, state, &activity).await? {
-                    PreparedSubmission::Broadcast(updated) => {
-                        let _ = confirm_after_mining(state, updated).await?;
-                        return Ok(());
-                    }
-                    PreparedSubmission::Expired(updated) => activity = updated,
-                }
-            }
-            "preparing" => {
-                if let Some(prepared) = repair_activity_journal(state, &activity, deadline).await? {
-                    activity = state.0.store.record_prepared(
-                        &activity.id,
-                        &prepared.txid,
-                        &prepared.raw_transaction,
-                        prepared.expiry_height,
-                    )?;
-                    continue;
-                }
-                let prepared = match prepare_activity_intent(state, intent, deadline).await {
-                    Ok(prepared) => prepared,
-                    Err(error) if is_insufficient_funds(&error) && activity.kind == "send" => {
-                        if can_fail_insufficient_send(state, &activity.id).await {
-                            state.0.store.fail(&activity.id, &error.to_string())?;
-                            return Ok(());
-                        }
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                };
-                activity = state.0.store.record_prepared(
-                    &activity.id,
-                    &prepared.txid,
-                    &prepared.raw_transaction,
-                    prepared.expiry_height,
-                )?;
-            }
-            status => anyhow::bail!("payment has unsupported status {status}"),
-        }
-    }
+    let attempt = PaymentAttempt {
+        state,
+        dispatch_deadline: Some(deadline),
+    };
+    execute_activity_intent(&attempt, intent, activity).await?;
+    Ok(())
+}
+
+async fn execute_activity_intent(
+    attempt: &PaymentAttempt<'_>,
+    intent: &crate::db::ActivityIntent,
+    activity: Activity,
+) -> anyhow::Result<Activity> {
+    execute_payment(attempt, activity, |_, replacement_txid| async move {
+        prepare_activity_intent(attempt, intent, replacement_txid.as_deref()).await
+    })
+    .await
 }
 
 fn is_insufficient_funds(error: &anyhow::Error) -> bool {
@@ -577,65 +808,148 @@ fn is_insufficient_funds(error: &anyhow::Error) -> bool {
     )
 }
 
-async fn can_fail_insufficient_send(state: &AppState, activity_id: &str) -> bool {
-    // The caller holds the payment mutex. Reading the wallet journal also
-    // waits behind any preparation worker that already owns the wallet DB.
-    let wallet_prepared = match state.0.wallet.prepared(activity_id).await {
-        Ok(prepared) => prepared,
-        Err(_) => return false,
-    };
-    let store_expiry = match state.0.store.prepared_transaction_expiry(activity_id) {
-        Ok(expiry) => expiry,
-        Err(_) => return false,
-    };
-    match wallet_prepared {
-        None => store_expiry.is_none(),
-        Some(prepared) if prepared.expiry_height != 0 => {
-            let current_height = match bounded_payment_chain_info(state).await {
-                Ok(info) => info.blocks,
-                Err(_) => return false,
-            };
-            if current_height < prepared.expiry_height
-                || store_expiry.is_some_and(|expiry| expiry == 0 || current_height < expiry)
-            {
-                return false;
-            }
-            matches!(
-                bounded_payment_transaction_known(state, &prepared.txid).await,
-                Ok(false)
-            )
-        }
-        Some(_) => false,
+#[cfg(test)]
+async fn can_fail_insufficient_send(state: &AppState, activity_id: &str) -> anyhow::Result<bool> {
+    can_fail_insufficient_send_with_attempt(
+        &PaymentAttempt {
+            state,
+            dispatch_deadline: None,
+        },
+        activity_id,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn can_fail_insufficient_send_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    activity_id: &str,
+) -> anyhow::Result<bool> {
+    can_fail_insufficient_send_after_preparation(attempt, activity_id, None).await
+}
+
+async fn can_fail_insufficient_send_after_preparation(
+    attempt: &PaymentAttempt<'_>,
+    activity_id: &str,
+    replacement_txid: Option<&str>,
+) -> anyhow::Result<bool> {
+    let state = attempt.state;
+    // Preparation has completed while the caller still owns the payment mutex.
+    // Local reads may finish beyond the dispatch budget; new RPC waits may not.
+    let wallet_prepared = state.0.wallet.prepared(activity_id).await?;
+    let current = state.0.store.activity(activity_id)?;
+    let server_prepared = state.0.store.optional_prepared_transaction(activity_id)?;
+    if current.kind != "send" || matches!(current.status.as_str(), "confirmed" | "failed") {
+        return Ok(false);
     }
+    if let (Some(wallet), Some(server)) = (&wallet_prepared, &server_prepared) {
+        anyhow::ensure!(
+            wallet.raw_transaction == server.raw_transaction
+                && wallet.expiry_height == server.expiry_height
+                && (current.txid.is_empty() || current.txid == wallet.txid),
+            "payment {activity_id} has inconsistent wallet and server preparations"
+        );
+    }
+    if let Some(wallet) = &wallet_prepared {
+        anyhow::ensure!(
+            current.txid.is_empty() || current.txid == wallet.txid,
+            "payment {activity_id} wallet journal disagrees with its current transaction"
+        );
+    }
+    if current.status != "preparing" || !current.txid.is_empty() {
+        return Ok(false);
+    }
+    let Some(prepared) = wallet_prepared else {
+        anyhow::ensure!(
+            server_prepared.is_none(),
+            "payment {activity_id} has a server preparation without a wallet journal"
+        );
+        anyhow::ensure!(
+            replacement_txid.is_none(),
+            "payment {activity_id} lost its authorized original wallet journal"
+        );
+        return Ok(true);
+    };
+    anyhow::ensure!(
+        !prepared.txid.is_empty(),
+        "payment {activity_id} has an empty wallet preparation txid"
+    );
+    match original_transaction_state(attempt, &prepared.txid, prepared.expiry_height).await? {
+        OriginalTransactionState::Included(hash) => {
+            let repaired = state.0.store.record_prepared(
+                activity_id,
+                &prepared.txid,
+                &prepared.raw_transaction,
+                prepared.expiry_height,
+            )?;
+            state.0.store.confirm(&repaired.id, &prepared.txid, &hash)?;
+            return Ok(false);
+        }
+        OriginalTransactionState::Expired => {}
+        OriginalTransactionState::Missing | OriginalTransactionState::Present => return Ok(false),
+    }
+    anyhow::ensure!(
+        server_prepared.is_none(),
+        "payment {activity_id} is preparing with an unexpected server preparation"
+    );
+    let Some(replacement_txid) = replacement_txid else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        replacement_txid == prepared.txid,
+        "payment {activity_id} wallet journal changed from its authorized original"
+    );
+
+    // Reprove nonpayment above, then reread both stores so a committed replacement
+    // or changed operation cannot inherit the original's terminal-failure decision.
+    let latest_wallet = state.0.wallet.prepared(activity_id).await?;
+    let latest = state.0.store.activity(activity_id)?;
+    let latest_server = state.0.store.optional_prepared_transaction(activity_id)?;
+    if latest.kind != "send" || latest.status != "preparing" || !latest.txid.is_empty() {
+        return Ok(false);
+    }
+    anyhow::ensure!(
+        latest_server.is_none(),
+        "payment {activity_id} acquired a server preparation after original reconciliation"
+    );
+    let latest_wallet = latest_wallet
+        .with_context(|| format!("payment {activity_id} lost its original wallet journal"))?;
+    anyhow::ensure!(
+        latest_wallet.txid == prepared.txid
+            && latest_wallet.raw_transaction == prepared.raw_transaction
+            && latest_wallet.expiry_height == prepared.expiry_height,
+        "payment {activity_id} wallet preparation changed after original reconciliation"
+    );
+    Ok(true)
 }
 
 async fn repair_activity_journal(
     state: &AppState,
     activity: &Activity,
-    deadline: Instant,
-) -> anyhow::Result<Option<PreparedPayment>> {
+) -> anyhow::Result<Option<Activity>> {
     let Some(prepared) = state.0.wallet.prepared(&activity.id).await? else {
         return Ok(None);
     };
-    if prepared.expiry_height == 0
-        || bounded_payment_chain_info_until(state, deadline)
-            .await?
-            .blocks
-            < prepared.expiry_height
-    {
-        return Ok(Some(prepared));
-    }
-    Ok(None)
+    let repaired = state.0.store.record_prepared(
+        &activity.id,
+        &prepared.txid,
+        &prepared.raw_transaction,
+        prepared.expiry_height,
+    )?;
+    Ok(Some(repaired))
 }
 
 async fn prepare_activity_intent(
-    state: &AppState,
+    attempt: &PaymentAttempt<'_>,
     intent: &crate::db::ActivityIntent,
-    deadline: Instant,
+    replacement_txid: Option<&str>,
 ) -> anyhow::Result<PreparedPayment> {
+    let state = attempt.state;
     let activity = &intent.activity;
-    let sync_deadline = (Instant::now() + PAYMENT_LOOKUP_TIMEOUT).min(deadline);
-    state.synchronize_wallet_until(None, sync_deadline).await?;
+    attempt
+        .synchronize_wallet(None)
+        .await
+        .context("synchronizing wallet for payment preparation")?;
     let seed = state.0.store.seed()?;
     let record = record_prepared_payment(&state.0.store, &activity.id);
     match activity.kind.as_str() {
@@ -658,11 +972,13 @@ async fn prepare_activity_intent(
             };
             let memo = parse_memo(intent.memo.as_deref(), &activity.destination_pool)
                 .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+            attempt.check_can_start()?;
             state
                 .0
                 .wallet
                 .prepare(
                     Some(&activity.id),
+                    replacement_txid,
                     &seed,
                     account_id,
                     &activity.source_pool,
@@ -685,10 +1001,11 @@ async fn prepare_activity_intent(
                 "ironwood" => destination.unified_address,
                 pool => anyhow::bail!("faucet has unsupported destination pool {pool}"),
             };
-            let _replenishment = state.0.treasury_replenishment.lock().await;
+            let _replenishment = attempt.lock(&state.0.treasury_replenishment).await?;
             prepare_with_replenishment(
-                state,
+                attempt,
                 Some(&activity.id),
+                replacement_txid,
                 &seed,
                 &account,
                 &address,
@@ -703,46 +1020,68 @@ async fn prepare_activity_intent(
 
 async fn progress_address_faucet(
     state: &AppState,
-    mut payment: AddressFaucet,
+    payment: AddressFaucet,
     deadline: Instant,
 ) -> anyhow::Result<()> {
+    execute_address_payment(
+        &PaymentAttempt {
+            state,
+            dispatch_deadline: Some(deadline),
+        },
+        payment,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn execute_address_payment(
+    attempt: &PaymentAttempt<'_>,
+    mut payment: AddressFaucet,
+) -> anyhow::Result<AddressFaucet> {
+    let state = attempt.state;
+    let mut replacement_txid = None;
     loop {
+        attempt.check_can_start()?;
         match payment.status.as_str() {
-            "confirmed" | "failed" => return Ok(()),
+            "confirmed" | "failed" => return Ok(payment),
             "prepared" | "broadcast" => {
-                match submit_address_prepared(&state.0.store, state, &payment).await? {
+                match submit_address_prepared(&state.0.store, attempt, &payment).await? {
                     AddressSubmission::Broadcast(updated) => {
-                        let _ = confirm_address_after_mining(state, updated).await?;
-                        return Ok(());
+                        return confirm_address_after_mining_with_attempt(attempt, updated).await;
                     }
-                    AddressSubmission::Expired(updated) => payment = updated,
+                    AddressSubmission::Expired(updated) => {
+                        replacement_txid = Some(payment.txid.clone());
+                        payment = updated;
+                    }
                 }
             }
             "preparing" => {
-                if let Some(prepared) = repair_address_journal(state, &payment, deadline).await? {
-                    payment = state.0.store.record_address_prepared(
-                        &payment.id,
-                        &prepared.txid,
-                        &prepared.raw_transaction,
-                        prepared.expiry_height,
-                    )?;
+                if replacement_txid.is_none()
+                    && let Some(prepared) = repair_address_journal(state, &payment).await?
+                {
+                    payment = prepared;
                     continue;
                 }
-                let sync_deadline = (Instant::now() + PAYMENT_LOOKUP_TIMEOUT).min(deadline);
-                state.synchronize_wallet_until(None, sync_deadline).await?;
+                attempt
+                    .synchronize_wallet(None)
+                    .await
+                    .context("synchronizing wallet for address faucet preparation")?;
                 let seed = state.0.store.seed()?;
                 let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-                let _replenishment = state.0.treasury_replenishment.lock().await;
+                let _replenishment = attempt.lock(&state.0.treasury_replenishment).await?;
                 let prepared = prepare_with_replenishment(
-                    state,
+                    attempt,
                     Some(&payment.id),
+                    replacement_txid.as_deref(),
                     &seed,
                     &treasury,
                     &payment.address,
                     payment.amount_zatoshi,
                     record_prepared_address_payment(&state.0.store, &payment.id),
                 )
-                .await?;
+                .await
+                .context("preparing address faucet with replenishment")?;
+                replacement_txid = None;
                 payment = state.0.store.record_address_prepared(
                     &payment.id,
                     &prepared.txid,
@@ -758,20 +1097,17 @@ async fn progress_address_faucet(
 async fn repair_address_journal(
     state: &AppState,
     payment: &AddressFaucet,
-    deadline: Instant,
-) -> anyhow::Result<Option<PreparedPayment>> {
+) -> anyhow::Result<Option<AddressFaucet>> {
     let Some(prepared) = state.0.wallet.prepared(&payment.id).await? else {
         return Ok(None);
     };
-    if prepared.expiry_height == 0
-        || bounded_payment_chain_info_until(state, deadline)
-            .await?
-            .blocks
-            < prepared.expiry_height
-    {
-        return Ok(Some(prepared));
-    }
-    Ok(None)
+    let repaired = state.0.store.record_address_prepared(
+        &payment.id,
+        &prepared.txid,
+        &prepared.raw_transaction,
+        prepared.expiry_height,
+    )?;
+    Ok(Some(repaired))
 }
 
 /// Serves the dashboard shell for client-side routes only.
@@ -951,6 +1287,40 @@ async fn activity(
     Ok(Json(state.0.store.activities(page.limit.unwrap_or(30))?))
 }
 
+#[derive(Debug)]
+struct PaymentResponse<T>(T, StatusCode, HeaderValue);
+
+impl<T: Serialize> IntoResponse for PaymentResponse<T> {
+    fn into_response(self) -> Response {
+        (self.1, [(LOCATION, self.2)], Json(self.0)).into_response()
+    }
+}
+
+fn payment_response<T>(
+    status: &str,
+    body: T,
+    status_path: &str,
+    key: &str,
+) -> ApiResult<PaymentResponse<T>> {
+    let status = match status {
+        "confirmed" | "failed" => StatusCode::OK,
+        "preparing" | "prepared" | "broadcast" => StatusCode::ACCEPTED,
+        status => return Err(anyhow::anyhow!("payment has unsupported status {status}").into()),
+    };
+    let mut url =
+        reqwest::Url::parse("http://127.0.0.1").context("constructing payment status URL")?;
+    url.set_path(status_path);
+    url.query_pairs_mut().append_pair("idempotency_key", key);
+    let location = HeaderValue::from_str(&format!(
+        "{}?{}",
+        url.path(),
+        url.query()
+            .context("payment status URL omitted its query")?,
+    ))
+    .context("constructing payment status Location header")?;
+    Ok(PaymentResponse(body, status, location))
+}
+
 #[derive(Deserialize)]
 /// Exactly one of `to_account` or `to_address` names the destination.
 struct SendRequest {
@@ -967,27 +1337,19 @@ struct SendRequest {
 async fn send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
-) -> ApiResult<Json<Activity>> {
+) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
-    let (recipient, memo) = validate_send(&req)?;
-    let address = match recipient {
-        Recipient::Account(id) => {
-            let destination = state.0.store.account(id)?;
-            match req.destination_pool.as_str() {
-                "transparent" => destination.transparent_address,
-                "ironwood" => destination.unified_address,
-                _ => unreachable!("validate_send checks destination_pool"),
-            }
-        }
-        Recipient::Address(address) => address.to_owned(),
-    };
+    let (recipient, _) = validate_send(&req)?;
     // A pasted address that belongs to a development account is recorded as
     // that account, before the claim, so a replay resolves to the same payment.
     let recipient = match recipient {
         Recipient::Address(address) => {
             development_account_for(&state.0.store, address)?.map_or(recipient, Recipient::Account)
         }
-        recipient => recipient,
+        Recipient::Account(id) => {
+            state.0.store.account(id)?;
+            recipient
+        }
     };
     if recipient == Recipient::Account(req.from_account) && req.source_pool == req.destination_pool
     {
@@ -995,7 +1357,6 @@ async fn send(
             "choose a different account or a different destination pool",
         ));
     }
-    let _payment = state.0.payments.lock().await;
     let pending = state.0.store.claim_transfer(
         req.from_account,
         recipient,
@@ -1005,32 +1366,8 @@ async fn send(
         &req.idempotency_key,
         req.memo.as_deref(),
     )?;
-    Ok(Json(
-        execute_payment(&state, pending, |activity_id| {
-            let state = &state;
-            let memo = memo.clone();
-            let req = &req;
-            let address = &address;
-            async move {
-                state.synchronize_latest().await?;
-                state
-                    .0
-                    .wallet
-                    .prepare(
-                        Some(&activity_id),
-                        &state.0.store.seed()?,
-                        req.from_account,
-                        &req.source_pool,
-                        address,
-                        req.amount_zatoshi,
-                        memo,
-                        record_prepared_payment(&state.0.store, &activity_id),
-                    )
-                    .await
-            }
-        })
-        .await?,
-    ))
+    let status = pending.status.clone();
+    payment_response(&status, pending, "/api/v1/activity", &req.idempotency_key)
 }
 
 #[derive(Deserialize)]
@@ -1181,7 +1518,7 @@ struct FaucetRequest {
 async fn faucet(
     State(state): State<AppState>,
     Json(req): Json<FaucetRequest>,
-) -> ApiResult<Json<Activity>> {
+) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
     require_user_account(req.account_id)?;
@@ -1194,16 +1531,14 @@ async fn faucet(
         return Err(ApiError::bad_request("amount must be greater than zero"));
     }
     require_pool(&req.pool, "pool")?;
-    Ok(Json(
-        fund_from_treasury(
-            &state,
-            req.account_id,
-            &req.pool,
-            req.amount_zatoshi,
-            &req.idempotency_key,
-        )
-        .await?,
-    ))
+    let pending = state.0.store.claim_faucet(
+        req.account_id,
+        &req.pool,
+        req.amount_zatoshi,
+        &req.idempotency_key,
+    )?;
+    let status = pending.status.clone();
+    payment_response(&status, pending, "/api/v1/activity", &req.idempotency_key)
 }
 
 #[derive(Deserialize)]
@@ -1300,6 +1635,7 @@ fn stored_address_faucet(
     faucet_address_response(address, activity).map(Some)
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 trait AddressFaucetRuntime: Sync {
     async fn fund_internal(
@@ -1315,33 +1651,7 @@ trait AddressFaucetRuntime: Sync {
     ) -> anyhow::Result<FaucetAddressResponse>;
 }
 
-#[async_trait::async_trait]
-impl AddressFaucetRuntime for AppState {
-    async fn fund_internal(
-        &self,
-        account_id: u8,
-        pool: &str,
-        amount_zatoshi: u64,
-        key: &str,
-    ) -> anyhow::Result<Activity> {
-        fund_from_treasury(self, account_id, pool, amount_zatoshi, key).await
-    }
-
-    async fn fund_external(
-        &self,
-        req: FaucetAddressRequest,
-    ) -> anyhow::Result<FaucetAddressResponse> {
-        let payment = fund_address_from_treasury(
-            self,
-            &req.address,
-            req.amount_zatoshi,
-            &req.idempotency_key,
-        )
-        .await?;
-        Ok(external_faucet_response(payment))
-    }
-}
-
+#[cfg(test)]
 async fn execute_address_faucet<R: AddressFaucetRuntime>(
     store: &Store,
     runtime: &R,
@@ -1373,9 +1683,49 @@ async fn execute_address_faucet<R: AddressFaucetRuntime>(
 async fn faucet_address(
     State(state): State<AppState>,
     Json(req): Json<FaucetAddressRequest>,
-) -> ApiResult<Json<FaucetAddressResponse>> {
+) -> ApiResult<PaymentResponse<FaucetAddressResponse>> {
     require_started(&state)?;
-    execute_address_faucet(&state.0.store, &state, req).await
+    require_key(&req.idempotency_key)?;
+    require_faucet_address(&req.address)?;
+    if req.amount_zatoshi == 0 || req.amount_zatoshi > 5 * ZATOSHIS_PER_ZEC {
+        return Err(ApiError::bad_request(
+            "amount must be greater than zero and no more than 5 ZEC",
+        ));
+    }
+    // An existing external claim keeps its store even if the address later
+    // becomes a development-account address.
+    let destination = if state
+        .0
+        .store
+        .address_faucet_for_key(&req.idempotency_key)?
+        .is_some()
+    {
+        None
+    } else {
+        internal_faucet_destination(&state.0.store, &req.address)?
+    };
+    let response = if let Some((account_id, pool)) = destination {
+        let pending = state.0.store.claim_faucet(
+            account_id,
+            pool,
+            req.amount_zatoshi,
+            &req.idempotency_key,
+        )?;
+        faucet_address_response(req.address, pending)?
+    } else {
+        external_faucet_response(state.0.store.claim_address_faucet(
+            &req.address,
+            req.amount_zatoshi,
+            &req.idempotency_key,
+        )?)
+    };
+    let status = response.status.clone();
+    payment_response(
+        &status,
+        response,
+        "/api/v1/faucet/address",
+        &req.idempotency_key,
+    )
 }
 
 #[derive(Deserialize)]
@@ -1395,119 +1745,53 @@ async fn faucet_address_status(
         })
 }
 
-async fn fund_address_from_treasury(
-    state: &AppState,
-    address: &str,
-    amount_zatoshi: u64,
-    idempotency_key: &str,
-) -> anyhow::Result<AddressFaucet> {
-    let _payment = state.0.payments.lock().await;
-    let mut pending =
-        state
-            .0
-            .store
-            .claim_address_faucet(address, amount_zatoshi, idempotency_key)?;
-    loop {
-        match pending.status.as_str() {
-            "confirmed" | "failed" => return Ok(pending),
-            "prepared" | "broadcast" => {
-                match submit_address_prepared(&state.0.store, state, &pending).await? {
-                    AddressSubmission::Broadcast(payment) => {
-                        pending = payment;
-                        break;
-                    }
-                    AddressSubmission::Expired(payment) => pending = payment,
-                }
-            }
-            "preparing" => {
-                let prepared = async {
-                    state.synchronize_latest().await?;
-                    let seed = state.0.store.seed()?;
-                    let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-                    let _replenishment = state.0.treasury_replenishment.lock().await;
-                    prepare_with_replenishment(
-                        state,
-                        Some(&pending.id),
-                        &seed,
-                        &treasury,
-                        address,
-                        amount_zatoshi,
-                        record_prepared_address_payment(&state.0.store, &pending.id),
-                    )
-                    .await
-                }
-                .await;
-                let prepared = match prepared {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        state.0.store.record_address_error(
-                            &pending.id,
-                            "preparing",
-                            "",
-                            &error.to_string(),
-                        )?;
-                        return Err(error);
-                    }
-                };
-                pending = state.0.store.record_address_prepared(
-                    &pending.id,
-                    &prepared.txid,
-                    &prepared.raw_transaction,
-                    prepared.expiry_height,
-                )?;
-            }
-            status => anyhow::bail!("address faucet has unsupported status {status}"),
-        }
-    }
-    confirm_address_after_mining(state, pending).await
-}
-
-async fn confirm_address_after_mining(
-    state: &AppState,
+async fn confirm_address_after_mining_with_attempt(
+    attempt: &PaymentAttempt<'_>,
     pending: AddressFaucet,
 ) -> anyhow::Result<AddressFaucet> {
-    let check = |payment: AddressFaucet, tx: Value| -> anyhow::Result<AddressFaucet> {
-        match confirmed_block_hash(&tx) {
-            Some(hash) => state
+    let pending = confirm_address_from_chain_with_attempt(attempt, pending).await?;
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
+        return Ok(pending);
+    }
+    attempt
+        .mine_and_sync(1)
+        .await
+        .context("automatically mining and synchronizing address faucet")?;
+    confirm_address_from_chain_with_attempt(attempt, pending).await
+}
+
+async fn confirm_address_from_chain_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: AddressFaucet,
+) -> anyhow::Result<AddressFaucet> {
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
+        return Ok(pending);
+    }
+    let state = attempt.state;
+    let transaction = attempt
+        .lookup_transaction(&pending.txid)
+        .await
+        .context("looking up address faucet confirmation")?;
+    let updated = match original_presence_from_lookup(attempt, &pending.txid, transaction)
+        .await
+        .context("checking address faucet confirmation")?
+    {
+        OriginalTransactionState::Included(hash) => {
+            state
                 .0
                 .store
-                .confirm_address(&payment.id, &payment.txid, hash),
-            None => Ok(payment),
+                .confirm_address(&pending.id, &pending.txid, &hash)?
         }
+        OriginalTransactionState::Missing | OriginalTransactionState::Present => state
+            .0
+            .store
+            .clear_address_error(&pending.id, &pending.status, &pending.txid)?,
+        OriginalTransactionState::Expired => unreachable!(),
     };
-    let pending = match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => check(pending, tx)?,
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not check address faucet confirmation"
-            );
-            pending
-        }
-    };
-    if pending.status == "confirmed" {
-        return Ok(pending);
+    if updated != pending {
+        notify(state, "wallet");
     }
-    if let Err(error) = mine_and_sync(state, 1).await {
-        tracing::warn!(
-            error = %format_args!("{error:#}"),
-            payment = %pending.id,
-            "address faucet recorded but auto-mine failed"
-        );
-        return Ok(pending);
-    }
-    match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => check(pending, tx),
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not check address faucet confirmation"
-            );
-            Ok(pending)
-        }
-    }
+    Ok(updated)
 }
 
 async fn fund_from_treasury(
@@ -1517,40 +1801,32 @@ async fn fund_from_treasury(
     amount_zatoshi: u64,
     idempotency_key: &str,
 ) -> anyhow::Result<Activity> {
-    let _payment = state.0.payments.lock().await;
+    let attempt = PaymentAttempt {
+        state,
+        dispatch_deadline: None,
+    };
+    let _payment = attempt.lock(&state.0.payments).await?;
     let pending = state
         .0
         .store
         .claim_faucet(account_id, pool, amount_zatoshi, idempotency_key)?;
-    execute_payment(state, pending, |activity_id| async move {
-        let destination = state.0.store.account(account_id)?;
-        let address = match pool {
-            "transparent" => destination.transparent_address,
-            "ironwood" => destination.unified_address,
-            _ => unreachable!("claim_faucet validates pool"),
-        };
-        state.synchronize_latest().await?;
-        let seed = state.0.store.seed()?;
-        // SDK proposals check spendability and the actual fee before construction. Total
-        // balances include pending change and cannot decide whether this request is fundable.
-        let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
-        let _replenishment = state.0.treasury_replenishment.lock().await;
-        prepare_with_replenishment(
-            state,
-            Some(&activity_id),
-            &seed,
-            &treasury,
-            &address,
-            amount_zatoshi,
-            record_prepared_payment(&state.0.store, &activity_id),
-        )
-        .await
-    })
-    .await
+    let intent = crate::db::ActivityIntent {
+        activity: pending.clone(),
+        key: idempotency_key.to_owned(),
+        memo: None,
+    };
+    execute_activity_intent(&attempt, &intent, pending).await
 }
 
 #[async_trait::async_trait]
 trait PaymentLifecycle: Sync {
+    fn check_can_start(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn repair_preparation(&self, activity: &Activity) -> anyhow::Result<Option<Activity>> {
+        let _ = activity;
+        Ok(None)
+    }
     async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission>;
     fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()>;
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity>;
@@ -1559,87 +1835,234 @@ trait PaymentLifecycle: Sync {
         &self,
         activity: &Activity,
         error: &str,
+        replacement_txid: Option<&str>,
     ) -> anyhow::Result<bool> {
-        let _ = (activity, error);
+        let _ = (activity, error, replacement_txid);
         Ok(false)
     }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl PaymentLifecycle for AppState {
+    async fn repair_preparation(&self, activity: &Activity) -> anyhow::Result<Option<Activity>> {
+        repair_activity_journal(self, activity).await
+    }
+
     async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission> {
-        submit_prepared(&self.0.store, self, activity).await
+        PaymentLifecycle::submit_prepared(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            activity,
+        )
+        .await
     }
 
     fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
-        self.0.store.record_error(id, "preparing", "", error)?;
-        Ok(())
+        PaymentLifecycle::record_preparation_error(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            id,
+            error,
+        )
     }
 
     fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
-        self.0.store.record_prepared(
+        PaymentLifecycle::record_prepared(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
             id,
-            &prepared.txid,
-            &prepared.raw_transaction,
-            prepared.expiry_height,
+            prepared,
         )
     }
 
     async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
-        confirm_after_mining(self, activity).await
+        PaymentLifecycle::confirm_after_mining(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            activity,
+        )
+        .await
     }
 
     async fn fail_insufficient_send(
         &self,
         activity: &Activity,
         error: &str,
+        replacement_txid: Option<&str>,
     ) -> anyhow::Result<bool> {
-        if activity.status != "preparing"
+        PaymentLifecycle::fail_insufficient_send(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            activity,
+            error,
+            replacement_txid,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentLifecycle for PaymentAttempt<'_> {
+    fn check_can_start(&self) -> anyhow::Result<()> {
+        PaymentAttempt::check_can_start(self)
+    }
+
+    async fn repair_preparation(&self, activity: &Activity) -> anyhow::Result<Option<Activity>> {
+        repair_activity_journal(self.state, activity).await
+    }
+
+    async fn submit_prepared(&self, activity: &Activity) -> anyhow::Result<PreparedSubmission> {
+        let current = self.state.0.store.activity(&activity.id)?;
+        let result = submit_prepared(&self.state.0.store, self, activity).await?;
+        notify_activity_change(self.state, &current)?;
+        Ok(result)
+    }
+
+    fn record_preparation_error(&self, id: &str, error: &str) -> anyhow::Result<()> {
+        let current = self.state.0.store.activity(id)?;
+        let updated = self
+            .state
+            .0
+            .store
+            .record_error(id, &current.status, &current.txid, error)?;
+        if updated != current {
+            notify(self.state, "wallet");
+        }
+        Ok(())
+    }
+
+    fn record_prepared(&self, id: &str, prepared: &PreparedPayment) -> anyhow::Result<Activity> {
+        let current = self.state.0.store.activity(id)?;
+        let updated = self.state.0.store.record_prepared(
+            id,
+            &prepared.txid,
+            &prepared.raw_transaction,
+            prepared.expiry_height,
+        )?;
+        if updated != current {
+            notify(self.state, "wallet");
+        }
+        Ok(updated)
+    }
+
+    async fn confirm_after_mining(&self, activity: Activity) -> anyhow::Result<Activity> {
+        confirm_after_mining_with_attempt(self, activity).await
+    }
+
+    async fn fail_insufficient_send(
+        &self,
+        activity: &Activity,
+        error: &str,
+        replacement_txid: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        if activity.kind != "send"
+            || activity.status != "preparing"
             || !activity.txid.is_empty()
-            || !can_fail_insufficient_send(self, &activity.id).await
+            || !can_fail_insufficient_send_after_preparation(self, &activity.id, replacement_txid)
+                .await?
         {
             return Ok(false);
         }
-        self.0.store.fail(&activity.id, error)?;
+        let current = self.state.0.store.activity(&activity.id)?;
+        let updated = self.state.0.store.fail(&activity.id, error)?;
+        if updated != current {
+            notify(self.state, "wallet");
+        }
         Ok(true)
     }
 }
 
 async fn execute_payment<R, Prepare, PrepareFuture>(
     runtime: &R,
+    pending: Activity,
+    prepare: Prepare,
+) -> anyhow::Result<Activity>
+where
+    R: PaymentLifecycle,
+    Prepare: FnMut(String, Option<String>) -> PrepareFuture,
+    PrepareFuture: Future<Output = anyhow::Result<PreparedPayment>>,
+{
+    let id = pending.id.clone();
+    let result = execute_payment_inner(runtime, pending, prepare).await;
+    if let Err(error) = &result
+        && let Err(persistence_error) = runtime.record_preparation_error(&id, &format!("{error:#}"))
+    {
+        tracing::warn!(
+            error = %format_args!("{persistence_error:#}"),
+            execution_error = %format_args!("{error:#}"),
+            activity = %id,
+            "could not record payment execution error"
+        );
+    }
+    result
+}
+
+async fn execute_payment_inner<R, Prepare, PrepareFuture>(
+    runtime: &R,
     mut pending: Activity,
     mut prepare: Prepare,
 ) -> anyhow::Result<Activity>
 where
     R: PaymentLifecycle,
-    Prepare: FnMut(String) -> PrepareFuture,
+    Prepare: FnMut(String, Option<String>) -> PrepareFuture,
     PrepareFuture: Future<Output = anyhow::Result<PreparedPayment>>,
 {
+    let mut replacement_txid = None;
     loop {
+        runtime.check_can_start()?;
         match pending.status.as_str() {
             "confirmed" | "failed" => return Ok(pending),
             "prepared" | "broadcast" => match runtime.submit_prepared(&pending).await? {
                 PreparedSubmission::Broadcast(activity) => {
                     return runtime.confirm_after_mining(activity).await;
                 }
-                PreparedSubmission::Expired(activity) => pending = activity,
+                PreparedSubmission::Expired(activity) => {
+                    replacement_txid = Some(pending.txid.clone());
+                    pending = activity;
+                }
             },
             "preparing" => {
-                let prepared = match prepare(pending.id.clone()).await {
+                if replacement_txid.is_none()
+                    && let Some(repaired) = runtime.repair_preparation(&pending).await?
+                {
+                    pending = repaired;
+                    continue;
+                }
+                runtime.check_can_start()?;
+                let replacement_txid = replacement_txid.take();
+                let prepared = match prepare(pending.id.clone(), replacement_txid.clone()).await {
                     Ok(prepared) => prepared,
                     Err(error) => {
-                        if pending.kind == "send"
-                            && is_insufficient_funds(&error)
-                            && runtime
-                                .fail_insufficient_send(&pending, &error.to_string())
-                                .await?
-                        {
-                            // Preserve the current POST error response while
-                            // retaining a terminal, replayable operation.
-                            return Err(error);
-                        }
-                        runtime.record_preparation_error(&pending.id, &error.to_string())?;
-                        return Err(error);
+                        let error = if pending.kind == "send" && is_insufficient_funds(&error) {
+                            match runtime
+                                .fail_insufficient_send(
+                                    &pending,
+                                    &format!("{error:#}"),
+                                    replacement_txid.as_deref(),
+                                )
+                                .await
+                            {
+                                Ok(true) => return Err(error),
+                                Ok(false) => error,
+                                Err(reconciliation_error) => reconciliation_error.context(format!(
+                                    "reconciling send preparation failure: {error:#}"
+                                )),
+                            }
+                        } else {
+                            error
+                        };
+                        return Err(error.context("preparing payment"));
                     }
                 };
                 pending = runtime.record_prepared(&pending.id, &prepared)?;
@@ -1652,27 +2075,152 @@ where
 #[async_trait::async_trait]
 trait PaymentSubmitter: Sync {
     async fn transaction_known(&self, txid: &str) -> anyhow::Result<bool>;
+    async fn lookup_original(&self, txid: &str) -> anyhow::Result<Option<Value>>;
+    async fn inclusion_height(&self, hash: &str) -> anyhow::Result<u64>;
+    async fn canonical_hash(&self, height: u32) -> anyhow::Result<String>;
     async fn chain_height(&self) -> anyhow::Result<u64>;
     async fn broadcast(&self, raw_transaction: &[u8]) -> anyhow::Result<()>;
     async fn recover_prepared(&self, txid: &str) -> anyhow::Result<Option<PreparedPayment>>;
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl PaymentSubmitter for AppState {
+    async fn lookup_original(&self, txid: &str) -> anyhow::Result<Option<Value>> {
+        PaymentSubmitter::lookup_original(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            txid,
+        )
+        .await
+    }
+    async fn inclusion_height(&self, hash: &str) -> anyhow::Result<u64> {
+        PaymentSubmitter::inclusion_height(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            hash,
+        )
+        .await
+    }
+    async fn canonical_hash(&self, height: u32) -> anyhow::Result<String> {
+        PaymentSubmitter::canonical_hash(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            height,
+        )
+        .await
+    }
+
     async fn transaction_known(&self, txid: &str) -> anyhow::Result<bool> {
-        bounded_payment_transaction_known(self, txid).await
+        PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        }
+        .network(
+            PAYMENT_LOOKUP_TIMEOUT,
+            "looking up payment transaction",
+            self.0.rpc.transaction_known(txid),
+        )
+        .await
     }
-
     async fn chain_height(&self) -> anyhow::Result<u64> {
-        Ok(bounded_payment_chain_info(self).await?.blocks)
+        PaymentSubmitter::chain_height(&PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        })
+        .await
     }
-
     async fn broadcast(&self, raw_transaction: &[u8]) -> anyhow::Result<()> {
-        self.0.wallet.broadcast(raw_transaction).await
+        PaymentSubmitter::broadcast(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            raw_transaction,
+        )
+        .await
     }
-
     async fn recover_prepared(&self, txid: &str) -> anyhow::Result<Option<PreparedPayment>> {
         self.0.wallet.recover_prepared(txid).await
+    }
+}
+
+#[async_trait::async_trait]
+impl PaymentSubmitter for PaymentAttempt<'_> {
+    async fn lookup_original(&self, txid: &str) -> anyhow::Result<Option<Value>> {
+        self.network(
+            PAYMENT_LOOKUP_TIMEOUT,
+            "looking up original payment",
+            self.state.0.rpc.lookup_transaction(txid),
+        )
+        .await
+    }
+    async fn inclusion_height(&self, hash: &str) -> anyhow::Result<u64> {
+        self.network(
+            PAYMENT_LOOKUP_TIMEOUT,
+            "reading payment inclusion block",
+            self.state.0.rpc.block(hash),
+        )
+        .await?
+        .get("height")
+        .and_then(Value::as_u64)
+        .context("payment inclusion block omitted its height")
+    }
+    async fn canonical_hash(&self, height: u32) -> anyhow::Result<String> {
+        let hash = self
+            .network(
+                PAYMENT_LOOKUP_TIMEOUT,
+                "validating payment inclusion block",
+                self.state.0.rpc.block_hash(height),
+            )
+            .await?;
+        anyhow::ensure!(!hash.is_empty(), "canonical payment block hash is empty");
+        Ok(hash)
+    }
+
+    async fn transaction_known(&self, txid: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .network(
+                PAYMENT_LOOKUP_TIMEOUT,
+                "looking up payment transaction",
+                self.state.0.rpc.lookup_transaction(txid),
+            )
+            .await?
+            .is_some())
+    }
+    async fn chain_height(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .network(
+                PAYMENT_LOOKUP_TIMEOUT,
+                "reading payment chain height",
+                self.state.0.rpc.chain_info(),
+            )
+            .await?
+            .blocks)
+    }
+    async fn broadcast(&self, raw_transaction: &[u8]) -> anyhow::Result<()> {
+        self.check_can_start()?;
+        if self.dispatch_deadline.is_none() {
+            return self.state.0.wallet.broadcast(raw_transaction).await;
+        }
+        self.state
+            .0
+            .wallet
+            .broadcast_until(
+                raw_transaction,
+                self.network_deadline(Duration::from_secs(30)),
+            )
+            .await
+    }
+    async fn recover_prepared(&self, txid: &str) -> anyhow::Result<Option<PreparedPayment>> {
+        self.check_can_start()?;
+        self.state.0.wallet.recover_prepared(txid).await
     }
 }
 
@@ -1729,6 +2277,11 @@ async fn submit_prepared<R: PaymentSubmitter>(
         SavedSubmission::Broadcast => Ok(PreparedSubmission::Broadcast(
             store.mark_broadcast(&activity.id, &activity.txid)?,
         )),
+        SavedSubmission::Included(hash) => Ok(PreparedSubmission::Broadcast(store.confirm(
+            &activity.id,
+            &activity.txid,
+            &hash,
+        )?)),
         SavedSubmission::Expired => Ok(PreparedSubmission::Expired(
             store.reset_for_retry(&activity.id, &activity.txid)?,
         )),
@@ -1759,14 +2312,109 @@ async fn submit_address_prepared<R: PaymentSubmitter>(
         SavedSubmission::Broadcast => Ok(AddressSubmission::Broadcast(
             store.mark_address_broadcast(&payment.id, &payment.txid)?,
         )),
+        SavedSubmission::Included(hash) => Ok(AddressSubmission::Broadcast(
+            store.confirm_address(&payment.id, &payment.txid, &hash)?,
+        )),
         SavedSubmission::Expired => Ok(AddressSubmission::Expired(
             store.reset_address_for_retry(&payment.id, &payment.txid)?,
         )),
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OriginalTransactionState {
+    Missing,
+    Present,
+    Included(String),
+    Expired,
+}
+
+async fn original_presence<R: PaymentSubmitter>(
+    runtime: &R,
+    txid: &str,
+) -> anyhow::Result<OriginalTransactionState> {
+    let transaction = runtime.lookup_original(txid).await?;
+    original_presence_from_lookup(runtime, txid, transaction).await
+}
+
+async fn original_presence_from_lookup<R: PaymentSubmitter>(
+    runtime: &R,
+    txid: &str,
+    transaction: Option<Value>,
+) -> anyhow::Result<OriginalTransactionState> {
+    let Some(transaction) = transaction else {
+        return Ok(OriginalTransactionState::Missing);
+    };
+    anyhow::ensure!(
+        transaction.get("txid").and_then(Value::as_str) == Some(txid),
+        "original payment lookup returned a different transaction"
+    );
+    // Zakura omits confirmations for mempool transactions.
+    let confirmations = match transaction.get("confirmations") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_i64()
+            .context("original payment lookup has invalid confirmations")?,
+    };
+    anyhow::ensure!(
+        confirmations >= 0,
+        "original payment is not on the selected chain"
+    );
+    if confirmations == 0 {
+        anyhow::ensure!(
+            transaction.get("blockhash").is_none_or(Value::is_null),
+            "unconfirmed original payment has an inclusion block"
+        );
+        return Ok(OriginalTransactionState::Present);
+    }
+    let hash = confirmed_block_hash(&transaction)
+        .context("original payment inclusion omitted its block hash")?;
+    let height = runtime.inclusion_height(hash).await?;
+    anyhow::ensure!(
+        runtime.canonical_hash(u32::try_from(height)?).await? == hash,
+        "original payment inclusion is not canonical"
+    );
+    Ok(OriginalTransactionState::Included(hash.to_owned()))
+}
+
+async fn original_after_absence<R: PaymentSubmitter>(
+    runtime: &R,
+    txid: &str,
+    expiry_height: u64,
+) -> anyhow::Result<OriginalTransactionState> {
+    if expiry_height == 0 {
+        return Ok(OriginalTransactionState::Missing);
+    }
+    let height = runtime.chain_height().await?;
+    let presence = original_presence(runtime, txid).await?;
+    if presence != OriginalTransactionState::Missing {
+        return Ok(presence);
+    }
+    // Block N may include expiry N. At tip N, absence means the next possible
+    // inclusion is N+1, so the original can safely be replaced.
+    Ok(if height >= expiry_height {
+        OriginalTransactionState::Expired
+    } else {
+        OriginalTransactionState::Missing
+    })
+}
+
+async fn original_transaction_state<R: PaymentSubmitter>(
+    runtime: &R,
+    txid: &str,
+    expiry_height: u64,
+) -> anyhow::Result<OriginalTransactionState> {
+    match original_presence(runtime, txid).await? {
+        OriginalTransactionState::Missing => {
+            original_after_absence(runtime, txid, expiry_height).await
+        }
+        presence => Ok(presence),
+    }
+}
+
 enum SavedSubmission {
     Broadcast,
+    Included(String),
     Expired,
 }
 
@@ -1780,13 +2428,22 @@ async fn submit_saved_prepared<
     txid: &str,
     record_recovered: F,
 ) -> anyhow::Result<SavedSubmission> {
-    if runtime.transaction_known(txid).await? {
-        return Ok(SavedSubmission::Broadcast);
+    match original_presence(runtime, txid)
+        .await
+        .context("reconciling original payment before broadcast")?
+    {
+        OriginalTransactionState::Present => return Ok(SavedSubmission::Broadcast),
+        OriginalTransactionState::Included(hash) => return Ok(SavedSubmission::Included(hash)),
+        OriginalTransactionState::Missing => {}
+        OriginalTransactionState::Expired => unreachable!(),
     }
-    let prepared = match store.prepared_transaction(id) {
-        Ok(prepared) => prepared,
-        Err(missing) => {
-            let recovered = runtime.recover_prepared(txid).await?.ok_or(missing)?;
+    let prepared = match store.optional_prepared_transaction(id)? {
+        Some(prepared) => prepared,
+        None => {
+            let recovered = runtime
+                .recover_prepared(txid)
+                .await?
+                .with_context(|| format!("prepared transaction {id} is missing"))?;
             if recovered.txid != txid {
                 anyhow::bail!("wallet returned a different prepared transaction");
             }
@@ -1797,20 +2454,23 @@ async fn submit_saved_prepared<
             }
         }
     };
-    if prepared.expiry_height != 0 && runtime.chain_height().await? >= prepared.expiry_height {
-        if runtime.transaction_known(txid).await? {
-            return Ok(SavedSubmission::Broadcast);
-        }
-        return Ok(SavedSubmission::Expired);
+    match original_after_absence(runtime, txid, prepared.expiry_height)
+        .await
+        .context("reconciling payment expiry before broadcast")?
+    {
+        OriginalTransactionState::Present => return Ok(SavedSubmission::Broadcast),
+        OriginalTransactionState::Included(hash) => return Ok(SavedSubmission::Included(hash)),
+        OriginalTransactionState::Expired => return Ok(SavedSubmission::Expired),
+        OriginalTransactionState::Missing => {}
     }
     if let Err(broadcast_error) = runtime.broadcast(&prepared.raw_transaction).await {
         match runtime.transaction_known(txid).await {
             Ok(true) => {}
-            Ok(false) => return Err(broadcast_error),
+            Ok(false) => return Err(broadcast_error.context("broadcasting prepared payment")),
             Err(lookup_error) => {
                 return Err(lookup_error).with_context(|| {
                     format!(
-                        "broadcast failed and transaction {txid} could not be checked: {broadcast_error}"
+                        "broadcast failed and transaction {txid} could not be checked: {broadcast_error:#}"
                     )
                 });
             }
@@ -1829,6 +2489,7 @@ trait FaucetRuntime: Sync {
     async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
@@ -1857,6 +2518,18 @@ trait FaucetRuntime: Sync {
         treasury: &Account,
         minimum_net: u64,
     ) -> anyhow::Result<()>;
+    async fn resume_shielding(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+    async fn shield_and_sync(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()> {
+        self.shield_coinbase(seed, treasury, minimum_net).await?;
+        self.mine_and_sync(1).await
+    }
     async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<()>;
     async fn mine_to_height(&self, height: u64) -> anyhow::Result<()> {
         let current = self.chain_height().await?;
@@ -1876,6 +2549,7 @@ impl FaucetRuntime for AppState {
     async fn prepare_payment<F>(
         &self,
         activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
         seed: &str,
         destination: &str,
         amount_zatoshi: u64,
@@ -1884,10 +2558,148 @@ impl FaucetRuntime for AppState {
     where
         F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
     {
-        self.0
+        FaucetRuntime::prepare_payment(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            activity_id,
+            replacement_txid,
+            seed,
+            destination,
+            amount_zatoshi,
+            record,
+        )
+        .await
+    }
+    async fn chain_height(&self) -> anyhow::Result<u64> {
+        FaucetRuntime::chain_height(&PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        })
+        .await
+    }
+    async fn block_hash(&self, height: u32) -> anyhow::Result<String> {
+        FaucetRuntime::block_hash(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            height,
+        )
+        .await
+    }
+    async fn synchronize_latest(&self) -> anyhow::Result<()> {
+        FaucetRuntime::synchronize_latest(&PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        })
+        .await
+    }
+    async fn treasury_cursor(&self) -> anyhow::Result<Option<crate::db::TreasuryCursor>> {
+        FaucetRuntime::treasury_cursor(&PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        })
+        .await
+    }
+    async fn initialize_treasury_cursor(
+        &self,
+        receiver: &str,
+        height: u32,
+        hash: &str,
+    ) -> anyhow::Result<crate::db::TreasuryCursor> {
+        FaucetRuntime::initialize_treasury_cursor(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            receiver,
+            height,
+            hash,
+        )
+        .await
+    }
+    async fn discover_reward(
+        &self,
+        cursor: &crate::db::TreasuryCursor,
+        treasury: &Account,
+    ) -> anyhow::Result<crate::db::TreasuryCursor> {
+        FaucetRuntime::discover_reward(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            cursor,
+            treasury,
+        )
+        .await
+    }
+    async fn shield_coinbase(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()> {
+        FaucetRuntime::shield_coinbase(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            seed,
+            treasury,
+            minimum_net,
+        )
+        .await
+    }
+    async fn resume_shielding(&self) -> anyhow::Result<bool> {
+        FaucetRuntime::resume_shielding(&PaymentAttempt {
+            state: self,
+            dispatch_deadline: None,
+        })
+        .await
+    }
+    async fn shield_and_sync(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()> {
+        FaucetRuntime::shield_coinbase(self, seed, treasury, minimum_net).await
+    }
+    async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<()> {
+        FaucetRuntime::mine_and_sync(
+            &PaymentAttempt {
+                state: self,
+                dispatch_deadline: None,
+            },
+            blocks,
+        )
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl FaucetRuntime for PaymentAttempt<'_> {
+    async fn prepare_payment<F>(
+        &self,
+        activity_id: Option<&str>,
+        replacement_txid: Option<&str>,
+        seed: &str,
+        destination: &str,
+        amount_zatoshi: u64,
+        record: F,
+    ) -> anyhow::Result<PreparedPayment>
+    where
+        F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Send + 'static,
+    {
+        self.check_can_start()?;
+        self.state
+            .0
             .wallet
             .prepare(
                 activity_id,
+                replacement_txid,
                 seed,
                 TREASURY_ACCOUNT_ID,
                 "ironwood",
@@ -1900,17 +2712,35 @@ impl FaucetRuntime for AppState {
     }
 
     async fn chain_height(&self) -> anyhow::Result<u64> {
-        Ok(self.0.rpc.chain_info().await?.blocks)
+        let limit = if self.dispatch_deadline.is_some() {
+            PAYMENT_LOOKUP_TIMEOUT
+        } else {
+            Duration::from_secs(30)
+        };
+        Ok(self
+            .network(
+                limit,
+                "reading treasury chain height",
+                self.state.0.rpc.chain_info(),
+            )
+            .await?
+            .blocks)
     }
 
     async fn block_hash(&self, height: u32) -> anyhow::Result<String> {
-        self.0.rpc.block_hash(height).await
+        self.network(
+            Duration::from_secs(30),
+            "reading treasury block hash",
+            self.state.0.rpc.block_hash(height),
+        )
+        .await
     }
     async fn synchronize_latest(&self) -> anyhow::Result<()> {
-        AppState::synchronize_latest(self).await
+        self.synchronize_wallet(None).await
     }
     async fn treasury_cursor(&self) -> anyhow::Result<Option<crate::db::TreasuryCursor>> {
-        self.0.wallet.treasury_cursor().await
+        self.check_can_start()?;
+        self.state.0.wallet.treasury_cursor().await
     }
     async fn initialize_treasury_cursor(
         &self,
@@ -1918,7 +2748,9 @@ impl FaucetRuntime for AppState {
         height: u32,
         hash: &str,
     ) -> anyhow::Result<crate::db::TreasuryCursor> {
-        self.0
+        self.check_can_start()?;
+        self.state
+            .0
             .wallet
             .initialize_treasury_cursor(receiver, height, hash)
             .await
@@ -1928,45 +2760,167 @@ impl FaucetRuntime for AppState {
         cursor: &crate::db::TreasuryCursor,
         treasury: &Account,
     ) -> anyhow::Result<crate::db::TreasuryCursor> {
-        let _sync = self.0.wallet_sync.lock().await;
-        discover_reward(self, cursor, treasury).await
+        let _sync = self.lock(&self.state.0.wallet_sync).await?;
+        discover_reward_with_attempt(self, cursor, treasury).await
     }
+    async fn resume_shielding(&self) -> anyhow::Result<bool> {
+        self.check_can_start()?;
+        let Some(prepared) = self.state.0.wallet.prepared_shielding().await? else {
+            return Ok(false);
+        };
+        let original =
+            original_transaction_state(self, &prepared.txid, prepared.expiry_height).await?;
+        if original == OriginalTransactionState::Expired {
+            return Ok(false);
+        }
+        self.complete_shielding(&prepared, original).await?;
+        Ok(true)
+    }
+
     async fn shield_coinbase(
         &self,
         seed: &str,
         treasury: &Account,
         minimum_net: u64,
     ) -> anyhow::Result<()> {
-        self.0
+        self.check_can_start()?;
+        let retained = self.state.0.wallet.prepared_shielding().await?;
+        let replacement_txid = if let Some(prepared) = &retained {
+            let original =
+                original_transaction_state(self, &prepared.txid, prepared.expiry_height).await?;
+            if original != OriginalTransactionState::Expired {
+                return self.complete_shielding(prepared, original).await;
+            }
+            Some(prepared.txid.as_str())
+        } else {
+            None
+        };
+        self.check_can_start()?;
+        let prepared = self
+            .state
+            .0
             .wallet
-            .shield_coinbase(
+            .prepare_shield_coinbase(
                 seed,
                 TREASURY_ACCOUNT_ID,
                 &treasury.transparent_address,
                 &treasury.unified_address,
                 minimum_net,
+                replacement_txid,
             )
             .await?;
-        Ok(())
+        let original =
+            original_transaction_state(self, &prepared.txid, prepared.expiry_height).await?;
+        self.complete_shielding(&prepared, original).await
+    }
+
+    async fn shield_and_sync(
+        &self,
+        seed: &str,
+        treasury: &Account,
+        minimum_net: u64,
+    ) -> anyhow::Result<()> {
+        FaucetRuntime::shield_coinbase(self, seed, treasury, minimum_net).await
     }
 
     async fn mine_and_sync(&self, blocks: u32) -> anyhow::Result<()> {
-        mine_and_sync(self, blocks).await?;
+        PaymentAttempt::mine_and_sync(self, blocks).await?;
         Ok(())
     }
 }
 
-async fn discover_reward(
-    state: &AppState,
+impl PaymentAttempt<'_> {
+    async fn complete_shielding(
+        &self,
+        prepared: &PreparedPayment,
+        original: OriginalTransactionState,
+    ) -> anyhow::Result<()> {
+        match original {
+            OriginalTransactionState::Included(hash) => {
+                return self.synchronize_shielding(prepared, &hash).await;
+            }
+            OriginalTransactionState::Expired => {
+                anyhow::bail!(
+                    "retained shielding {} expired; replenishment remains pending",
+                    prepared.txid
+                );
+            }
+            OriginalTransactionState::Present => {}
+            OriginalTransactionState::Missing => {
+                PaymentSubmitter::broadcast(self, &prepared.raw_transaction)
+                    .await
+                    .with_context(|| {
+                        format!("shielding {} broadcast remains pending", prepared.txid)
+                    })?;
+            }
+        }
+        // A prior mine request may have completed after its response was lost.
+        // Reconcile the retained identity at the selected tip before mining again.
+        PaymentSubmitter::chain_height(self).await?;
+        match original_transaction_state(self, &prepared.txid, prepared.expiry_height).await? {
+            OriginalTransactionState::Included(hash) => {
+                return self.synchronize_shielding(prepared, &hash).await;
+            }
+            OriginalTransactionState::Missing | OriginalTransactionState::Present => {}
+            OriginalTransactionState::Expired => {
+                anyhow::bail!(
+                    "retained shielding {} expired; replenishment remains pending",
+                    prepared.txid
+                );
+            }
+        }
+        self.mine_and_sync(1)
+            .await
+            .with_context(|| format!("shielding {} mining remains pending", prepared.txid))?;
+        match original_presence(self, &prepared.txid).await? {
+            OriginalTransactionState::Included(hash) => {
+                self.synchronize_shielding(prepared, &hash).await
+            }
+            _ => anyhow::bail!("shielding {} inclusion remains pending", prepared.txid),
+        }
+    }
+
+    async fn synchronize_shielding(
+        &self,
+        prepared: &PreparedPayment,
+        hash: &str,
+    ) -> anyhow::Result<()> {
+        let height = PaymentSubmitter::inclusion_height(self, hash).await?;
+        self.synchronize_wallet(Some(height)).await?;
+        anyhow::ensure!(
+            PaymentSubmitter::canonical_hash(self, u32::try_from(height)?).await? == hash,
+            "shielding inclusion changed during synchronization; replenishment remains pending"
+        );
+        self.check_can_start()?;
+        self.state.0.wallet.retire_shielding(&prepared.txid).await
+    }
+}
+
+async fn discover_reward_with_attempt(
+    attempt: &PaymentAttempt<'_>,
     cursor: &crate::db::TreasuryCursor,
     treasury: &Account,
 ) -> anyhow::Result<crate::db::TreasuryCursor> {
+    let state = attempt.state;
+    attempt.check_can_start()?;
     let next_height = cursor
         .height
         .checked_add(1)
         .context("treasury discovery height overflow")?;
-    let block_hash = state.0.rpc.block_hash(next_height).await?;
-    let block = state.0.rpc.block(&block_hash).await?;
+    let block_hash = attempt
+        .network(
+            Duration::from_secs(30),
+            "reading treasury discovery hash",
+            state.0.rpc.block_hash(next_height),
+        )
+        .await?;
+    let block = attempt
+        .network(
+            Duration::from_secs(30),
+            "reading treasury discovery block",
+            state.0.rpc.block(&block_hash),
+        )
+        .await?;
     anyhow::ensure!(
         block.get("height").and_then(Value::as_u64) == Some(u64::from(next_height)),
         "Zakura returned the wrong treasury discovery height"
@@ -1975,13 +2929,16 @@ async fn discover_reward(
     let mut required_spenders = Vec::new();
     if let Some(candidate) = &candidate {
         for index in &candidate.output_indexes {
-            if state
-                .0
-                .rpc
-                .unspent_output(&candidate.txid, *index)
+            if attempt
+                .network(
+                    Duration::from_secs(30),
+                    "reading treasury output",
+                    state.0.rpc.unspent_output(&candidate.txid, *index),
+                )
                 .await?
                 .is_none()
             {
+                attempt.check_can_start()?;
                 let spenders = state
                     .0
                     .wallet
@@ -1989,23 +2946,40 @@ async fn discover_reward(
                     .await?;
                 let mut accepted = Vec::new();
                 for txid in spenders {
-                    let Some(transaction) = state.0.rpc.lookup_transaction(&txid).await? else {
+                    let Some(transaction) = attempt.lookup_transaction(&txid).await? else {
                         continue;
                     };
                     if let Some(hash) = confirmed_block_hash(&transaction) {
-                        let height = state
-                            .0
-                            .rpc
-                            .block(hash)
+                        let height = attempt
+                            .network(
+                                Duration::from_secs(30),
+                                "reading treasury spender block",
+                                state.0.rpc.block(hash),
+                            )
                             .await?
                             .get("height")
                             .and_then(Value::as_u64)
                             .context("spender block omitted its height")?;
                         anyhow::ensure!(
-                            state.0.rpc.block_hash(u32::try_from(height)?).await? == hash,
+                            attempt
+                                .network(
+                                    Duration::from_secs(30),
+                                    "validating treasury spender block",
+                                    state.0.rpc.block_hash(u32::try_from(height)?)
+                                )
+                                .await?
+                                == hash,
                             "spender block is not canonical"
                         );
-                    } else if !state.0.rpc.mempool().await?.contains(&txid) {
+                    } else if !attempt
+                        .network(
+                            Duration::from_secs(30),
+                            "reading treasury spender mempool",
+                            state.0.rpc.mempool(),
+                        )
+                        .await?
+                        .contains(&txid)
+                    {
                         continue;
                     }
                     accepted.push((*index, txid));
@@ -2023,9 +2997,17 @@ async fn discover_reward(
         hash: block_hash,
     };
     anyhow::ensure!(
-        state.0.rpc.block_hash(next_height).await? == checkpoint.hash,
+        attempt
+            .network(
+                Duration::from_secs(30),
+                "reading treasury discovery hash",
+                state.0.rpc.block_hash(next_height)
+            )
+            .await?
+            == checkpoint.hash,
         "canonical block changed during treasury discovery"
     );
+    attempt.check_can_start()?;
     let next = state
         .0
         .wallet
@@ -2037,15 +3019,24 @@ async fn discover_reward(
         )
         .await?;
     anyhow::ensure!(
-        state.0.rpc.block_hash(next_height).await? == checkpoint.hash,
+        attempt
+            .network(
+                Duration::from_secs(30),
+                "reading treasury discovery hash",
+                state.0.rpc.block_hash(next_height)
+            )
+            .await?
+            == checkpoint.hash,
         "canonical block changed after treasury discovery"
     );
     Ok(next)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_with_replenishment<R, F>(
     runtime: &R,
     activity_id: Option<&str>,
+    replacement_txid: Option<&str>,
     seed: &str,
     treasury: &Account,
     destination: &str,
@@ -2056,11 +3047,13 @@ where
     R: FaucetRuntime,
     F: FnOnce(PreparedPayment) -> anyhow::Result<PreparedPayment> + Clone + Send + 'static,
 {
+    runtime.resume_shielding().await?;
     let mut reconciled_after_scan_required = false;
     loop {
         match runtime
             .prepare_payment(
                 activity_id,
+                replacement_txid,
                 seed,
                 destination,
                 amount_zatoshi,
@@ -2109,6 +3102,9 @@ async fn replenish_treasury<R: FaucetRuntime>(
     treasury: &Account,
     minimum_net: u64,
 ) -> anyhow::Result<()> {
+    if runtime.resume_shielding().await? {
+        return Ok(());
+    }
     let boundary = WALLET_BIRTHDAY_HEIGHT - 1;
     runtime.mine_to_height(u64::from(boundary)).await?;
     let mut cursor = match runtime.treasury_cursor().await? {
@@ -2142,8 +3138,8 @@ async fn replenish_treasury<R: FaucetRuntime>(
     }
 
     loop {
-        match runtime.shield_coinbase(seed, treasury, minimum_net).await {
-            Ok(()) => return runtime.mine_and_sync(1).await,
+        match runtime.shield_and_sync(seed, treasury, minimum_net).await {
+            Ok(()) => return Ok(()),
             Err(error) if matches!(error.downcast_ref(), Some(PaymentError::TreasuryExhausted)) => {
             }
             Err(error) => return Err(error),
@@ -2154,7 +3150,12 @@ async fn replenish_treasury<R: FaucetRuntime>(
             .context("treasury discovery height overflow")?;
         // The SDK constructs a spend at tip + 1; 100 confirmations make this reward eligible there.
         let required_height = u64::from(next_height) + u64::from(COINBASE_MATURITY_BLOCKS) - 1;
-        runtime.mine_to_height(required_height).await?;
+        runtime
+            .mine_to_height(required_height)
+            .await
+            .with_context(|| {
+                format!("treasury maturity mining to height {required_height} remains pending")
+            })?;
         cursor = runtime.discover_reward(&cursor, treasury).await?;
     }
 }
@@ -2215,40 +3216,30 @@ fn coinbase_candidate(block: &Value, receiver: &str) -> anyhow::Result<Option<Co
     }))
 }
 
-async fn mine_and_sync(state: &AppState, blocks: u32) -> anyhow::Result<Vec<String>> {
-    let hashes = state.0.rpc.generate(blocks).await?;
-    let tip_hash = hashes
-        .last()
-        .context("Zakura did not return the mined block hash")?;
-    let tip_height = state
+const INITIAL_FUNDING_KEY: &str = "startup-account-1-ironwood-v1";
+
+pub fn initial_balance_provisioned(state: &AppState) -> anyhow::Result<bool> {
+    Ok(state
         .0
-        .rpc
-        .block(tip_hash)
-        .await?
-        .pointer("/height")
-        .and_then(Value::as_u64)
-        .context("Zakura mined block omitted its height")?;
-    state.synchronize_wallet(Some(tip_height)).await?;
-    // Every caller here produces blocks, so the chain moved for everyone, not
-    // just the tab that asked. Without this, other dashboards keep the old
-    // height and tip until something else happens to mine.
-    notify(state, "chain");
-    Ok(hashes)
+        .store
+        .activity_for_key(INITIAL_FUNDING_KEY)?
+        .is_some_and(|activity| activity.status == "confirmed"))
 }
 
-pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
-    const INITIAL_FUNDING_KEY: &str = "startup-account-1-ironwood-v1";
+pub async fn provision_initial_balance_with_history(
+    state: &AppState,
+    already_provisioned: bool,
+) -> anyhow::Result<()> {
     let existing = state.0.store.activity_for_key(INITIAL_FUNDING_KEY)?;
-    if existing
-        .as_ref()
-        .is_some_and(|activity| activity.status == "confirmed")
-    {
-        return Ok(());
-    }
+    state
+        .0
+        .store
+        .claim_faucet(1, "ironwood", 5 * ZATOSHIS_PER_ZEC, INITIAL_FUNDING_KEY)?;
     if existing.is_none() {
         // A fresh wallet needs scanned blocks before a proposal can determine its target height.
         let seed = state.0.store.seed()?;
         let treasury = state.0.store.account(TREASURY_ACCOUNT_ID)?;
+        let _replenishment = state.0.treasury_replenishment.lock().await;
         replenish_treasury(state, &seed, &treasury, 1).await?;
     }
     let funding = fund_from_treasury(
@@ -2259,8 +3250,41 @@ pub async fn provision_initial_balance(state: &AppState) -> anyhow::Result<()> {
         INITIAL_FUNDING_KEY,
     )
     .await?;
+    anyhow::ensure!(
+        funding.status != "failed",
+        "startup funding failed: {}",
+        funding
+            .last_error
+            .as_deref()
+            .unwrap_or("no failure reason was recorded")
+    );
     if funding.status != "confirmed" {
         return Err(crate::ReadinessError::FundingPending.into());
+    }
+    let attempt = PaymentAttempt {
+        state,
+        dispatch_deadline: None,
+    };
+    let transaction = attempt
+        .lookup_transaction(&funding.txid)
+        .await
+        .context("looking up startup funding confirmation")?;
+    if !matches!(
+        original_presence_from_lookup(&attempt, &funding.txid, transaction)
+            .await
+            .context("checking canonical startup funding confirmation")?,
+        OriginalTransactionState::Included(_)
+    ) {
+        return Err(crate::ReadinessError::FundingPending.into());
+    }
+    attempt
+        .synchronize_wallet(None)
+        .await
+        .context("synchronizing confirmed startup funding")?;
+    // Completed provisioning survives user spending. The five-ZEC balance is
+    // an initial readiness invariant, not a permanent account restriction.
+    if already_provisioned {
+        return Ok(());
     }
     let account = state
         .accounts()
@@ -2624,6 +3648,7 @@ fn confirmed_block_hash(tx: &Value) -> Option<&str> {
         .filter(|hash| !hash.is_empty())
 }
 
+#[cfg(test)]
 fn apply_confirmation(store: &Store, pending: &Activity, tx: &Value) -> anyhow::Result<Activity> {
     match confirmed_block_hash(tx) {
         Some(hash) => store.confirm(&pending.id, &pending.txid, hash),
@@ -2631,29 +3656,38 @@ fn apply_confirmation(store: &Store, pending: &Activity, tx: &Value) -> anyhow::
     }
 }
 
-async fn confirm_from_chain(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
-    if pending.status == "confirmed" {
+async fn confirm_from_chain_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: Activity,
+) -> anyhow::Result<Activity> {
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
         return Ok(pending);
     }
-    match state.0.rpc.transaction(&pending.txid).await {
-        Ok(tx) => {
-            let updated = apply_confirmation(&state.0.store, &pending, &tx)?;
-            if updated.status == "confirmed" {
-                notify(state, "wallet");
-            }
-            Ok(updated)
+    let state = attempt.state;
+    let transaction = attempt
+        .lookup_transaction(&pending.txid)
+        .await
+        .context("looking up payment confirmation")?;
+    let updated = match original_presence_from_lookup(attempt, &pending.txid, transaction)
+        .await
+        .context("checking payment confirmation")?
+    {
+        OriginalTransactionState::Included(hash) => {
+            state.0.store.confirm(&pending.id, &pending.txid, &hash)?
         }
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                txid = %pending.txid,
-                "could not fetch transaction for confirmation"
-            );
-            Ok(pending)
-        }
+        OriginalTransactionState::Missing | OriginalTransactionState::Present => state
+            .0
+            .store
+            .clear_error(&pending.id, &pending.status, &pending.txid)?,
+        OriginalTransactionState::Expired => unreachable!(),
+    };
+    if updated != pending {
+        notify(state, "wallet");
     }
+    Ok(updated)
 }
 
+#[cfg(test)]
 async fn reconcile_unconfirmed_with<F, Fut>(
     store: &Store,
     cursor: &mut Option<String>,
@@ -2714,26 +3748,33 @@ where
     Ok(changed)
 }
 
+#[cfg(test)]
 async fn confirm_after_mining(state: &AppState, pending: Activity) -> anyhow::Result<Activity> {
-    let pending = confirm_from_chain(state, pending).await?;
-    if pending.status == "confirmed" {
+    confirm_after_mining_with_attempt(
+        &PaymentAttempt {
+            state,
+            dispatch_deadline: None,
+        },
+        pending,
+    )
+    .await
+}
+
+async fn confirm_after_mining_with_attempt(
+    attempt: &PaymentAttempt<'_>,
+    pending: Activity,
+) -> anyhow::Result<Activity> {
+    let pending = confirm_from_chain_with_attempt(attempt, pending).await?;
+    if matches!(pending.status.as_str(), "confirmed" | "failed") {
         return Ok(pending);
     }
-    match mine_and_sync(state, 1).await {
-        Ok(_) => confirm_from_chain(state, pending).await,
-        // Startup must classify the original failure; replacing it with a
-        // pending result would also retry store errors and broken invariants.
-        Err(error) if !state.started() => Err(error),
-        Err(error) => {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                activity = %pending.id,
-                "transaction recorded but auto-mine failed"
-            );
-            Ok(pending)
-        }
-    }
+    attempt
+        .mine_and_sync(1)
+        .await
+        .context("automatically mining and synchronizing payment")?;
+    confirm_from_chain_with_attempt(attempt, pending).await
 }
+
 fn notify(state: &AppState, topic: &str) {
     let _ = state.0.events.send(topic.to_owned());
 }
@@ -4418,7 +5459,7 @@ mod tests {
                     500_000_000,
                     "startup-account-1-ironwood-v1",
                 )?;
-                let activity = execute_payment(&runtime, pending, |_| async {
+                let activity = execute_payment(&runtime, pending, |_, _| async {
                     let attempt = prepare_calls.fetch_add(1, Ordering::SeqCst);
                     if window == "before-prepare" && attempt == 0 {
                         return Err(tonic::Status::unavailable(
@@ -4472,6 +5513,8 @@ mod tests {
                     "generate" if mode == "warmup" => return Json(json!({"error":{"code":-28,"message":"warming up"},"result":null})),
                     "generate" if mode == "internal" => return Json(json!({"error":{"code":-32603,"message":"internal failure"},"result":null})),
                     "generate" => json!(["mined-block"]),
+                    "getblock" if mode == "store" => json!({"height":100}),
+                    "getblockhash" if mode == "store" => json!("confirmed-block"),
                     "getblock" => json!({}),
                     method => panic!("unexpected startup method {method}"),
                 };
@@ -4532,7 +5575,7 @@ mod tests {
                 assert_eq!(saved.raw_transaction, b"original signed bytes");
                 state.mark_started();
                 let (status, response) = api_request(&state, "POST", "/api/v1/faucet", json!({"account_id":1,"pool":"ironwood","amount_zatoshi":500_000_000,"idempotency_key":"startup-account-1-ironwood-v1"})).await;
-                assert_eq!(status, StatusCode::OK);
+                assert_eq!(status, StatusCode::ACCEPTED);
                 assert_eq!(response["status"], "broadcast");
                 assert_eq!(response["txid"], "original-startup-txid");
             }
@@ -4580,8 +5623,13 @@ mod tests {
                         "getrawtransaction" => {
                             let txid = request["params"][0].as_str().unwrap();
                             assert!(matches!(txid, "journal-txid" | "fast-external-txid"));
+                            if txid == "journal-txid" && slow.load(Ordering::SeqCst) {
+                                return Json(json!({"result":null,"error":{"code":-5,"message":"not found"}}));
+                            }
                             json!({"txid":txid,"confirmations":1,"blockhash":"confirmed-block"})
                         }
+                        "getblock" => json!({"height":100}),
+                        "getblockhash" => json!("confirmed-block"),
                         method => panic!("unexpected journal recovery RPC {method}"),
                     };
                     Json(json!({"jsonrpc":"2.0","id":request["id"],"result":result,"error":null}))
@@ -4641,16 +5689,16 @@ mod tests {
                 .activity_for_key("slow-journal")
                 .unwrap()
                 .unwrap();
-            assert_eq!(pending.status, "preparing");
-            assert!(pending.txid.is_empty());
+            assert_eq!(pending.status, "prepared");
+            assert_eq!(pending.txid, "journal-txid");
             assert!(pending.last_error.is_some());
-            assert!(
+            assert_eq!(
                 state
                     .0
                     .store
                     .prepared_transaction_expiry(&internal.id)
-                    .unwrap()
-                    .is_none()
+                    .unwrap(),
+                Some(140)
             );
             let journal = state
                 .0
@@ -4690,77 +5738,350 @@ mod tests {
         assert!(server.await.unwrap_err().is_cancelled());
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn expired_attempt_observes_preparation_and_keeps_guards_until_recording_finishes() {
+        let (state, dir) = state_with_local_wallet();
+        let claim = lifecycle_claim(&state.0.store, "deadline-worker");
+        rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute(
+            "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'worker-txid',x'010203',140)", [&claim.id],
+        ).unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let work_state = state.clone();
+        let id = claim.id.clone();
+        let work = tokio::spawn(async move {
+            let attempt = PaymentAttempt {
+                state: &work_state,
+                dispatch_deadline: Some(deadline),
+            };
+            let _payments = attempt.lock(&work_state.0.payments).await?;
+            let _replenishment = attempt.lock(&work_state.0.treasury_replenishment).await?;
+            let store = work_state.0.store.clone();
+            let recorded_id = id.clone();
+            let prepared = FaucetRuntime::prepare_payment(
+                &attempt,
+                Some(&id),
+                None,
+                "invalid seed",
+                "invalid address",
+                0,
+                move |prepared| {
+                    entered.send(()).unwrap();
+                    released.recv().unwrap();
+                    store.record_prepared(
+                        &recorded_id,
+                        &prepared.txid,
+                        &prepared.raw_transaction,
+                        prepared.expiry_height,
+                    )?;
+                    Ok(prepared)
+                },
+            )
+            .await?;
+            PaymentSubmitter::broadcast(&attempt, &prepared.raw_transaction).await
+        });
+        ready.await.unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!work.is_finished());
+        assert!(state.0.payments.try_lock().is_err());
+        assert!(state.0.treasury_replenishment.try_lock().is_err());
+        release.send(()).unwrap();
+        let error = work.await.unwrap().unwrap_err();
+        assert!(
+            error
+                .downcast_ref::<crate::reconcile::ReconciliationDeadline>()
+                .is_some()
+        );
+        let saved = state
+            .0
+            .store
+            .activity_for_key("deadline-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "prepared");
+        assert_eq!(saved.txid, "worker-txid");
+        assert_eq!(
+            state
+                .0
+                .store
+                .prepared_transaction(&claim.id)
+                .unwrap()
+                .raw_transaction,
+            [1, 2, 3]
+        );
+        assert!(state.0.payments.try_lock().is_ok());
+        assert!(state.0.treasury_replenishment.try_lock().is_ok());
+    }
+
     #[tokio::test]
-    async fn journal_height_lookup_caps_both_repair_paths_without_extending_the_pass_deadline() {
-        let (endpoint, server) = journal_height_rpc(Arc::new(AtomicBool::new(true))).await;
-        let (mut state, dir) = state_with_local_wallet();
-        Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(endpoint);
-        let internal = lifecycle_claim(&state.0.store, "bounded-internal-journal");
+    async fn attempt_bounds_treasury_and_wallet_sync_serialization_waits() {
+        let (state, _dir) = state_with_local_wallet();
+        let _treasury = state.0.treasury_replenishment.lock().await;
+        let _sync = state.0.wallet_sync.lock().await;
+        let attempt = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        assert!(attempt.lock(&state.0.treasury_replenishment).await.is_err());
+        assert!(attempt.synchronize_wallet(None).await.is_err());
+        assert!(state.0.treasury_replenishment.try_lock().is_err());
+        assert!(state.0.wallet_sync.try_lock().is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_confirmation_keeps_its_stage_limit_while_dispatch_uses_remaining_time() {
+        let (mut state, _dir) = state_with_local_wallet();
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(2200)).await;
+                Json(json!({"result":{"txid":"confirmation-txid","confirmations":0},"error":null}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let startup = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: None,
+        };
+        let periodic = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + Duration::from_millis(100)),
+        };
+        let (startup_result, periodic_result) = tokio::join!(
+            startup.lookup_transaction("confirmation-txid"),
+            periodic.lookup_transaction("confirmation-txid")
+        );
+        assert!(periodic_result.is_err());
+        assert!(
+            startup_result.unwrap().is_some(),
+            "startup confirmation inherited the periodic two-second limit"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn automatic_mining_stages_share_the_remaining_attempt_budget() {
+        for stalled_stage in ["generate", "getblock"] {
+            let (mut state, _dir) = state_with_local_wallet();
+            let generated = Arc::new(AtomicUsize::new(0));
+            let block_reads = Arc::new(AtomicUsize::new(0));
+            let generated_rpc = generated.clone();
+            let blocks_rpc = block_reads.clone();
+            let app = Router::new().route(
+                "/",
+                post(move |Json(request): Json<Value>| {
+                    let generated = generated_rpc.clone();
+                    let blocks = blocks_rpc.clone();
+                    async move {
+                        let method = request["method"].as_str().unwrap();
+                        match method {
+                            "generate" => {
+                                generated.fetch_add(1, Ordering::SeqCst);
+                            }
+                            "getblock" => {
+                                blocks.fetch_add(1, Ordering::SeqCst);
+                            }
+                            method => panic!("unexpected stage {method}"),
+                        }
+                        tokio::time::sleep(if method == stalled_stage {
+                            Duration::from_secs(5)
+                        } else {
+                            Duration::from_millis(50)
+                        })
+                        .await;
+                        Json(json!({"result":["mined-block"],"error":null}))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            Arc::get_mut(&mut state.0).unwrap().rpc =
+                NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let attempt = PaymentAttempt {
+                state: &state,
+                dispatch_deadline: Some(Instant::now() + Duration::from_millis(150)),
+            };
+            let result = tokio::time::timeout(Duration::from_millis(500), attempt.mine_and_sync(1))
+                .await
+                .unwrap();
+            assert!(result.is_err());
+            assert_eq!(generated.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                block_reads.load(Ordering::SeqCst),
+                usize::from(stalled_stage == "getblock")
+            );
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_deadline_bounds_waiting_for_payment_serialization() {
+        let (state, _dir) = state_with_local_wallet();
+        lifecycle_claim(&state.0.store, "locked-dispatch");
+        let _guard = state.0.payments.lock().await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            progress_payment_intents(
+                &state,
+                Instant::now() + Duration::from_millis(500),
+                &mut None,
+                &mut None,
+            ),
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "payment lock wait exceeded the dispatch budget"
+        );
+        assert_eq!(
+            state
+                .0
+                .store
+                .activity_for_key("locked-dispatch")
+                .unwrap()
+                .unwrap()
+                .status,
+            "preparing"
+        );
+    }
+
+    #[tokio::test]
+    async fn payment_lookup_uses_remaining_dispatch_time() {
+        let (mut state, _dir) = state_with_local_wallet();
+        let pending = lifecycle_claim(&state.0.store, "short-dispatch");
+        state
+            .0
+            .store
+            .record_prepared(&pending.id, "pending-txid", b"signed bytes", 0)
+            .unwrap();
+        let app = Router::new().route("/", post(|| async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Json(json!({"result":null,"error":{"code":-5,"message":"No such mempool or main chain transaction"}}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            progress_payment_intents(
+                &state,
+                Instant::now() + Duration::from_millis(500),
+                &mut None,
+                &mut None,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "lookup extended the dispatch budget");
+        let saved = state
+            .0
+            .store
+            .activity_for_key("short-dispatch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "prepared");
+        assert_eq!(saved.txid, "pending-txid");
+        assert_eq!(
+            state
+                .0
+                .store
+                .prepared_transaction(&pending.id)
+                .unwrap()
+                .raw_transaction,
+            b"signed bytes"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn payment_presence_rejects_a_mismatched_transaction_identity() {
+        let (mut state, _dir) = state_with_local_wallet();
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                Json(
+                    json!({"result":{"txid":"another-transaction","confirmations":0},"error":null}),
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let attempt = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + Duration::from_secs(1)),
+        };
+        assert!(
+            PaymentSubmitter::transaction_known(&attempt, "expected-transaction")
+                .await
+                .is_err()
+        );
+        assert!(
+            PaymentSubmitter::transaction_known(&state, "expected-transaction")
+                .await
+                .is_err()
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn expired_wallet_journals_restore_both_server_rows_without_network() {
+        let (state, dir) = state_with_local_wallet();
+        let internal = lifecycle_claim(&state.0.store, "expired-internal-journal");
         let external = state
             .0
             .store
-            .claim_address_faucet("tm-external", 12_000, "bounded-external-journal")
+            .claim_address_faucet("tm-external", 12_000, "expired-external-journal")
             .unwrap();
         let wallet_db = rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap();
         for id in [&internal.id, &external.id] {
-            wallet_db
-                .execute(
-                    "INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,?2,?3,?4)",
-                    rusqlite::params![id, "journal-txid", b"original signed bytes", 140_u64],
-                )
-                .unwrap();
+            wallet_db.execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',x'010203',140)", [id]).unwrap();
         }
-
-        for budget in [PAYMENT_DISPATCH_BUDGET, Duration::from_millis(100)] {
-            for internal_path in [true, false] {
-                let started = Instant::now();
-                let deadline = started + budget;
-                let (id, result) = if internal_path {
-                    (
-                        &internal.id,
-                        repair_activity_journal(&state, &internal, deadline).await,
-                    )
-                } else {
-                    (
-                        &external.id,
-                        repair_address_journal(&state, &external, deadline).await,
-                    )
-                };
-                let error = result.err().unwrap();
-                assert!(
-                    error
-                        .downcast_ref::<tokio::time::error::Elapsed>()
-                        .is_some()
-                );
-                assert!(
-                    started.elapsed() < budget.min(PAYMENT_LOOKUP_TIMEOUT) + Duration::from_secs(1)
-                );
-                let journal = state.0.wallet.prepared(id).await.unwrap().unwrap();
-                assert_eq!(journal.txid, "journal-txid");
-                assert_eq!(journal.raw_transaction, b"original signed bytes");
-                assert_eq!(journal.expiry_height, 140);
-            }
-        }
-
-        wallet_db
-            .execute("UPDATE ext_tsz_prepared_payments SET expiry_height=0", [])
-            .unwrap();
-        let internal_journal = repair_activity_journal(&state, &internal, Instant::now())
-            .await
-            .unwrap()
-            .unwrap();
-        let external_journal = repair_address_journal(&state, &external, Instant::now())
-            .await
-            .unwrap()
-            .unwrap();
-        for journal in [internal_journal, external_journal] {
-            assert_eq!(journal.txid, "journal-txid");
-            assert_eq!(journal.raw_transaction, b"original signed bytes");
-            assert_eq!(journal.expiry_height, 0);
-        }
-
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            repair_activity_journal(&state, &internal)
+                .await
+                .unwrap()
+                .unwrap()
+                .txid,
+            "original-txid"
+        );
+        assert_eq!(
+            repair_address_journal(&state, &external)
+                .await
+                .unwrap()
+                .unwrap()
+                .txid,
+            "original-txid"
+        );
+        assert_eq!(
+            state
+                .0
+                .store
+                .activity_for_key("expired-internal-journal")
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
+        assert_eq!(
+            state
+                .0
+                .store
+                .address_faucet_for_key("expired-external-journal")
+                .unwrap()
+                .unwrap()
+                .status,
+            "prepared"
+        );
     }
 
     #[tokio::test]
@@ -4772,6 +6093,14 @@ mod tests {
             post(move |Json(request): Json<Value>| {
                 let lookup_count = lookup_count.clone();
                 async move {
+                    match request["method"].as_str().unwrap() {
+                        "getblock" => return Json(json!({"result":{"height":100},"error":null})),
+                        "getblockhash" => {
+                            return Json(json!({"result":"external-block","error":null}));
+                        }
+                        "getrawtransaction" => {}
+                        method => panic!("unexpected RPC {method}"),
+                    }
                     let txid = request["params"][0].as_str().unwrap();
                     if txid == "slow-internal-txid" {
                         tokio::time::sleep(PAYMENT_LOOKUP_TIMEOUT + Duration::from_secs(1)).await;
@@ -4857,12 +6186,25 @@ mod tests {
         let rpc = Router::new().route("/", post(move |Json(request): Json<Value>| {
             let calls = rpc_calls.clone();
             async move {
-                assert_eq!(request["method"], "getrawtransaction");
-                assert_eq!(request["params"][0], "reopened-txid");
-                let response = if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                    json!({"result": null, "error": {"code": -5, "message": "not found"}, "id": request["id"]})
-                } else {
-                    json!({"result": {"txid": "reopened-txid", "confirmations": 1, "blockhash": "inclusion-block"}, "error": null, "id": request["id"]})
+                let response = match request["method"].as_str().unwrap() {
+                    "getrawtransaction" => {
+                        assert_eq!(request["params"][0], "reopened-txid");
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            json!({"result": null, "error": {"code": -5, "message": "not found"}, "id": request["id"]})
+                        } else {
+                            json!({"result": {"txid": "reopened-txid", "confirmations": 1, "blockhash": "inclusion-block"}, "error": null, "id": request["id"]})
+                        }
+                    }
+                    "getblockchaininfo" => json!({"result": {"chain": "regtest", "blocks": 100, "bestblockhash": "tip-block"}, "error": null, "id": request["id"]}),
+                    "getblock" => {
+                        assert_eq!(request["params"][0], "inclusion-block");
+                        json!({"result": {"height": 100}, "error": null, "id": request["id"]})
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"][0], 100);
+                        json!({"result": "inclusion-block", "error": null, "id": request["id"]})
+                    }
+                    method => panic!("unexpected recovery RPC {method}"),
                 };
                 Json(response)
             }
@@ -4873,6 +6215,7 @@ mod tests {
         let store = Store::open(dir.path().join("server.db")).unwrap();
         let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
         let state = AppState::new(store, wallet, rpc_url, "test".into());
+        state.mark_started();
         let mut updates = state.0.events.subscribe();
         // The production loop must progress even while synchronization owns
         // its guard, and must not require a new block or a payment POST.
@@ -4916,7 +6259,18 @@ mod tests {
             let released = released.clone();
             let calls = rpc_calls.clone();
             async move {
-                assert_eq!(request["method"], "getrawtransaction");
+                match request["method"].as_str().unwrap() {
+                    "getrawtransaction" => {}
+                    "getblock" => {
+                        assert_eq!(request["params"][0], "recovered-block");
+                        return Json(json!({"result": {"height": 100}, "error": null, "id": request["id"]}));
+                    }
+                    "getblockhash" => {
+                        assert_eq!(request["params"][0], 100);
+                        return Json(json!({"result": "recovered-block", "error": null, "id": request["id"]}));
+                    }
+                    method => panic!("unexpected recovery RPC {method}"),
+                }
                 assert_eq!(request["params"][0], "cancelled-request-txid");
                 if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     let released = released.lock().unwrap().take().unwrap();
@@ -4940,6 +6294,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, rpc).await.unwrap() });
         let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
         let state = AppState::new(store, wallet, rpc_url, "test".into());
+        state.mark_started();
         let mut updates = state.0.events.subscribe();
         let request_state = state.clone();
         let request_claim = claim.clone();
@@ -5183,7 +6538,7 @@ mod tests {
 
         let result = execute_payment(&runtime, confirmed.clone(), {
             let prepare_calls = prepare_calls.clone();
-            move |_| {
+            move |_, _| {
                 prepare_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(prepared_payment_result("unused", 180)))
             }
@@ -5205,7 +6560,7 @@ mod tests {
             .fail(&claim.id, "insufficient spendable funds")
             .unwrap();
         let runtime = RecordingPaymentLifecycle::new(store, []);
-        let result = execute_payment(&runtime, failed.clone(), |_| async {
+        let result = execute_payment(&runtime, failed.clone(), |_, _| async {
             panic!("failed replay must not prepare another payment")
         })
         .await
@@ -5242,7 +6597,7 @@ mod tests {
             })))
         };
         assert!(
-            execute_payment(&state, claim.clone(), |_| failure())
+            execute_payment(&state, claim.clone(), |_, _| failure())
                 .await
                 .is_err()
         );
@@ -5275,7 +6630,7 @@ mod tests {
         assert_eq!(replay.id, failed.id);
         assert_eq!(replay.status, "failed");
         let prepare_calls = AtomicUsize::new(0);
-        let replayed = execute_payment(&state, replay, |_| {
+        let replayed = execute_payment(&state, replay, |_, _| {
             prepare_calls.fetch_add(1, Ordering::SeqCst);
             std::future::ready(Ok(PreparedPayment {
                 txid: "later-funded-txid".into(),
@@ -5294,6 +6649,129 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insufficient_send_keeps_the_uncertain_original_lookup_error_pending() {
+        let (mut state, dir) = state_with_local_wallet();
+        let claim = lifecycle_claim(&state.0.store, "uncertain-insufficient-send");
+        rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'expired-txid',x'010203',140)", [&claim.id]).unwrap();
+        let prepared = state
+            .0
+            .store
+            .record_prepared(&claim.id, "expired-txid", &[1, 2, 3], 140)
+            .unwrap();
+        let pending = state
+            .0
+            .store
+            .reset_for_retry(&prepared.id, &prepared.txid)
+            .unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let rpc_lookups = lookups.clone();
+        let app = Router::new().route("/", post(move |Json(request): Json<Value>| {
+            let lookups = rpc_lookups.clone();
+            async move {
+                match request["method"].as_str().unwrap() {
+                    "getrawtransaction" if lookups.fetch_add(1, Ordering::SeqCst) < 3 => Json(json!({"result":null,"error":{"code":-5,"message":"original absent"}})),
+                    "getrawtransaction" => Json(json!({"result":null,"error":{"code":-28,"message":"original lookup uncertain"}})),
+                    "getblockchaininfo" => Json(json!({"result":{"chain":"regtest","blocks":140},"error":null})),
+                    method => panic!("unexpected RPC {method}"),
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Arc::get_mut(&mut state.0).unwrap().rpc =
+            NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let prepare_calls = AtomicUsize::new(0);
+        let error = execute_payment(&state, pending, |_, _| {
+            prepare_calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Err(anyhow::Error::new(PaymentError::InsufficientFunds {
+                available: 0,
+                required: 12_000,
+            })))
+        })
+        .await
+        .expect_err("uncertain original must remain pending");
+        assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(lookups.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            error.downcast_ref::<RpcError>().map(|error| error.code),
+            Some(-28),
+            "{error:#}"
+        );
+        let saved = state
+            .0
+            .store
+            .activity_for_key("uncertain-insufficient-send")
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.status, "preparing");
+        assert!(saved.txid.is_empty());
+        assert!(
+            saved
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("original lookup uncertain")
+        );
+        let journal = state.0.wallet.prepared(&claim.id).await.unwrap().unwrap();
+        assert_eq!(journal.txid, "expired-txid");
+        assert_eq!(journal.raw_transaction, [1, 2, 3]);
+        lookups.store(2, Ordering::SeqCst);
+        state
+            .0
+            .store
+            .record_error(&claim.id, "preparing", "", "earlier insufficient funds")
+            .unwrap();
+        let periodic_attempt = PaymentAttempt {
+            state: &state,
+            dispatch_deadline: Some(Instant::now() + PAYMENT_DISPATCH_BUDGET),
+        };
+        let periodic_error = can_fail_insufficient_send_with_attempt(&periodic_attempt, &claim.id)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            periodic_error
+                .downcast_ref::<RpcError>()
+                .map(|error| error.code),
+            Some(-28)
+        );
+        assert_eq!(lookups.load(Ordering::SeqCst), 4);
+        record_current_activity_error(
+            &state.0.store,
+            "uncertain-insufficient-send",
+            &format!("{periodic_error:#}"),
+        )
+        .unwrap();
+        let pending_periodic = state
+            .0
+            .store
+            .activity_for_key("uncertain-insufficient-send")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending_periodic.status, "preparing");
+        assert!(pending_periodic.txid.is_empty());
+        assert!(
+            pending_periodic
+                .last_error
+                .as_deref()
+                .unwrap()
+                .contains("original lookup uncertain")
+        );
+        assert_eq!(
+            state
+                .0
+                .wallet
+                .prepared(&claim.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .txid,
+            "expired-txid"
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
     async fn insufficient_send_policy_waits_for_wallet_journal_and_checks_server_transaction() {
         let (state, dir) = state_with_local_wallet();
         let claim = state
@@ -5309,14 +6787,14 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(can_fail_insufficient_send(&state, &claim.id).await);
+        assert!(can_fail_insufficient_send(&state, &claim.id).await.unwrap());
 
         state
             .0
             .store
             .record_prepared(&claim.id, "server-txid", b"signed", 140)
             .unwrap();
-        assert!(!can_fail_insufficient_send(&state, &claim.id).await);
+        assert!(!can_fail_insufficient_send(&state, &claim.id).await.unwrap());
 
         let wallet_claim = state
             .0
@@ -5338,7 +6816,11 @@ mod tests {
                 rusqlite::params![wallet_claim.id, "wallet-txid", b"signed", 140_u64],
             )
             .unwrap();
-        assert!(!can_fail_insufficient_send(&state, &wallet_claim.id).await);
+        assert!(
+            can_fail_insufficient_send(&state, &wallet_claim.id)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -5407,7 +6889,7 @@ mod tests {
 
         let result = execute_payment(&runtime, prepared, {
             let prepare_calls = prepare_calls.clone();
-            move |_| {
+            move |_, _| {
                 prepare_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(prepared_payment_result("unused", 180)))
             }
@@ -5436,7 +6918,8 @@ mod tests {
 
         let result = execute_payment(&runtime, prepared, {
             let prepare_calls = prepare_calls.clone();
-            move |_| {
+            move |_, replacement_txid| {
+                assert_eq!(replacement_txid.as_deref(), Some("expired-txid"));
                 prepare_calls.fetch_add(1, Ordering::SeqCst);
                 std::future::ready(Ok(prepared_payment_result("replacement-txid", 180)))
             }
@@ -5457,7 +6940,7 @@ mod tests {
         let runtime = RecordingPaymentLifecycle::new(store.clone(), []);
         runtime.record_fails.store(true, Ordering::SeqCst);
 
-        let result = execute_payment(&runtime, claim.clone(), |_| {
+        let result = execute_payment(&runtime, claim.clone(), |_, _| {
             std::future::ready(Ok(prepared_payment_result("durable-txid", 180)))
         })
         .await;
@@ -5484,7 +6967,7 @@ mod tests {
         let mut runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
         runtime.confirm = false;
 
-        let result = execute_payment(&runtime, prepared, |_| {
+        let result = execute_payment(&runtime, prepared, |_, _| {
             std::future::ready(Ok(prepared_payment_result("unused", 180)))
         })
         .await
@@ -5519,7 +7002,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            execute_payment(&state, claim.clone(), |_| {
+            execute_payment(&state, claim.clone(), |_, _| {
                 std::future::ready(Err(anyhow::anyhow!("preparation failed")))
             })
             .await
@@ -5550,7 +7033,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            execute_payment(&state, claim.clone(), |_| {
+            execute_payment(&state, claim.clone(), |_, _| {
                 std::future::ready(Err(anyhow::anyhow!("preparation failed")))
             })
             .await
@@ -5559,7 +7042,10 @@ mod tests {
         let retained = state.0.store.activity_for_key("same").unwrap().unwrap();
         assert_eq!(retained.id, claim.id);
         assert_eq!(retained.status, "preparing");
-        assert_eq!(retained.last_error.as_deref(), Some("preparation failed"));
+        assert_eq!(
+            retained.last_error.as_deref(),
+            Some("preparing payment: preparation failed")
+        );
     }
 
     #[test]
@@ -6039,9 +7525,7 @@ mod tests {
 
     const REPLAY_KEY: &str = "existing-idempotency-key";
 
-    /// A state with a real store and offline wallet whose node RPC refuses
-    /// connections, so any synchronization or network access surfaces as a
-    /// 500 rather than the 400 or replay these tests expect.
+    /// A real local store and SDK wallet with unavailable network dependencies.
     fn offline_state() -> (AppState, tempfile::TempDir) {
         let store = Store::open(":memory:").unwrap();
         store.initialize().unwrap();
@@ -6332,12 +7816,10 @@ mod tests {
         }
         assert_eq!(activity_ids(&state), before);
 
-        // Guard for the harness itself: a send that is not a replay must reach
-        // the (unreachable) network and fail, so the 200s above prove none did.
         let mut fresh = valid_send();
         fresh["idempotency_key"] = json!("a-key-never-used-before");
         let (status, _) = post_send(&state, &fresh).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(status, StatusCode::ACCEPTED);
         let after = activity_ids(&state);
         assert_eq!(after.len(), before.len() + 1);
         assert!(before.iter().all(|id| after.contains(id)));
@@ -6348,7 +7830,17 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(retained.status, "preparing");
-        assert!(retained.last_error.is_some());
+        assert_eq!(retained.last_error, None);
+        assert!(state.0.store.prepared_transaction(&retained.id).is_err());
+        assert!(
+            state
+                .0
+                .wallet
+                .prepared(&retained.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -6759,6 +8251,7 @@ mod tests {
         async fn prepare_payment<F>(
             &self,
             _activity_id: Option<&str>,
+            _replacement_txid: Option<&str>,
             _seed: &str,
             _destination: &str,
             _amount_zatoshi: u64,
@@ -6861,6 +8354,7 @@ mod tests {
         let prepared = prepare_with_replenishment(
             &runtime,
             None,
+            None,
             "seed",
             &treasury,
             "uregtest-recipient",
@@ -6896,6 +8390,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn original_presence_accepts_zakura_mempool_responses_without_confirmations() {
+        let runtime = RecordingPaymentSubmitter::default();
+        let mempool = json!({"txid": "original-txid", "hex": "010203", "vin": [], "vout": []});
+        for confirmations in [None, Some(Value::Null), Some(json!(0))] {
+            for blockhash in [None, Some(Value::Null)] {
+                let mut transaction = mempool.clone();
+                if let Some(confirmations) = &confirmations {
+                    transaction["confirmations"] = confirmations.clone();
+                }
+                if let Some(blockhash) = blockhash {
+                    transaction["blockhash"] = blockhash;
+                }
+                assert_eq!(
+                    original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                        .await
+                        .unwrap(),
+                    OriginalTransactionState::Present,
+                );
+            }
+        }
+        for confirmations in [json!("0"), json!(false), json!(0.5), json!([]), json!(-1)] {
+            let mut transaction = mempool.clone();
+            transaction["confirmations"] = confirmations;
+            assert!(
+                original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                    .await
+                    .is_err()
+            );
+        }
+        for confirmations in [None, Some(Value::Null), Some(json!(0))] {
+            let mut transaction = mempool.clone();
+            transaction["blockhash"] = json!("an-inclusion-block");
+            if let Some(confirmations) = confirmations {
+                transaction["confirmations"] = confirmations;
+            }
+            assert!(
+                original_presence_from_lookup(&runtime, "original-txid", Some(transaction))
+                    .await
+                    .is_err()
+            );
+        }
+        let mut wrong_identity = mempool.clone();
+        wrong_identity["txid"] = json!("another-txid");
+        assert!(
+            original_presence_from_lookup(&runtime, "original-txid", Some(wrong_identity))
+                .await
+                .is_err()
+        );
+        let mut unverified_inclusion = mempool;
+        unverified_inclusion["confirmations"] = json!(1);
+        unverified_inclusion["blockhash"] = json!("an-inclusion-block");
+        assert!(
+            original_presence_from_lookup(&runtime, "original-txid", Some(unverified_inclusion))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn address_faucet_reconciles_the_original_txid_after_a_lost_broadcast_response() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("app.db");
@@ -6916,6 +8469,7 @@ mod tests {
             .unwrap();
         let runtime = RecordingPaymentSubmitter {
             lookups: Mutex::new(VecDeque::from([
+                Ok(false),
                 Ok(false),
                 Err("node unavailable"),
                 Ok(true),
@@ -6949,6 +8503,19 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PaymentSubmitter for RecordingPaymentSubmitter {
+        async fn lookup_original(&self, txid: &str) -> anyhow::Result<Option<Value>> {
+            Ok(self
+                .transaction_known(txid)
+                .await?
+                .then(|| json!({"txid":txid,"confirmations":0})))
+        }
+        async fn inclusion_height(&self, _hash: &str) -> anyhow::Result<u64> {
+            anyhow::bail!("unexpected inclusion lookup")
+        }
+        async fn canonical_hash(&self, _height: u32) -> anyhow::Result<String> {
+            anyhow::bail!("unexpected canonical lookup")
+        }
+
         async fn transaction_known(&self, _txid: &str) -> anyhow::Result<bool> {
             self.lookups
                 .lock()
@@ -7014,7 +8581,9 @@ mod tests {
             let runtime = RecordingPaymentSubmitter {
                 lookups: Mutex::new(VecDeque::from([
                     Ok(false),
+                    Ok(false),
                     Err("node unavailable"),
+                    Ok(false),
                     Ok(false),
                 ])),
                 height: AtomicU64::new(139),
@@ -7289,6 +8858,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn saved_original_inclusion_wins_over_expiry_only_on_the_selected_chain() {
+        for (mode, expected_status) in [
+            ("included", "confirmed"),
+            ("boundary", "confirmed"),
+            ("orphan", "prepared"),
+            ("malformed", "prepared"),
+            ("unavailable", "prepared"),
+        ] {
+            let (mut state, dir) = state_with_local_wallet();
+            let claim = lifecycle_claim(&state.0.store, mode);
+            rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',?2,140)", rusqlite::params![claim.id, b"signed original"]).unwrap();
+            repair_activity_journal(&state, &claim)
+                .await
+                .unwrap()
+                .unwrap();
+            let prepared = state.0.store.activity_for_key(mode).unwrap().unwrap();
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let rpc_lookups = lookups.clone();
+            let app = Router::new().route("/", post(move |Json(request): Json<Value>| {
+                let lookups = Arc::clone(&rpc_lookups);
+                async move {
+                    let result = match request["method"].as_str().unwrap() {
+                        "getrawtransaction" => {
+                            let index = lookups.fetch_add(1, Ordering::SeqCst);
+                            if (mode == "boundary" || mode == "unavailable") && index == 0 {
+                                return Json(json!({"result":null,"error":{"code":-5,"message":"missing"}}));
+                            }
+                            if mode == "unavailable" {
+                                return Json(json!({"result":null,"error":{"code":-28,"message":"unavailable"}}));
+                            }
+                            if mode == "malformed" { json!({"txid":"original-txid","confirmations":1}) }
+                            else { json!({"txid":"original-txid","confirmations":1,"blockhash":"original-block"}) }
+                        }
+                        "getblockchaininfo" => json!({"chain":"regtest","blocks":140}),
+                        "getblock" => json!({"height":140}),
+                        "getblockhash" => json!(if mode == "orphan" {"different-block"} else {"original-block"}),
+                        method => panic!("unexpected RPC {method}"),
+                    };
+                    Json(json!({"result":result,"error":null}))
+                }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            Arc::get_mut(&mut state.0).unwrap().rpc =
+                NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let attempt = PaymentAttempt {
+                state: &state,
+                dispatch_deadline: Some(Instant::now() + PAYMENT_DISPATCH_BUDGET),
+            };
+            let result = submit_prepared(&state.0.store, &attempt, &prepared).await;
+            if expected_status == "confirmed" {
+                assert!(result.is_ok(), "{mode}");
+            } else {
+                assert!(result.is_err(), "{mode} must remain pending");
+            }
+            let saved = state.0.store.activity_for_key(mode).unwrap().unwrap();
+            assert_eq!(saved.status, expected_status, "{mode}");
+            assert_eq!(saved.id, claim.id);
+            assert_eq!(saved.txid, "original-txid");
+            assert_eq!(
+                state
+                    .0
+                    .store
+                    .prepared_transaction(&claim.id)
+                    .unwrap()
+                    .raw_transaction,
+                b"signed original"
+            );
+            let external = state
+                .0
+                .store
+                .claim_address_faucet("external-address", 12_000, &format!("external-{mode}"))
+                .unwrap();
+            rusqlite::Connection::open(dir.path().join("wallet.db")).unwrap().execute("INSERT INTO ext_tsz_prepared_payments(activity_id,txid,raw_transaction,expiry_height) VALUES(?1,'original-txid',?2,140)", rusqlite::params![external.id, b"signed original"]).unwrap();
+            repair_address_journal(&state, &external)
+                .await
+                .unwrap()
+                .unwrap();
+            let external_prepared = state
+                .0
+                .store
+                .address_faucet_for_key(&format!("external-{mode}"))
+                .unwrap()
+                .unwrap();
+            lookups.store(0, Ordering::SeqCst);
+            let result =
+                submit_address_prepared(&state.0.store, &attempt, &external_prepared).await;
+            assert_eq!(
+                result.is_ok(),
+                expected_status == "confirmed",
+                "external {mode}"
+            );
+            let saved_external = state
+                .0
+                .store
+                .address_faucet_for_key(&format!("external-{mode}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved_external.status, expected_status);
+            assert_eq!(saved_external.id, external.id);
+            assert_eq!(saved_external.txid, "original-txid");
+            for id in [&claim.id, &external.id] {
+                let journal = state.0.wallet.prepared(id).await.unwrap().unwrap();
+                assert_eq!(journal.txid, "original-txid");
+                assert_eq!(journal.raw_transaction, b"signed original");
+            }
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_expiry_and_mempool_presence_retain_the_original_payment() {
+        for (expiry, present) in [(0, false), (140, true)] {
+            let (store, prepared) = prepared_payment(expiry);
+            let runtime = RecordingPaymentSubmitter {
+                lookups: Mutex::new(VecDeque::from([Ok(present)])),
+                height: AtomicU64::new(500),
+                ..Default::default()
+            };
+            let result = submit_prepared(&store, &runtime, &prepared).await.unwrap();
+            assert!(matches!(result, PreparedSubmission::Broadcast(_)));
+            let saved = store.activity_for_key("same").unwrap().unwrap();
+            assert_eq!(saved.txid, "real-txid");
+            assert_eq!(saved.status, "broadcast");
+            assert_eq!(
+                *runtime.broadcasts.lock().unwrap(),
+                if present {
+                    vec![]
+                } else {
+                    vec![b"signed transaction".to_vec()]
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canonical_payment_reads_share_the_remaining_attempt_deadline() {
+        for stalled_method in ["getblock", "getblockhash"] {
+            let (mut state, _dir) = state_with_local_wallet();
+            let claim = lifecycle_claim(&state.0.store, stalled_method);
+            let prepared = state
+                .0
+                .store
+                .record_prepared(&claim.id, "original-txid", b"signed original", 140)
+                .unwrap();
+            let app = Router::new().route("/", post(move |Json(request): Json<Value>| async move {
+                let method = request["method"].as_str().unwrap();
+                if method == stalled_method { tokio::time::sleep(Duration::from_secs(5)).await; }
+                let result = match method {
+                    "getrawtransaction" => json!({"txid":"original-txid","confirmations":1,"blockhash":"original-block"}),
+                    "getblock" => json!({"height":140}),
+                    "getblockhash" => json!("original-block"),
+                    _ => panic!("unexpected RPC"),
+                };
+                Json(json!({"result":result,"error":null}))
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            Arc::get_mut(&mut state.0).unwrap().rpc =
+                NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let attempt = PaymentAttempt {
+                state: &state,
+                dispatch_deadline: Some(Instant::now() + Duration::from_millis(100)),
+            };
+            let started = Instant::now();
+            assert!(
+                submit_prepared(&state.0.store, &attempt, &prepared)
+                    .await
+                    .is_err()
+            );
+            assert!(started.elapsed() < Duration::from_secs(1));
+            let saved = state
+                .0
+                .store
+                .activity_for_key(stalled_method)
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.status, "prepared");
+            assert_eq!(saved.txid, "original-txid");
+            server.abort();
+            assert!(server.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    #[tokio::test]
     async fn an_expired_missing_transaction_is_reset_for_preparation() {
         let (store, prepared) = prepared_payment(140);
         let runtime = RecordingPaymentSubmitter {
@@ -7377,6 +9132,493 @@ mod tests {
 
     async fn api_get(state: &AppState, uri: &str) -> (StatusCode, Value) {
         api_request(state, "GET", uri, Value::Null).await
+    }
+
+    async fn payment_post(
+        state: &AppState,
+        uri: &str,
+        body: &Value,
+    ) -> (StatusCode, String, Value) {
+        let response = tokio::time::timeout(
+            Duration::from_secs(1),
+            router(state.clone()).oneshot(
+                Request::post(uri)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("payment admission waited for execution")
+        .unwrap();
+        let status = response.status();
+        let location = response.headers()[LOCATION].to_str().unwrap().to_owned();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, location, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn all_payment_posts_admit_without_execution_while_payments_are_busy() {
+        let (local, _dir) = offline_state();
+        let (rpc_url, calls) = counting_rpc(false).await;
+        let state = AppState::new(
+            local.0.store.clone(),
+            local.0.wallet.clone(),
+            rpc_url,
+            "test".into(),
+        );
+        state.mark_started();
+        let _payment = state.0.payments.lock().await;
+        let internal = state.0.store.account(2).unwrap().transparent_address;
+        let external = state
+            .0
+            .store
+            .account(TREASURY_ACCOUNT_ID)
+            .unwrap()
+            .unified_address;
+        let cases = [
+            ("/api/v1/send", valid_send(), REPLAY_KEY, false),
+            (
+                "/api/v1/faucet",
+                json!({"account_id": 3, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": "busy-account-faucet"}),
+                "busy-account-faucet",
+                false,
+            ),
+            (
+                "/api/v1/faucet/address",
+                json!({"address": internal, "amount_zatoshi": 100_000, "idempotency_key": "busy-internal-address"}),
+                "busy-internal-address",
+                false,
+            ),
+            (
+                "/api/v1/faucet/address",
+                json!({"address": external, "amount_zatoshi": 100_000, "idempotency_key": "busy-external-address"}),
+                "busy-external-address",
+                true,
+            ),
+        ];
+        for (uri, request, key, external) in cases {
+            let (status, location, response) = payment_post(&state, uri, &request).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{uri}");
+            assert_eq!(response["status"], "preparing");
+            assert_eq!(response["last_error"], Value::Null);
+            assert_eq!(response["txid"], "");
+            let id = if external {
+                assert!(state.0.store.activity_for_key(key).unwrap().is_none());
+                let saved = state.0.store.address_faucet_for_key(key).unwrap().unwrap();
+                assert_eq!(saved.address, request["address"].as_str().unwrap());
+                saved.id
+            } else {
+                assert!(state.0.store.address_faucet_for_key(key).unwrap().is_none());
+                let saved = state.0.store.activity_for_key(key).unwrap().unwrap();
+                assert_eq!(saved.amount_zatoshi, 100_000);
+                saved.id
+            };
+            assert!(state.0.store.prepared_transaction(&id).is_err());
+            assert!(state.0.wallet.prepared(&id).await.unwrap().is_none());
+            let before = (
+                state.0.store.unresolved_activities().unwrap(),
+                state.0.store.unresolved_address_faucets().unwrap(),
+            );
+            let durable_response = if uri == "/api/v1/faucet/address" {
+                response
+            } else {
+                let saved = state.0.store.activity_for_key(key).unwrap().unwrap();
+                let mut admitted = response;
+                admitted["created_at"] = json!(saved.created_at);
+                let durable = serde_json::to_value(saved).unwrap();
+                assert_eq!(admitted, durable);
+                durable
+            };
+            assert_eq!(
+                payment_post(&state, uri, &request).await,
+                (status, location, durable_response)
+            );
+            assert_eq!(
+                (
+                    state.0.store.unresolved_activities().unwrap(),
+                    state.0.store.unresolved_address_faucets().unwrap()
+                ),
+                before,
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.0.store.activities(100).unwrap().len(), 3);
+        assert_eq!(state.0.store.unresolved_address_faucets().unwrap().len(), 1);
+        assert!(state.0.mining.latest().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn payment_replays_use_stored_status_and_exact_encoded_location() {
+        const KEY: &str = "payment-key?x=1&y=+%/#";
+        const ENCODED_KEY: &str = "payment-key%3Fx%3D1%26y%3D%2B%25%2F%23";
+        for endpoint in ["send", "faucet", "internal-address", "external-address"] {
+            for stored_status in ["preparing", "prepared", "broadcast", "confirmed", "failed"] {
+                let (state, _dir) = offline_state();
+                let store = &state.0.store;
+                let external = endpoint == "external-address";
+                let address = store
+                    .account(if external { TREASURY_ACCOUNT_ID } else { 2 })
+                    .unwrap()
+                    .unified_address;
+                let (uri, status_path, request) = match endpoint {
+                    "send" => {
+                        let mut body = valid_send();
+                        body["idempotency_key"] = json!(KEY);
+                        body["memo"] = json!("stored memo");
+                        ("/api/v1/send", "/api/v1/activity", body)
+                    }
+                    "faucet" => (
+                        "/api/v1/faucet",
+                        "/api/v1/activity",
+                        json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": KEY}),
+                    ),
+                    _ => (
+                        "/api/v1/faucet/address",
+                        "/api/v1/faucet/address",
+                        json!({"address": address, "amount_zatoshi": 100_000, "idempotency_key": KEY}),
+                    ),
+                };
+                let id = if external {
+                    store
+                        .claim_address_faucet(&address, 100_000, KEY)
+                        .unwrap()
+                        .id
+                } else if endpoint == "send" {
+                    store
+                        .claim_transfer(
+                            1,
+                            Recipient::Account(2),
+                            "ironwood",
+                            "ironwood",
+                            100_000,
+                            KEY,
+                            Some("stored memo"),
+                        )
+                        .unwrap()
+                        .id
+                } else {
+                    store.claim_faucet(2, "ironwood", 100_000, KEY).unwrap().id
+                };
+                match stored_status {
+                    "failed" => {
+                        if external {
+                            store.fail_address(&id, "stored failure").unwrap();
+                        } else {
+                            store.fail(&id, "stored failure").unwrap();
+                        }
+                    }
+                    "prepared" | "broadcast" | "confirmed" => {
+                        if external {
+                            store
+                                .record_address_prepared(
+                                    &id,
+                                    "original-txid",
+                                    b"original signed bytes",
+                                    140,
+                                )
+                                .unwrap();
+                            if stored_status != "prepared" {
+                                store.mark_address_broadcast(&id, "original-txid").unwrap();
+                            }
+                            if stored_status == "confirmed" {
+                                store
+                                    .confirm_address(&id, "original-txid", "original-block")
+                                    .unwrap();
+                            }
+                        } else {
+                            store
+                                .record_prepared(
+                                    &id,
+                                    "original-txid",
+                                    b"original signed bytes",
+                                    140,
+                                )
+                                .unwrap();
+                            if stored_status != "prepared" {
+                                store.mark_broadcast(&id, "original-txid").unwrap();
+                            }
+                            if stored_status == "confirmed" {
+                                store
+                                    .confirm(&id, "original-txid", "original-block")
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if matches!(stored_status, "preparing" | "prepared" | "broadcast") {
+                    let txid = if stored_status == "preparing" {
+                        ""
+                    } else {
+                        "original-txid"
+                    };
+                    if external {
+                        store
+                            .record_address_error(
+                                &id,
+                                stored_status,
+                                txid,
+                                "pending execution error",
+                            )
+                            .unwrap();
+                    } else {
+                        store
+                            .record_error(&id, stored_status, txid, "pending execution error")
+                            .unwrap();
+                    }
+                }
+                let expected = if endpoint == "send" || endpoint == "faucet" {
+                    serde_json::to_value(store.activity_for_key(KEY).unwrap().unwrap()).unwrap()
+                } else if external {
+                    serde_json::to_value(external_faucet_response(
+                        store.address_faucet_for_key(KEY).unwrap().unwrap(),
+                    ))
+                    .unwrap()
+                } else {
+                    serde_json::to_value(
+                        faucet_address_response(
+                            address.clone(),
+                            store.activity_for_key(KEY).unwrap().unwrap(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap()
+                };
+                let before = (
+                    store.activity_for_key(KEY).unwrap(),
+                    store.address_faucet_for_key(KEY).unwrap(),
+                );
+                let _payment = state.0.payments.lock().await;
+                for _ in 0..2 {
+                    let (code, location, body) = payment_post(&state, uri, &request).await;
+                    let terminal = matches!(stored_status, "confirmed" | "failed");
+                    assert_eq!(
+                        code,
+                        if terminal {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::ACCEPTED
+                        },
+                        "{endpoint}: {stored_status}"
+                    );
+                    assert_eq!(
+                        location,
+                        format!("{status_path}?idempotency_key={ENCODED_KEY}")
+                    );
+                    assert_eq!(body, expected);
+                    let (read_code, read) = api_get(&state, &location).await;
+                    assert_eq!(read_code, StatusCode::OK);
+                    assert_eq!(
+                        read,
+                        if status_path == "/api/v1/activity" {
+                            json!([body])
+                        } else {
+                            body
+                        }
+                    );
+                }
+                assert_eq!(
+                    (
+                        store.activity_for_key(KEY).unwrap(),
+                        store.address_faucet_for_key(KEY).unwrap()
+                    ),
+                    before
+                );
+                if matches!(stored_status, "prepared" | "broadcast" | "confirmed") {
+                    assert_eq!(
+                        store.prepared_transaction(&id).unwrap().raw_transaction,
+                        b"original signed bytes"
+                    );
+                } else {
+                    assert!(store.prepared_transaction(&id).is_err());
+                }
+                assert!(state.0.wallet.prepared(&id).await.unwrap().is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn payment_admission_replays_enforce_fingerprints_and_cross_store_identity() {
+        let (state, _dir) = offline_state();
+        let _payment = state.0.payments.lock().await;
+        let mut send_body = valid_send();
+        send_body["memo"] = json!("original memo");
+        payment_post(&state, "/api/v1/send", &send_body).await;
+        let original = state.0.store.activity_for_key(REPLAY_KEY).unwrap().unwrap();
+        for (field, value) in [
+            ("from_account", json!(3)),
+            ("to_account", json!(3)),
+            ("source_pool", json!("transparent")),
+            ("destination_pool", json!("transparent")),
+            ("amount_zatoshi", json!(100_001)),
+            ("memo", json!("changed memo")),
+            ("memo", Value::Null),
+        ] {
+            let mut conflict = send_body.clone();
+            conflict[field] = value;
+            if field == "destination_pool" {
+                conflict.as_object_mut().unwrap().remove("memo");
+            }
+            assert_eq!(
+                api_request(&state, "POST", "/api/v1/send", conflict)
+                    .await
+                    .0,
+                StatusCode::CONFLICT,
+                "{field}"
+            );
+            assert_eq!(
+                state.0.store.activity_for_key(REPLAY_KEY).unwrap().unwrap(),
+                original
+            );
+        }
+        let faucet_body = json!({"account_id": 2, "pool": "ironwood", "amount_zatoshi": 100_000, "idempotency_key": "fingerprint-faucet"});
+        payment_post(&state, "/api/v1/faucet", &faucet_body).await;
+        let faucet = state
+            .0
+            .store
+            .activity_for_key("fingerprint-faucet")
+            .unwrap()
+            .unwrap();
+        for (field, value) in [
+            ("account_id", json!(3)),
+            ("pool", json!("transparent")),
+            ("amount_zatoshi", json!(100_001)),
+        ] {
+            let mut conflict = faucet_body.clone();
+            conflict[field] = value;
+            assert_eq!(
+                api_request(&state, "POST", "/api/v1/faucet", conflict)
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+        let internal_address = state.0.store.account(2).unwrap().unified_address;
+        let address_body = json!({"address": internal_address, "amount_zatoshi": 100_000, "idempotency_key": "fingerprint-faucet"});
+        assert_eq!(
+            payment_post(&state, "/api/v1/faucet/address", &address_body)
+                .await
+                .2["status"],
+            "preparing"
+        );
+        assert_eq!(
+            state
+                .0
+                .store
+                .activity_for_key("fingerprint-faucet")
+                .unwrap()
+                .unwrap(),
+            faucet
+        );
+        let mut wrong_kind = faucet_body.clone();
+        wrong_kind["idempotency_key"] = json!(REPLAY_KEY);
+        assert_eq!(
+            api_request(&state, "POST", "/api/v1/faucet", wrong_kind)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        let external_address = state
+            .0
+            .store
+            .account(TREASURY_ACCOUNT_ID)
+            .unwrap()
+            .unified_address;
+        let mut wrong_store = address_body.clone();
+        wrong_store["address"] = json!(external_address);
+        assert_eq!(
+            api_request(&state, "POST", "/api/v1/faucet/address", wrong_store)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+
+        let external = state
+            .0
+            .store
+            .claim_address_faucet(&internal_address, 100_000, "external-before-classification")
+            .unwrap();
+        let replay_body = json!({"address": internal_address, "amount_zatoshi": 100_000, "idempotency_key": "external-before-classification"});
+        for terminal in [false, true] {
+            if terminal {
+                state
+                    .0
+                    .store
+                    .fail_address(&external.id, "stored failure")
+                    .unwrap();
+            }
+            let (code, location, body) =
+                payment_post(&state, "/api/v1/faucet/address", &replay_body).await;
+            assert_eq!(
+                code,
+                if terminal {
+                    StatusCode::OK
+                } else {
+                    StatusCode::ACCEPTED
+                }
+            );
+            assert_eq!(
+                body["status"],
+                if terminal { "failed" } else { "preparing" }
+            );
+            assert_eq!(api_get(&state, &location).await.1, body);
+            assert!(
+                state
+                    .0
+                    .store
+                    .activity_for_key("external-before-classification")
+                    .unwrap()
+                    .is_none()
+            );
+            let saved = state
+                .0
+                .store
+                .address_faucet_for_key("external-before-classification")
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.id, external.id);
+            for (field, value, expected) in [
+                ("amount_zatoshi", json!(100_001), StatusCode::CONFLICT),
+                ("address", json!(external_address), StatusCode::CONFLICT),
+                ("address", json!("invalid-address"), StatusCode::BAD_REQUEST),
+                ("amount_zatoshi", json!(0), StatusCode::BAD_REQUEST),
+                ("idempotency_key", json!("short"), StatusCode::BAD_REQUEST),
+            ] {
+                let mut conflict = replay_body.clone();
+                conflict[field] = value;
+                assert_eq!(
+                    api_request(&state, "POST", "/api/v1/faucet/address", conflict)
+                        .await
+                        .0,
+                    expected
+                );
+                assert_eq!(
+                    state
+                        .0
+                        .store
+                        .address_faucet_for_key("external-before-classification")
+                        .unwrap()
+                        .unwrap(),
+                    saved
+                );
+            }
+            let mut wrong_store = faucet_body.clone();
+            wrong_store["idempotency_key"] = json!("external-before-classification");
+            assert_eq!(
+                api_request(&state, "POST", "/api/v1/faucet", wrong_store)
+                    .await
+                    .0,
+                StatusCode::CONFLICT
+            );
+        }
+        assert_eq!(state.0.store.activities(100).unwrap().len(), 2);
+        for id in [&original.id, &faucet.id, &external.id] {
+            assert!(state.0.store.prepared_transaction(id).is_err());
+            assert!(state.0.wallet.prepared(id).await.unwrap().is_none());
+        }
     }
 
     async fn counting_rpc(chain_info: bool) -> (String, Arc<AtomicUsize>) {
@@ -7827,6 +10069,8 @@ mod tests {
                         "confirmations":1,
                         "blockhash":"journal-block"
                     }),
+                    "getblock" => json!({"height":100}),
+                    "getblockhash" => json!("journal-block"),
                     method => panic!("unexpected RPC method {method}"),
                 };
                 Json(json!({
