@@ -44,7 +44,7 @@ impl Runtime {
                 Cancellation::Observe(&requested),
             );
             (|| {
-                startup_docker_reachable(&docker)?;
+                startup_docker_reachable(&docker, false)?;
                 for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
                     startup_require_image(&docker, &image)?;
                 }

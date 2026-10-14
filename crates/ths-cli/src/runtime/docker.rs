@@ -21,6 +21,7 @@ pub(super) struct LifecycleContext {
     pub(super) policy: LifecyclePolicy,
     pub(super) helpers: RefCell<HelperSet>,
     pub(super) overall_deadline: Option<Deadline>,
+    pub(super) diagnostics_to_stderr: bool,
 }
 
 impl LifecycleContext {
@@ -29,6 +30,14 @@ impl LifecycleContext {
             policy,
             helpers: RefCell::new(HelperSet::new()),
             overall_deadline: None,
+            diagnostics_to_stderr: false,
+        }
+    }
+
+    pub(super) fn new_for_start(policy: LifecyclePolicy, diagnostics_to_stderr: bool) -> Self {
+        Self {
+            diagnostics_to_stderr,
+            ..Self::new(policy)
         }
     }
 
@@ -145,7 +154,12 @@ impl DockerResourceCommands for LifecycleDocker<'_> {
     }
 
     fn run(&self, args: &[&str]) -> Result<()> {
-        self.execute(args, OutputMode::Inherit)?;
+        let mode = if self.context.diagnostics_to_stderr {
+            OutputMode::InheritStderr
+        } else {
+            OutputMode::Inherit
+        };
+        self.execute(args, mode)?;
         Ok(())
     }
 }

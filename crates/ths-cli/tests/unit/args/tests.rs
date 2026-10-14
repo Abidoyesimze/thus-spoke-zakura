@@ -237,6 +237,34 @@ fn parses_wallet_balances_with_global_json_after_subcommand() {
 }
 
 #[test]
+fn parses_wallet_activity_flags_and_rejects_invalid_limits() {
+    let cli = Cli::try_parse_from(["ths", "wallet", "activity"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Wallet {
+            action: WalletCommand::Activity { limit: None }
+        })
+    ));
+
+    let cli =
+        Cli::try_parse_from(["ths", "wallet", "activity", "--limit", "20", "--json"]).unwrap();
+    assert!(cli.json);
+    assert!(matches!(
+        cli.command,
+        Some(Command::Wallet {
+            action: WalletCommand::Activity { limit: Some(20) }
+        })
+    ));
+
+    for limit in ["0", "101"] {
+        assert!(
+            Cli::try_parse_from(["ths", "wallet", "activity", "--limit", limit]).is_err(),
+            "accepted activity limit {limit}"
+        );
+    }
+}
+
+#[test]
 fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
     let parse = |args: &[&str]| {
         let mut argv = vec!["ths", "wallet", "send", "--from", "1"];
