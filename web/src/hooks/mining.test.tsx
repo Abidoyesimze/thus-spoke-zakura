@@ -36,6 +36,36 @@ afterEach(() => {
 });
 
 describe('mining hooks', () => {
+  it('preserves an uncertain request key when a storage failure blocks its retry', async () => {
+    const post = vi.spyOn(api, 'startMining').mockRejectedValue(new Error('response lost'));
+    const first = setup();
+    const hook = renderHook(useStartMining, { wrapper: first.wrapper });
+    await act(async () => {
+      await expect(hook.result.current.mutateAsync(10)).rejects.toThrow('response lost');
+    });
+    const retainedKey = sessionStorage.getItem('ths:mine:10');
+    expect(retainedKey).toBe(post.mock.calls[0]?.[1]);
+    const write = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+      throw new DOMException('Access denied', 'SecurityError');
+    });
+    await act(async () => {
+      await expect(hook.result.current.mutateAsync(10)).rejects.toThrow(/browser session storage/i);
+    });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(sessionStorage.getItem('ths:mine:10')).toBe(retainedKey);
+    write.mockRestore();
+    hook.unmount();
+
+    post.mockResolvedValue(job);
+    const second = setup();
+    const retry = renderHook(useStartMining, { wrapper: second.wrapper });
+    await act(async () => {
+      await retry.result.current.mutateAsync(10);
+    });
+    expect(post).toHaveBeenLastCalledWith(10, retainedKey);
+    expect(sessionStorage.getItem('ths:mine:10')).toBeNull();
+  });
+
   it.each(['network', 'validation'])(
     'retains the POST key after a %s failure across a fresh cache',
     async (failure) => {

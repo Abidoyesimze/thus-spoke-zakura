@@ -68,6 +68,37 @@ describe('MineDialog', () => {
     expect(await screen.findByRole('region', { name: 'Mining job' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Dismiss mining job' })).not.toBeInTheDocument();
   });
+  it.each(['getter', 'read', 'write', 'unretained write'])(
+    'stays closable and sends no mining request when session storage fails on %s',
+    async (failure) => {
+      const fetchSpy = mockJob(null);
+      const onOpenChange = vi.fn();
+      const denied = () => {
+        throw new DOMException('Access denied', 'SecurityError');
+      };
+      if (failure === 'getter') {
+        vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(denied);
+      } else if (failure === 'read') {
+        vi.spyOn(Storage.prototype, 'getItem').mockImplementation(denied);
+      } else {
+        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(
+          failure === 'write' ? denied : () => {},
+        );
+      }
+
+      renderWithProviders(<MineDialog open onOpenChange={onOpenChange} />);
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Mine blocks' })).toBeEnabled(),
+      );
+      await userEvent.click(screen.getByRole('button', { name: 'Mine blocks' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/browser session storage/i);
+      expect(screen.getByRole('alert')).toHaveTextContent(/no mining request was sent/i);
+      expect(fetchSpy.mock.calls.every(([, init]) => init?.method !== 'POST')).toBe(true);
+      await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    },
+  );
+
   it('restores a running job on a fresh mount without starting mining and polls completion', async () => {
     let job = running;
     const fetchSpy = vi

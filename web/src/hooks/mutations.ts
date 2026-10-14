@@ -53,6 +53,9 @@ function operationKey<T>(
         key = idempotencyKey();
       }
       storageArea.setItem(itemKey, key);
+      if (storageArea.getItem(itemKey) !== key) {
+        throw new Error('Could not retain the operation key.');
+      }
       return key;
     },
     clear(variables: T) {
@@ -260,16 +263,28 @@ export function usePaymentRequest(): UseMutationResult<
 
 export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
   const queryClient = useQueryClient();
-  const operation = operationKey('mine', (blocks: number) => String(blocks));
   return useMutation({
     mutationFn: (blocks: number) => {
       const state = queryClient.getQueryData<{ job: MiningJob | null }>(queryKeys.mining)?.job
         ?.state;
-      if (state === 'completed' || state === 'failed') operation.clear(blocks);
-      return api.startMining(blocks, operation.keyFor(blocks));
+      let key: string;
+      try {
+        // Storage policy may deny even the getter. Resolve it only on submit,
+        // and retain the retry identity before the server can accept a job.
+        const operation = operationKey('mine', (blocks: number) => String(blocks));
+        if (state === 'completed' || state === 'failed') operation.clear(blocks);
+        key = operation.keyFor(blocks);
+      } catch (cause) {
+        throw new Error(
+          'Browser session storage is unavailable. Allow site storage and retry. No mining request was sent.',
+          { cause },
+        );
+      }
+      return api.startMining(blocks, key);
     },
     retry: false,
     onSuccess: async (job, blocks) => {
+      const operation = operationKey('mine', (blocks: number) => String(blocks));
       operation.clear(blocks);
       queryClient.setQueryData(queryKeys.mining, { job });
       await queryClient.invalidateQueries({ queryKey: queryKeys.mining });

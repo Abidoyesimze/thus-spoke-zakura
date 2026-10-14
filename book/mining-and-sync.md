@@ -66,6 +66,12 @@ On completion, the CLI reports the confirmed count and mined tip hash; errors
 include the job ID. `--json` includes the legacy `blocks` and `hashes` fields
 alongside the job's ID, state, and progress.
 
+Before starting a job, the dashboard retains its idempotency key in browser
+session storage. If browser policy denies storage access or the key cannot be
+saved, the Mine dialog stays open and shows a storage error; no mining request
+is sent. Allow site storage before retrying. After an uncertain response, keep
+the existing session storage so a retry can reuse the same key.
+
 Read the node and wallet view through the running instance's API:
 
 ```console
