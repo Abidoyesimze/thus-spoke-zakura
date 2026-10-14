@@ -1179,6 +1179,28 @@ fn payment_uri_resolves_a_development_account_with_amount_and_memo() {
 }
 
 #[test]
+fn payment_uri_rejects_an_explicit_zero_and_keeps_a_missing_amount() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let address = store.account(2).unwrap().unified_address;
+
+    for amount in ["0", "0.0"] {
+        let error = payment_uri(&store, &format!("zcash:{address}?amount={amount}")).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{amount}");
+        assert_eq!(
+            error.message, "amount must be greater than zero",
+            "{amount}"
+        );
+    }
+
+    let omitted = payment_uri(&store, &format!("zcash:{address}")).unwrap();
+    assert_eq!(omitted.amount_zatoshi, None);
+
+    let positive = payment_uri(&store, &format!("zcash:{address}?amount=1")).unwrap();
+    assert_eq!(positive.amount_zatoshi, Some(100_000_000));
+}
+
+#[test]
 fn payment_uri_accepts_transparent_and_external_regtest_addresses() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
