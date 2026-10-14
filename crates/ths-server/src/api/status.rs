@@ -44,6 +44,7 @@ fn settlement_status(
     node: Option<&ChainCheckpoint>,
     lightwalletd: Option<&ChainCheckpoint>,
     wallet: &WalletSyncStatus,
+    started: bool,
 ) -> SettlementStatus {
     let settlement_blocker = if node.is_none() {
         Some("node_unavailable")
@@ -59,6 +60,8 @@ fn settlement_status(
         Some("chain_mismatch")
     } else if !node.is_some_and(|tip| wallet_matches_tip(wallet, tip)) {
         Some("wallet_behind")
+    } else if !started {
+        Some("starting")
     } else {
         None
     };
@@ -111,7 +114,12 @@ pub(crate) async fn status(
         height: chain.blocks,
         hash: chain.bestblockhash.clone(),
     });
-    let settlement = settlement_status(node_tip.as_ref(), lightwalletd.as_ref(), &wallet_sync);
+    let settlement = settlement_status(
+        node_tip.as_ref(),
+        lightwalletd.as_ref(),
+        &wallet_sync,
+        state.started(),
+    );
     Ok(Json(Status {
         instance: state.0.instance.clone(),
         node,

@@ -55,6 +55,7 @@ fn settlement_for_test(
         node.map(checkpoint).as_ref(),
         lightwalletd.map(checkpoint).as_ref(),
         wallet,
+        true,
     )
 }
 
@@ -95,10 +96,10 @@ fn settlement_requires_all_three_components_at_the_same_tip() {
         hash: "replacement".to_owned(),
     };
     let wallet = wallet_status("ready", Some(105), None);
-    let status = settlement_status(Some(&canonical), Some(&replacement), &wallet);
+    let status = settlement_status(Some(&canonical), Some(&replacement), &wallet, true);
     assert_eq!(status.settlement_blocker, Some("chain_mismatch"));
 
-    let status = settlement_status(Some(&replacement), Some(&replacement), &wallet);
+    let status = settlement_status(Some(&replacement), Some(&replacement), &wallet, true);
     assert!(
         !status.settled,
         "a same-height reorg needs wallet reconciliation"
@@ -163,9 +164,26 @@ fn settlement_allows_a_canonical_tip_before_the_wallet_birthday() {
     let mut wallet = wallet_status("ready", None, None);
     wallet.observed_height = Some(tip.height);
     wallet.observed_hash = Some(tip.hash.clone());
-    assert!(settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+    assert!(settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
     wallet.observed_hash = Some("orphaned".to_owned());
-    assert!(!settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+    assert!(!settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
+}
+
+#[test]
+fn settlement_waits_for_startup_after_the_components_agree() {
+    let tip = ChainCheckpoint {
+        height: 101,
+        hash: "canonical".to_owned(),
+    };
+    let wallet = wallet_status("ready", Some(101), None);
+    let status = settlement_status(Some(&tip), Some(&tip), &wallet, false);
+    assert!(!status.settled);
+    assert_eq!(status.settlement_blocker, Some("starting"));
+
+    let status = settlement_status(None, Some(&tip), &wallet, false);
+    assert_eq!(status.settlement_blocker, Some("node_unavailable"));
+
+    assert!(settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
 }
 
 use crate::state::tests::{api_get, counting_rpc};

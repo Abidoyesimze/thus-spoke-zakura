@@ -498,7 +498,9 @@ pub(super) fn session_files(runtime: &Runtime) -> Vec<String> {
     fs::read_dir(runtime.root.join(".locks"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|file| !file.ends_with(".lock") && !file.ends_with(".owner"))
+        .filter(|file| {
+            !file.ends_with(".lock") && !file.ends_with(".owner") && !file.ends_with(".generation")
+        })
         .collect()
 }
 
@@ -654,6 +656,117 @@ fn stop_without_an_owner_cleans_leftovers() {
 }
 
 #[test]
+fn a_stop_after_wait_settles_ends_start_cleanly() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |host| {
+        host.ready_delay = Duration::from_millis(300)
+    });
+    wait_for_event(&events, "wait_ready");
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    let (_sender, shutdown) = Shutdown::channel();
+
+    runtime
+        .wait_for_settlement(
+            &alpha,
+            Instant::now() + Duration::from_secs(10),
+            Duration::ZERO,
+            &shutdown,
+            false,
+            &|_, _| {
+                Ok(RuntimeStatus {
+                    node_height: Some(101),
+                    lightwalletd_height: Some(101),
+                    wallet_scanned_height: Some(101),
+                    wallet_sync_state: "ready".into(),
+                    settled: true,
+                    settlement_blocker: None,
+                })
+            },
+        )
+        .unwrap();
+
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"wait_for_shutdown:app-1".to_owned())
+    );
+    assert!(stop_after_owner(&runtime, &events).unwrap().verified());
+    owner.join().unwrap().0.unwrap();
+}
+
+#[test]
+fn a_launcher_that_cannot_record_readiness_says_so() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |host| {
+        host.ready_delay = Duration::from_millis(200)
+    });
+    wait_for_event(&events, "wait_ready");
+    fs::create_dir_all(runtime.root.join(".locks/alpha.ready")).unwrap();
+
+    let (result, events) = owner.join().unwrap();
+
+    let error = result.unwrap_err();
+    assert!(error.contains("recording that alpha is ready"), "{error}");
+    assert!(!events.contains(&"wait_for_shutdown:app-1".to_owned()));
+}
+
+#[test]
+fn an_owner_tearing_down_never_looks_ready() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = runtime_for_tests();
+    let locks = runtime.root.join(".locks");
+    let (mut host, _events) = RecordingHost::new();
+    let in_teardown = host.ready_in_teardown.clone();
+    let alpha = name("alpha");
+    let (root, owned) = (runtime.root.clone(), alpha.clone());
+    host.while_running = Some(Box::new(move || {
+        let runtime = Runtime { root: root.clone() };
+        fs::create_dir_all(runtime.instance_dir(&owned)).unwrap();
+        runtime
+            .write_instance(&owned, &endpoints_for(&host_ports(0).unwrap()))
+            .unwrap();
+        fs::set_permissions(root.join(".locks"), fs::Permissions::from_mode(0o555)).unwrap();
+        Ended::Interrupted
+    }));
+    let (_sender, shutdown) = Shutdown::channel();
+
+    let started = runtime.start_with(&alpha, true, false, 0, &host, &shutdown);
+    fs::set_permissions(&locks, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(started.is_ok(), "{started:?}");
+    assert!(!in_teardown.load(Ordering::SeqCst));
+}
+
+#[test]
+fn an_owner_that_panics_never_looks_ready_while_it_tears_down() {
+    let runtime = runtime_for_tests();
+    let (mut host, _events) = RecordingHost::new();
+    let in_teardown = host.ready_in_teardown.clone();
+    let alpha = name("alpha");
+    let (root, owned) = (runtime.root.clone(), alpha.clone());
+    host.while_running = Some(Box::new(move || {
+        let runtime = Runtime { root: root.clone() };
+        fs::create_dir_all(runtime.instance_dir(&owned)).unwrap();
+        runtime
+            .write_instance(&owned, &endpoints_for(&host_ports(0).unwrap()))
+            .unwrap();
+        panic!("the owner failed while running")
+    }));
+    let (_sender, shutdown) = Shutdown::channel();
+
+    let started = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime.start_with(&alpha, true, false, 0, &host, &shutdown)
+    }));
+
+    assert!(started.is_err());
+    assert!(!in_teardown.load(Ordering::SeqCst));
+}
+
+#[test]
 fn reset_without_force_does_not_request_shutdown() {
     let runtime = runtime_for_tests();
     let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), |_| {});
@@ -662,7 +775,9 @@ fn reset_without_force_does_not_request_shutdown() {
     let error = runtime.reset(&name("alpha"), false).unwrap_err();
 
     assert!(error.to_string().contains("--force"), "{error:#}");
-    assert_eq!(session_files(&runtime), ["alpha.session"]);
+    let mut files = session_files(&runtime);
+    files.sort();
+    assert_eq!(files, ["alpha.ready", "alpha.session"]);
     assert!(!owner.is_finished());
     interrupt.send(Ended::Interrupted).unwrap();
     owner.join().unwrap().0.unwrap();
@@ -1028,12 +1143,7 @@ fn start_reports_a_stop_in_progress() {
         .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
         .unwrap_err();
 
-    assert!(
-        error
-            .to_string()
-            .contains("is being stopped or reset by another command"),
-        "{error:#}"
-    );
+    assert!(error.to_string().contains("is being stopped"), "{error:#}");
     assert!(events.lock().unwrap().is_empty());
     release.send(()).unwrap();
     assert_eq!(stop.join().unwrap(), Ok(true));
@@ -1085,4 +1195,20 @@ fn stop_reports_leftovers_it_cannot_remove() {
     let error = format!("{:#}", report.into_result().unwrap_err());
     assert!(error.contains("recovery remains at"), "{error}");
     owner.join().unwrap().0.unwrap_err();
+}
+
+#[test]
+fn an_owner_marks_its_own_teardown_as_stopping() {
+    let runtime = runtime_for_tests();
+    let (mut host, _events) = RecordingHost::new();
+    host.while_running = Some(Box::new(|| Ended::Interrupted));
+    let (_sender, shutdown) = Shutdown::channel();
+    let seen = host.stopping_seen.clone();
+
+    runtime
+        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .unwrap();
+
+    assert!(seen.load(Ordering::SeqCst));
+    assert!(!runtime.root.join(".locks/alpha.stopping").exists());
 }

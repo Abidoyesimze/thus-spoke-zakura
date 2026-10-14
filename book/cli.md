@@ -59,9 +59,12 @@ instead of selecting a random port.
 
 ### `ths wait [--timeout <SECONDS>]`
 
-Waits for an existing instance's node, lightwalletd index, and wallet to be
-settled at the same canonical tip. It creates no instance and makes no chain
-changes. The timeout defaults to **120 seconds**, and status reads are bounded
+Waits for an instance's node, lightwalletd index, and wallet to be settled at
+the same canonical tip, and for the `ths start` or `ths run` that owns it to
+report ready. It also waits for an instance that is still being created in
+another shell, and fails after a few seconds if no command is creating it or
+if its launcher has exited and left only its containers behind. It creates
+no instance and makes no chain changes. The timeout defaults to **120 seconds**, and status reads are bounded
 by the remaining budget. Timeout or interruption exits nonzero and leaves the
 instance running. On timeout, the error reports the last observed heights and
 settlement blocker. `--json` emits the settlement object on success:

@@ -151,9 +151,12 @@ struct RecordingHost {
     final_cleanup_failure: Option<String>,
     deleted_elsewhere: bool,
     allocate_delay: Duration,
+    ready_delay: Duration,
     run_status: Option<RuntimeStatus>,
     while_running: Option<Box<dyn Fn() -> Ended>>,
     real_child: bool,
+    stopping_seen: Arc<AtomicBool>,
+    ready_in_teardown: Arc<AtomicBool>,
 }
 
 impl RecordingHost {
@@ -170,12 +173,31 @@ impl RecordingHost {
                 final_cleanup_failure: None,
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
+                ready_delay: Duration::ZERO,
                 run_status: None,
                 while_running: None,
                 real_child: false,
+                stopping_seen: Arc::new(AtomicBool::new(false)),
+                ready_in_teardown: Arc::new(AtomicBool::new(false)),
             },
             events,
         )
+    }
+
+    fn note_stopping(&self, runtime: &Runtime, name: &InstanceName) {
+        if runtime
+            .root
+            .join(".locks")
+            .join(format!("{name}.stopping"))
+            .exists()
+        {
+            self.stopping_seen.store(true, Ordering::SeqCst);
+        }
+        if let Ok(instance) = runtime.read_instance(name)
+            && runtime.ready_owner_wrote(name, &instance).unwrap()
+        {
+            self.ready_in_teardown.store(true, Ordering::SeqCst);
+        }
     }
 
     fn push(&self, event: &str) {
@@ -238,6 +260,7 @@ impl StartHost for RecordingHost {
         self.push(&format!("delete:{name}"));
         if later {
             self.push(&format!("final_cleanup:{name}"));
+            self.note_stopping(runtime, name);
         }
         if !later && self.initial_delete_error {
             bail!("resource collision");
@@ -273,6 +296,7 @@ impl StartHost for RecordingHost {
         context: &LifecycleContext,
         deadline: Deadline,
     ) -> Result<CleanupReport> {
+        self.note_stopping(runtime, name);
         if let Some(docker) = &self.shutdown_collision {
             let later =
                 self.events.lock().unwrap().iter().any(|event| {
@@ -322,6 +346,7 @@ impl StartHost for RecordingHost {
         _context: &LifecycleContext,
     ) -> Result<()> {
         self.push("wait_ready");
+        std::thread::sleep(self.ready_delay);
         if self.interrupt_before_ready {
             bail!("interrupted");
         }
