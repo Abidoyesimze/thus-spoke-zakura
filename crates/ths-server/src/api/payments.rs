@@ -192,6 +192,7 @@ pub(crate) async fn send_quote(
     State(state): State<AppState>,
     Json(req): Json<SendQuoteRequest>,
 ) -> ApiResult<Json<SendQuote>> {
+    require_started(&state)?;
     require_user_account(req.from_account)?;
     require_pool(&req.source_pool, "source_pool")?;
     require_pool(&req.destination_pool, "destination_pool")?;

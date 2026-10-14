@@ -193,6 +193,20 @@ fn transparent_quote_reports_zero_max_for_dust() {
     assert_eq!(quote.max_zatoshi, 0);
 }
 
+#[test]
+fn quote_reports_scan_required_before_any_blocks_are_scanned() {
+    let mut st = test_state();
+    for (source_pool, destination_pool) in [("ironwood", "ironwood"), ("transparent", "ironwood")] {
+        let error = quote(&mut st, source_pool, destination_pool)
+            .err()
+            .expect("quote must fail before any blocks are scanned");
+        assert!(
+            matches!(error.downcast_ref(), Some(PaymentError::ScanRequired)),
+            "{source_pool}->{destination_pool}: {error:#}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn scanned_expiry_does_not_authorize_replacing_a_journal() {
     let test = test_wallet();
