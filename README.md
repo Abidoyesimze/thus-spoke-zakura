@@ -59,9 +59,9 @@ dependencies remain protected. Existing recovery journals with a known container
 ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
-allocation identities. It does not lock an instance name or coordinate separate
-launcher sessions. Exclusive ownership and coordinated stop/reset remain tracked
-in [#175](https://github.com/zcashlabs/thus-spoke-zakura/issues/175). Once ready,
+allocation identities. A per-name lock serializes startup, stop, and reset.
+`run` holds that lock until cleanup; ordinary foreground start releases it
+once ready so another command can stop the environment. Once ready,
 the foreground launcher watches the allocated app container and exits when
 another command deletes it, without deleting the environment again.
 
@@ -161,6 +161,82 @@ Ctrl+C, the command exits with an error and keeps the key. The environment keeps
 processing the payment. Run the same command to check that payment again; it
 does not create a second one. After the command reports a confirmed or failed
 payment, the next identical command makes a new payment.
+
+### Payment API compatibility
+
+`POST /api/v1/send`, `POST /api/v1/faucet`, and
+`POST /api/v1/faucet/address` durably accept an intent before execution. New or
+unresolved payments return HTTP **202**; replays of stored `confirmed` or
+`failed` payments return HTTP **200**. Every successful response includes the
+existing operation body and a relative `Location` containing the exact encoded
+idempotency key. The server continues execution after a client disconnects and
+resumes retained intents after a restart.
+
+This intentionally changes the API contract for scripts that previously assumed
+a successful POST meant payment completion. Follow `Location` with **GET** to
+observe execution. Activity lookup returns a one-item array, or `[]` when the
+key is absent; address-faucet lookup returns an object, or HTTP 404. Status reads
+use the local store and never start execution. The CLI and dashboard already
+retain payment identity and show pending status; their resumption behavior above
+remains the supported flow.
+
+`preparing`, `prepared`, and `broadcast` are pending. Only `confirmed` and
+`failed` are terminal. A pending operation can have an empty `txid` before its
+signed transaction is retained. `last_error` is nullable: a pending dependency
+error is recoverable and the server retries; successful progression clears it.
+A completed Send preparation with insufficient funds can become `failed` only
+when retained transaction reconciliation establishes that it cannot still pay.
+Terminal failures retain their reason. A timeout is not a reason to create a
+new key. A deliberately new payment after a terminal failure needs a new key.
+Reusing a key with a changed request is rejected.
+
+For example, this Bash script uses `curl` and `jq` to fund Account 2 with one ZEC.
+Set `THS_API_URL` to the dashboard origin from `ths endpoints` (or run the script
+through `ths run`). Keep the state directory to resume this same payment; choose
+a new directory only for a deliberately new payment. It saves the request key
+before POST, saves the returned operation and Location, and then polls only that
+status URL. If admission's response is lost, rerunning submits the saved request
+with the same key. Neither successful admission nor a mined block is confirmation.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+: "${THS_API_URL:?Set THS_API_URL to the dashboard origin}"
+payment_dir=${PAYMENT_DIR:-./faucet-payment}
+mkdir -p "$payment_dir"
+if [[ ! -s "$payment_dir/request.json" ]]; then
+  key="script-faucet-$(uuidgen)"
+  jq -n --arg key "$key" \
+    '{account_id: 2, pool: "ironwood", amount_zatoshi: 100000000,
+      idempotency_key: $key}' > "$payment_dir/request.json"
+fi
+if [[ ! -s "$payment_dir/location" ]]; then
+  curl --fail-with-body --silent --show-error \
+    -D "$payment_dir/headers" -o "$payment_dir/operation.json" \
+    -H 'Content-Type: application/json' \
+    --data-binary "@$payment_dir/request.json" \
+    "${THS_API_URL%/}/api/v1/faucet"
+  location=$(awk 'tolower($1) == "location:" {print $2}' \
+    "$payment_dir/headers" | tr -d '\r')
+  [[ -n "$location" ]] || { echo 'Admission returned no Location' >&2; exit 1; }
+  printf '%s\n' "$location" > "$payment_dir/location"
+fi
+location=$(cat "$payment_dir/location")
+while true; do
+  curl --fail-with-body --silent --show-error \
+    "${THS_API_URL%/}$location" > "$payment_dir/status.json"
+  jq 'if type == "array" then .[0] else . end' \
+    "$payment_dir/status.json" > "$payment_dir/operation.json"
+  jq '{status, txid, last_error}' "$payment_dir/operation.json"
+  status=$(jq -r '.status // "missing"' "$payment_dir/operation.json")
+  case "$status" in
+    confirmed) exit 0 ;;
+    failed) exit 1 ;;
+    preparing|prepared|broadcast) sleep 2 ;;
+    *) echo 'Stored payment is missing or has an unknown status' >&2; exit 1 ;;
+  esac
+done
+```
 
 ### Mine blocks
 
@@ -281,7 +357,9 @@ has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
 `THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS`, and
 `THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
 the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
-endpoint. `ths run` supports non-interactive commands; commands that read from
+endpoint. `ths run` chooses a fresh `run-<UUID>` name unless `--name` is supplied and
+refuses an existing environment. It uses the default loopback ports, so they
+must be free. `ths run` supports non-interactive commands; commands that read from
 the controlling terminal are not supported.
 
 To wait for an environment you started separately:
@@ -298,6 +376,7 @@ Running `ths` with no command starts the default environment.
 | --- | --- |
 | `ths` | Start a fresh environment and open the dashboard. Readiness is 120 seconds per phase, ordinary startup commands are 30 seconds, initialization is 120 seconds, and cleanup is a separate 120 seconds |
 | `ths start --no-open` | Start without opening a browser, with the same phase budgets as `ths` |
+| `ths --json start --no-open` | Print endpoints as JSON on stdout, with startup diagnostics on stderr |
 | `ths start --port-offset 10` | Start on loopback ports shifted by 10 for another instance |
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
@@ -311,6 +390,7 @@ Running `ths` with no command starts the default environment.
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury; repeat the same command to check pending payments |
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo; repeat the same command to check a pending payment |
 | `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address; repeat the same command to check a pending payment |
+| `ths wallet activity --limit 20` | Print recent wallet transfers and faucet activity |
 | `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
@@ -435,25 +515,28 @@ target with the matching source-built `ths-server` binary, including when
 The live test owns a UUID-prefixed `ths-recovery-*` Docker network, containers,
 and volumes, plus private temporary data/configuration directories, a local RPC
 proxy, and a local server process. It sends a genuine 1,000,000-zatoshi (0.01
-ZEC) Ironwood payment from Account 1 to Account 2, deliberately rejects exactly
-one automatic `generate([1])` through the proxy, mines directly through the
-node, then waits for the production background payment-confirmation loop to update the
-existing activity row. Direct mining is intentional: retrying Send or using the
-server's mine endpoint would repair the row through a different path and would
-not prove background recovery.
+ZEC) Ironwood payment from Account 1 to Account 2, holds automatic
+`generate([1])` requests behind a controlled proxy failure, mines directly
+through the node, then waits for the production background progression loop to
+update the existing activity row. The pending window checks an observed mining
+failure and no forwarded automatic mine; autonomous retries may encounter the
+same controlled failure. Direct mining and GET polling establish recovery
+without another execution-triggering request. The startup funding regression
+retains its separate one-shot mining failure.
 
 The queued-retry regressions exercise Send and an external-address faucet through
 the production HTTP handlers. A loopback proxy withholds the original HTTP
-response until the client stops waiting. The real original transaction remains
-in the node's mempool. On the same-key retry, controlled proxies report that
+admission response until the client stops waiting. The server progresses the
+retained intent to broadcast while controlled mining failures keep the original
+transaction pending in the node's mempool. Controlled proxies then report that
 transaction missing and substitute the exact lightwalletd already-queued
-response. These are injected faults, not a naturally occurring node queue race.
-Both server and wallet journals, signed bytes, transaction identity, and reserved
-inputs must remain unchanged and pending without a block hash. After restarting
-the server against both existing databases, the tests mine the original and
-check canonical confirmation, exactly one payout, and no additional broadcast
-or block on confirmed replay. These tests retain caller-driven recovery; they
-do not establish autonomous payment progression.
+response during autonomous progression. These are injected faults, not a
+naturally occurring node queue race. Same-key POST replay observes durable
+admission; GET polling observes execution. Both server and wallet journals,
+signed bytes, transaction identity, and reserved inputs must remain unchanged
+and pending without a block hash. After restarting the server against both
+existing databases, the tests mine the original and check canonical confirmation,
+exactly one payout, and no additional broadcast or block on confirmed replay.
 
 The same-account round-trip regression unshields 1,000,000 zatoshis from Account 1
 to its transparent pool, then shields 500,000 zatoshis back to Ironwood. It checks
@@ -473,10 +556,11 @@ request bodies, wallet keys, wallet databases, or configuration directories.
 
 To prove the regression is sensitive, perform the negative control only after a
 successful live run and only in an isolated verification worktree. Temporarily
-remove the `api::payment_confirmation_loop` task from `background_tasks` in
-`crates/ths-server/src/main.rs`, rerun the same explicit live Cargo command,
+remove the `background.spawn(async move { ... })` block that calls
+`crate::payments::progression::payment_confirmation_loop(state)` from
+`background_tasks` in `crates/ths-server/src/bootstrap.rs`, rerun the same explicit live Cargo command,
 and require failure at background activity recovery after the broadcast,
-intercepted auto-mine failure, and real inclusion checks. Restore the exact line
+intercepted auto-mine failure, and real inclusion checks. Restore the exact block
 immediately, including after a failed run; do not retain the temporary
 production-code edit.
 
@@ -489,11 +573,17 @@ Browser ──HTTP/SSE── ths-server ──JSON-RPC── Zakura (Regtest)
 ```
 
 The server owns wallet synchronization and exposes the latest confirmed wallet
-snapshot to the dashboard. A separate supervised loop checks persisted payment
-transaction IDs for chain inclusion every two seconds, independently of wallet
-synchronization. Each lookup is bounded to two seconds and each pass to ten
-seconds, resuming after the last attempted record when the budget is exhausted.
-Unknown transactions and unavailable RPC responses remain pending for retry.
+snapshot to the dashboard. A separate supervised loop progresses durable
+payment intents every two seconds, independently of wallet synchronization.
+It resumes preparation, retained transaction submission, and canonical
+confirmation fairly across account payments and external-address faucets,
+including retained legacy transactions. The traversal remembers its collection
+choice and cursors across passes, so one slow record does not always go first.
+Periodic transaction lookups are bounded to two seconds and each dispatch has a
+ten-second budget. Exhausting that budget stops new stages; an active wallet
+preparation is awaited while serialization remains held. Ten seconds is not a
+hard ceiling on proof construction. Unknown transactions and unavailable RPC
+responses remain pending with recoverable errors available through status reads.
 
 The server opens HTTP as soon as its local stores load, so stored payment status
 stays readable while Zakura or lightwalletd is unavailable. Health reports ready,

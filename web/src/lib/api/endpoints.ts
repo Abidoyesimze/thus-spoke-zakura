@@ -24,6 +24,14 @@ export const api = {
 
   activity: (limit = 30) => request(`/activity?limit=${limit}`, z.array(activitySchema)),
 
+  payment: async (key: string) => {
+    const rows = await request(
+      `/activity?idempotency_key=${encodeURIComponent(key)}`,
+      z.array(activitySchema).max(1),
+    );
+    return rows[0] ?? null;
+  },
+
   blocks: (options?: { limit?: number; before?: number }) => {
     const params = new URLSearchParams();
     params.set('limit', String(options?.limit ?? 20));

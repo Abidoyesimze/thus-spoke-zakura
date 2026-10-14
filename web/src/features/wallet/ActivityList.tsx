@@ -1,5 +1,6 @@
-import { Link } from 'react-router-dom';
-import { ArrowDownToLine, ArrowRight } from 'lucide-react';
+import { useId } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { AlertTriangle, ArrowDownToLine, ArrowRight } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { absoluteTime, shortHash, timeAgo } from '@/lib/format';
 import { formatZecAmount } from '@/lib/money';
@@ -40,58 +41,114 @@ function recipientLabel(activity: Activity): string {
 }
 
 function ActivityRow({ activity, index }: { activity: Activity; index: number }) {
+  const id = useId();
+  const errorId = activity.last_error ? id : undefined;
   const isFaucet = activity.kind === 'faucet';
+  const transactionPath = activity.txid ? `/explorer/tx/${activity.txid}` : null;
+  const transfer = isFaucet
+    ? `Faucet → ${recipientLabel(activity)}`
+    : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`;
+  const navigate = useNavigate();
 
   return (
-    <Row index={index} to={`/explorer/tx/${activity.txid}`}>
-      <td>
-        <div className="flex items-center gap-2.5">
-          <span
-            className={cn(
-              'xp-raised grid size-6 shrink-0 place-items-center rounded-xs',
-              isFaucet ? 'bg-accent-soft text-accent' : 'bg-raised text-ink-muted',
-            )}
-            aria-hidden
-          >
-            {isFaucet ? <ArrowDownToLine className="size-3" /> : <ArrowRight className="size-3" />}
-          </span>
-          <Link
-            to={`/explorer/tx/${activity.txid}`}
-            className="min-w-0 font-semibold hover:underline"
-          >
-            <span className="block truncate">
-              {isFaucet
-                ? `Faucet → ${recipientLabel(activity)}`
-                : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`}
+    <>
+      <Row
+        index={index}
+        {...(transactionPath ? { to: transactionPath } : {})}
+        // The error row below belongs to this activity, so the pair reads,
+        // hovers and navigates as one item.
+        className={cn(
+          activity.last_error &&
+            '[&:has(+tr:hover)]:bg-accent-soft [&:hover+tr]:bg-accent-soft border-b-0',
+        )}
+      >
+        <td aria-describedby={errorId}>
+          <div className="flex items-center gap-2.5">
+            <span
+              className={cn(
+                'xp-raised grid size-6 shrink-0 place-items-center rounded-xs',
+                isFaucet ? 'bg-accent-soft text-accent' : 'bg-raised text-ink-muted',
+              )}
+              aria-hidden
+            >
+              {isFaucet ? (
+                <ArrowDownToLine className="size-3" />
+              ) : (
+                <ArrowRight className="size-3" />
+              )}
             </span>
-          </Link>
-        </div>
-      </td>
+            {transactionPath ? (
+              <Link
+                to={transactionPath}
+                aria-describedby={errorId}
+                className="min-w-0 truncate font-semibold hover:underline"
+              >
+                {transfer}
+              </Link>
+            ) : (
+              <span className="min-w-0 truncate font-semibold">{transfer}</span>
+            )}
+          </div>
+        </td>
 
-      <td className="max-sm:hidden">
-        <PoolLabel pool={activity.source_pool} />
-        <span className="text-ink-muted px-1.5">→</span>
-        <PoolLabel pool={activity.destination_pool} />
-      </td>
+        <td className="max-sm:hidden">
+          <PoolLabel pool={activity.source_pool} />
+          <span className="text-ink-muted px-1.5">→</span>
+          <PoolLabel pool={activity.destination_pool} />
+        </td>
 
-      <td className="min-w-0">
-        <code className="text-ink block truncate font-mono" title={activity.txid}>
-          {shortHash(activity.txid)}
-        </code>
-      </td>
+        <td className="min-w-0">
+          {activity.txid ? (
+            <code className="text-ink block truncate font-mono" title={activity.txid}>
+              {shortHash(activity.txid)}
+            </code>
+          ) : (
+            <span className="text-ink-muted relative">
+              <span aria-hidden>—</span>
+              <span className="sr-only">Not prepared</span>
+            </span>
+          )}
+        </td>
 
-      <NumCell className="font-semibold">{formatZecAmount(activity.amount_zatoshi)}</NumCell>
+        <NumCell className="font-semibold">{formatZecAmount(activity.amount_zatoshi)}</NumCell>
 
-      <NumCell className="text-ink-muted max-sm:hidden">
-        <time dateTime={activity.created_at} title={absoluteTime(activity.created_at)}>
-          {timeAgo(activity.created_at)}
-        </time>
-      </NumCell>
+        <NumCell className="text-ink-muted max-sm:hidden">
+          <time dateTime={activity.created_at} title={absoluteTime(activity.created_at)}>
+            {timeAgo(activity.created_at)}
+          </time>
+        </NumCell>
 
-      <td className="text-right">
-        <Badge tone={statusTone(activity.status)}>{activity.status}</Badge>
-      </td>
-    </Row>
+        <td className="text-right">
+          <Badge tone={statusTone(activity.status)}>{activity.status}</Badge>
+        </td>
+      </Row>
+      {activity.last_error && (
+        <tr
+          style={{ animationDelay: `${Math.min(index, 8) * 30}ms` }}
+          onClick={transactionPath ? () => void navigate(transactionPath) : undefined}
+          className={cn(
+            'border-line hover:bg-accent-soft animate-fade-in border-b transition-colors last:border-b-0',
+            transactionPath && 'cursor-pointer',
+          )}
+        >
+          <td colSpan={COLUMNS.length} className="px-5 pt-0 pb-3.5">
+            <p
+              id={errorId}
+              className={cn(
+                'flex items-start gap-1.5 pl-[34px] text-[11px] wrap-anywhere',
+                activity.status === 'failed' ? 'text-negative' : 'text-warning',
+              )}
+            >
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" aria-hidden />
+              <span>
+                {activity.status === 'failed' ? 'Failed: ' : 'Latest execution error: '}
+                {activity.last_error}
+              </span>
+            </p>
+          </td>
+        </tr>
+      )}
+    </>
   );
 }
 

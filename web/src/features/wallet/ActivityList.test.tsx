@@ -39,6 +39,7 @@ describe('ActivityList same-account transfers', () => {
                 txid,
                 block_hash: 'cd'.repeat(32),
                 status: 'confirmed',
+                last_error: null,
                 created_at: '2026-10-02 12:00:00',
               },
             ],

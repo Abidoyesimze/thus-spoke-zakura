@@ -16,7 +16,7 @@ to run in order. For a worked dashboard flow, see [Chapter
 - All commands accept two **global options**, which can be placed before or
   after the subcommand:
   - `--name <NAME>` — target a named, isolated environment instead of the
-    default one (default: `default`, except generated names for `run`). Names
+    default one (default: `default`, or a fresh `run-<UUID>` for `run`). Names
     use 1–40 lowercase ASCII letters, digits, or internal hyphens.
   - `--json` — print machine-readable JSON instead of human-readable text,
     where the command supports it.
@@ -63,7 +63,8 @@ Waits for an existing instance's node, lightwalletd index, and wallet to be
 settled at the same canonical tip. It creates no instance and makes no chain
 changes. The timeout defaults to **120 seconds**, and status reads are bounded
 by the remaining budget. Timeout or interruption exits nonzero and leaves the
-instance running. `--json` emits the settlement object on success:
+instance running. On timeout, the error reports the last observed heights and
+settlement blocker. `--json` emits the settlement object on success:
 `node_height`, `lightwalletd_height`, `wallet_scanned_height`,
 `wallet_sync_state`, `settled`, and nullable `settlement_blocker`.
 
@@ -88,7 +89,8 @@ ths run --timeout 180 -- sh -c 'curl -fsS "$THS_API_URL/api/v1/accounts"'
 The child inherits standard streams and the calling directory, but `run`
 supports non-interactive commands: it creates a separate process group without
 transferring control of the terminal. Commands that read from the controlling
-terminal are unsupported. No persistent environment is provided. `--json` is rejected
+terminal are unsupported. No persistent environment is provided. Seeds and
+spending keys are not exported. `--json` is rejected
 because the child owns stdout. The child receives:
 
 | Variable | Value |
@@ -341,13 +343,14 @@ and Send dialogs, from a script or terminal:
 | Subcommand | What it does |
 | --- | --- |
 | `ths wallet balances` | Print each account's balances and addresses |
+| `ths wallet activity` | Print recent sends, shields, unshields, and faucet payments |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield` | Spend Ironwood funds into the same or another account's transparent balance |
 
-Every subcommand except `balances` attempts to mine a confirming block and
-prints the resulting transaction ID. If auto-mining fails, activity may remain
+The mutating subcommands attempt to mine a confirming block and
+print the resulting transaction ID. If auto-mining fails, activity may remain
 in `broadcast` state; `send`, `shield`, and `unshield` print a confirming block
 hash when one is available. Pass `--json` for machine-readable output.
 
@@ -365,6 +368,29 @@ alignment is required.
 ths wallet balances
 ths wallet balances --json
 ```
+
+### `ths wallet activity [--limit <N>]`
+
+Prints recent activity recorded by the development wallet, newest first. The
+output distinguishes sends, shields, unshields, and faucet payments, and shows
+their status, route, amount, transaction ID and confirmation block (when
+available), creation time, and any retained payment error. External Regtest
+recipients are shown by their full address. Faucet routes are labeled `faucet`;
+the hidden treasury account is never exposed as a user account.
+
+Without `--limit`, the server's default of 30 entries is used. An explicit
+limit must be between 1 and 100. An environment with no activity prints a
+short empty-state message.
+
+```console
+ths wallet activity
+ths wallet activity --limit 20
+ths wallet activity --json
+ths wallet activity --limit 20 --json
+```
+
+JSON output is the unmodified activity schema returned by
+`GET /api/v1/activity`, including `created_at` and nullable `block_hash`.
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -595,6 +621,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
 | `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
+| `ths wallet activity [--limit N] [--json]` | Print recent development-wallet activity |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
 | `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
 | `ths wallet send --from --uri [--amount] [--source-pool]` | Pay a ZIP-321 `zcash:` URI to any Regtest address |
