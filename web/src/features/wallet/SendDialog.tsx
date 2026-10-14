@@ -254,7 +254,8 @@ export function SendDialog({
         return;
       }
       const quoted = quote.data ?? (await quote.refetch()).data;
-      if (uriRevision !== paymentUriRevision.current) return;
+      // Closing the form before quoting finishes must not create a new payment.
+      if (!mounted.current || uriRevision !== paymentUriRevision.current) return;
       if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
         form.setError('amount', {
           message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
