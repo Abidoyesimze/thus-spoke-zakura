@@ -129,6 +129,12 @@ pub(crate) enum Command {
 pub(crate) enum WalletCommand {
     /// Show current account addresses and spendable balances.
     Balances,
+    /// Print recent wallet transfers and faucet activity.
+    Activity {
+        /// Maximum number of entries to print (1-100).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
+        limit: Option<u32>,
+    },
     /// Send faucet funds from the treasury to one or more accounts.
     Faucet {
         /// Account indices to fund (1-5), e.g. --accounts 1,2,3,5.
