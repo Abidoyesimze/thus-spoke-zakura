@@ -181,6 +181,9 @@ ths logs zakura --head 200     # first 200 node lines
 ### `ths stop`
 
 Stops the named environment and deletes its containers, volumes, and network.
+If a `ths start` for it is still running, even while starting, `stop` asks that
+launcher to shut down, waits for its cleanup, and succeeds only once the
+deletion is verified.
 
 ```console
 ths stop

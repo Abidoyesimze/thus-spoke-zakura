@@ -424,3 +424,203 @@ fn stopped_launcher_keeps_the_name_until_its_cleanup_ends() {
             .contains(&"allocate:alpha".into())
     );
 }
+
+type OwnerOutcome = (Result<(), String>, Vec<String>);
+
+fn spawn_owner(
+    root: PathBuf,
+    allocate_delay: Duration,
+) -> (
+    thread::JoinHandle<OwnerOutcome>,
+    mpsc::Sender<Ended>,
+    Arc<Mutex<Vec<String>>>,
+) {
+    let (handoff, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let (mut host, events) = RecordingHost::new();
+        host.allocate_delay = allocate_delay;
+        let (interrupt, shutdown) = Shutdown::channel();
+        handoff.send((interrupt, events.clone())).unwrap();
+        let result = Runtime { root }
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+            .map_err(|error| format!("{error:#}"));
+        (result, events.lock().unwrap().clone())
+    });
+    let (interrupt, events) = received.recv().unwrap();
+    (owner, interrupt, events)
+}
+
+fn wait_for_event(events: &Mutex<Vec<String>>, event: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !events.lock().unwrap().iter().any(|e| e == event) {
+        assert!(Instant::now() < deadline, "{event} never happened");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn stop_policy() -> LifecyclePolicy {
+    LifecyclePolicy {
+        poll: Duration::from_millis(1),
+        cleanup: Duration::from_secs(5),
+        ..LifecyclePolicy::default()
+    }
+}
+
+fn session_files(runtime: &Runtime) -> Vec<String> {
+    fs::read_dir(runtime.root.join(".locks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|file| !file.ends_with(".lock"))
+        .collect()
+}
+
+fn stop_after_owner(runtime: &Runtime, owner: &Mutex<Vec<String>>) -> Result<CleanupReport> {
+    let docker = RecordingDocker::new("", "", "");
+    runtime.verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+        assert!(
+            owner
+                .lock()
+                .unwrap()
+                .contains(&"final_cleanup:alpha".into()),
+            "stop cleaned up before the owner did"
+        );
+        runtime.cleanup_with(&name("alpha"), &docker, false, &stop_policy())
+    })
+}
+
+#[test]
+fn stop_during_startup_aborts_the_owner_and_verifies_cleanup() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::from_millis(300));
+    wait_for_event(&events, "allocate:alpha");
+
+    let report = stop_after_owner(&runtime, &events).unwrap();
+
+    assert!(report.verified());
+    let (result, events) = owner.join().unwrap();
+    assert_eq!(result.unwrap_err(), "interrupted");
+    assert!(!events.iter().any(|e| e == "wait_ready"), "{events:?}");
+    assert!(session_files(&runtime).is_empty());
+}
+
+#[test]
+fn stop_while_ready_routes_through_the_owner() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+
+    let report = stop_after_owner(&runtime, &events).unwrap();
+
+    assert!(report.verified());
+    let (result, events) = owner.join().unwrap();
+    result.unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| *e == "final_cleanup:alpha")
+            .count(),
+        1
+    );
+    assert!(session_files(&runtime).is_empty());
+}
+
+#[test]
+fn concurrent_stops_both_wait_for_the_owner() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+
+    let stops = [(); 2].map(|()| {
+        let other_shell = Runtime {
+            root: runtime.root.clone(),
+        };
+        let events = events.clone();
+        thread::spawn(move || {
+            stop_after_owner(&other_shell, &events)
+                .map(|report| report.verified())
+                .map_err(|error| format!("{error:#}"))
+        })
+    });
+
+    for stop in stops {
+        assert_eq!(stop.join().unwrap(), Ok(true));
+    }
+    owner.join().unwrap().0.unwrap();
+}
+
+#[test]
+fn stale_stop_request_does_not_stop_a_new_session() {
+    let runtime = runtime_for_tests();
+    let locks = runtime.root.join(".locks");
+    fs::create_dir_all(&locks).unwrap();
+    let stale = locks.join(format!("alpha.{}.stop", uuid::Uuid::new_v4()));
+    fs::write(&stale, "").unwrap();
+    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+
+    thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        !owner.is_finished(),
+        "a stale request stopped the new session"
+    );
+    assert!(!stale.exists());
+    interrupt.send(Ended::Interrupted).unwrap();
+    owner.join().unwrap().0.unwrap();
+}
+
+#[test]
+fn stop_without_an_owner_cleans_leftovers() {
+    let runtime = runtime_for_tests();
+    let locks = runtime.root.join(".locks");
+    fs::create_dir_all(&locks).unwrap();
+    fs::write(locks.join("alpha.session"), "crashed-launcher").unwrap();
+    let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "ths-alpha");
+    docker.inspect(
+        "container",
+        "ths-alpha-app",
+        r#"[{"Id":"owned-app","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
+    );
+    docker.inspect(
+        "volume",
+        "ths-alpha-wallet",
+        r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
+    );
+    docker.inspect(
+        "network",
+        "ths-alpha",
+        r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
+    );
+
+    let report = runtime
+        .verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+            runtime.cleanup_with(&name("alpha"), &docker, false, &stop_policy())
+        })
+        .unwrap();
+
+    assert!(report.verified());
+    assert_eq!(
+        *docker.runs.lock().unwrap(),
+        [
+            "rm -f owned-app",
+            "volume rm ths-alpha-wallet",
+            "network rm owned-network",
+        ]
+    );
+    assert!(session_files(&runtime).is_empty());
+}
+
+#[test]
+fn reset_without_force_does_not_request_shutdown() {
+    let runtime = runtime_for_tests();
+    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+
+    let error = runtime.reset(&name("alpha"), false).unwrap_err();
+
+    assert!(error.to_string().contains("--force"), "{error:#}");
+    assert_eq!(session_files(&runtime), ["alpha.session"]);
+    assert!(!owner.is_finished());
+    interrupt.send(Ended::Interrupted).unwrap();
+    owner.join().unwrap().0.unwrap();
+}

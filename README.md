@@ -66,7 +66,10 @@ the foreground launcher watches the allocated app container and exits when
 another command deletes it, without deleting the environment again. A second
 per-name lock is held by the foreground start until it exits, so another
 `start` with the same name is refused instead of replacing the running
-environment, and `stop` and `reset` wait for that launcher to exit.
+environment. While that launcher runs, `stop` and `reset --force` ask it to
+shut down, as Ctrl+C would, during startup or once ready, wait for its cleanup,
+and then verify that nothing is left. Requests name the launcher's session, so
+a leftover request cannot stop a later `start`.
 
 ![Wallet dashboard with five development accounts](book/images/wallet.png)
 

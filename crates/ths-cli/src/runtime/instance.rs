@@ -204,6 +204,34 @@ impl Drop for InstanceLock {
     }
 }
 
+pub(super) struct StartSession {
+    files: [PathBuf; 2],
+    stop: Option<mpsc::Sender<()>>,
+    watcher: Option<thread::JoinHandle<()>>,
+}
+impl Drop for StartSession {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(watcher) = self.watcher.take()
+            && watcher.join().is_err()
+        {
+            eprintln!("stop request monitoring stopped unexpectedly");
+        }
+        for file in &self.files {
+            if let Err(error) = remove_if_present(file) {
+                eprintln!("could not remove {}: {error}", file.display());
+            }
+        }
+    }
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 impl Runtime {
     pub(super) fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
         self.try_lock(&format!("{name}.lock"))?
@@ -218,20 +246,102 @@ impl Runtime {
         })
     }
 
-    pub(super) fn wait_for_start_exit(
+    pub(super) fn publish_session(
         &self,
         name: &InstanceName,
-        deadline: Deadline,
+        shutdown: &Shutdown,
         poll: Duration,
-    ) -> Result<()> {
+    ) -> Result<StartSession> {
+        let lock_dir = self.root.join(".locks");
+        let stale = format!("{name}.");
+        for entry in fs::read_dir(&lock_dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| file.starts_with(&stale) && file.ends_with(".stop"))
+            {
+                remove_if_present(&path)?;
+            }
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let session = self.session_path(name);
+        let pending = lock_dir.join(format!("{name}.session.pending"));
+        fs::write(&pending, &id)?;
+        fs::rename(&pending, &session)?;
+        let request = self.stop_request_path(name, &id);
+        let (stop, stopped) = mpsc::channel();
+        let flag = shutdown.flag.clone();
+        let notify = shutdown.sender.clone();
+        let watched = request.clone();
+        let watcher = thread::spawn(move || {
+            while matches!(stopped.recv_timeout(poll), Err(RecvTimeoutError::Timeout)) {
+                if watched.exists() {
+                    flag.store(true, Ordering::SeqCst);
+                    let _ = notify.send(Ended::Interrupted);
+                    return;
+                }
+            }
+        });
+        Ok(StartSession {
+            files: [request, session],
+            stop: Some(stop),
+            watcher: Some(watcher),
+        })
+    }
+
+    pub(super) fn verified_cleanup_with(
+        &self,
+        name: &InstanceName,
+        policy: &LifecyclePolicy,
+        cleanup: impl FnOnce() -> Result<CleanupReport>,
+    ) -> Result<CleanupReport> {
+        let deadline = Deadline::after(policy.startup_docker + policy.cleanup * 2);
+        let mut requested: Option<(String, PathBuf)> = None;
         loop {
-            if self.try_lock(&format!("{name}.start.lock"))?.is_some() {
-                return Ok(());
+            if let Some(_owner) = self.try_lock(&format!("{name}.start.lock"))? {
+                if let Some((_, request)) = &requested {
+                    remove_if_present(request)?;
+                }
+                remove_if_present(&self.session_path(name))?;
+                let _lock = self.lock_instance(name)?;
+                return cleanup();
+            }
+            match (&requested, self.read_session(name)?) {
+                (None, Some(id)) => {
+                    let request = self.stop_request_path(name, &id);
+                    fs::write(&request, "")?;
+                    println!("Asking the running `ths start` for {name} to stop…");
+                    requested = Some((id, request));
+                }
+                (Some((target, _)), Some(id)) if *target != id => {
+                    bail!("{name} is now owned by a newer `ths start`; it was not stopped")
+                }
+                _ => {}
             }
             if deadline.expired() {
-                bail!("deleted {name}, but its `ths start` launcher has not exited yet");
+                bail!("the `ths start` launcher for {name} did not stop and clean up in time");
             }
-            thread::sleep(poll.min(deadline.remaining()));
+            thread::sleep(policy.poll.min(deadline.remaining()));
+        }
+    }
+
+    fn session_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.session"))
+    }
+
+    fn stop_request_path(&self, name: &InstanceName, session: &str) -> PathBuf {
+        self.root
+            .join(".locks")
+            .join(format!("{name}.{session}.stop"))
+    }
+
+    fn read_session(&self, name: &InstanceName) -> Result<Option<String>> {
+        match fs::read_to_string(self.session_path(name)) {
+            Ok(id) if !id.trim().is_empty() => Ok(Some(id.trim().to_owned())),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading the `ths start` session"),
         }
     }
 

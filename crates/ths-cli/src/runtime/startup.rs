@@ -647,6 +647,7 @@ impl Runtime {
         host_ports(port_offset)?;
         let _owner = self.claim_start(name)?;
         let mut lifecycle = Some(self.lock_instance(name)?);
+        let _session = self.publish_session(name, shutdown, context.policy.poll)?;
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
