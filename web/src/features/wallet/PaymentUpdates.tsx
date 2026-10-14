@@ -109,8 +109,7 @@ export function PaymentUpdates() {
   const forget = async (identity: PaymentIdentity) => {
     const operation = identity.kind === 'send' ? send : faucet;
     const saved = identity.kind === 'send' ? savedSend : savedFaucet;
-    await operation.clear(identity);
-    saved.forgetKey(identity.key);
+    if (!(await operation.forget(identity, () => saved.forgetKey(identity.key)))) return;
     requestAnimationFrame(() => focusNext(identity));
   };
   const startNew = (identity: PaymentIdentity) => {
@@ -290,7 +289,7 @@ export function PaymentUpdates() {
             onView={() => viewPayment(identity.key)}
             identity={identity}
             restored={isRestored(identity.key)}
-            pendingKey={operation.pendingKey}
+            inFlight={operation.isSubmitting(identity)}
             busy={send.isPending || faucet.isPending}
             claimAnnouncement={operation.claimAnnouncement}
             onTerminal={operation.clear}

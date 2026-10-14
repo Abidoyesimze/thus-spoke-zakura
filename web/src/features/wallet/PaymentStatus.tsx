@@ -23,7 +23,7 @@ import { cn } from '@/lib/cn';
 export function PaymentStatus({
   identity,
   restored,
-  pendingKey,
+  inFlight,
   busy,
   claimAnnouncement,
   onTerminal,
@@ -39,7 +39,7 @@ export function PaymentStatus({
 }: {
   identity: PaymentIdentity;
   restored: boolean;
-  pendingKey: string | null;
+  inFlight: boolean;
   busy: boolean;
   claimAnnouncement: (key: string) => boolean;
   onTerminal: (identity: PaymentIdentity) => Promise<void>;
@@ -73,7 +73,6 @@ export function PaymentStatus({
   const terminal = isTerminalPayment(activity);
   const confirmed = activity?.status === 'confirmed';
   const failed = activity?.status === 'failed';
-  const inFlight = pendingKey === identity.key;
   const canForget = status.isSuccess && activity === null && !inFlight;
   const variables = identity.variables;
   const destination = paymentRecipient(variables);

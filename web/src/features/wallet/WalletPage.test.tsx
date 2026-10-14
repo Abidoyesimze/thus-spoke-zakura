@@ -17,6 +17,7 @@ import { WalletPage } from './WalletPage';
 
 const TXID = 'ab'.repeat(32);
 const PAYMENT_URI = 'zcash:uregtest1account2?amount=1.23456789&memo=cmVudCBmb3IgT2N0b2Jlcg';
+const testLocks = Object.getOwnPropertyDescriptor(navigator, 'locks')!;
 
 function json(body: unknown): Promise<Response> {
   return Promise.resolve(
@@ -154,6 +155,47 @@ function retainSaved(kind: 'send' | 'faucet', key: string, name = savedName(kind
   localStorage.setItem(`ths:${kind}:retained:${key}`, name);
 }
 
+function preparingPayment(kind: 'send' | 'faucet', key: string): Activity {
+  return {
+    id: key,
+    kind,
+    from_account: kind === 'send' ? 1 : null,
+    to_account: kind === 'send' ? 2 : 1,
+    to_address: null,
+    source_pool: 'ironwood',
+    destination_pool: 'ironwood',
+    amount_zatoshi: 100_000_000n,
+    txid: '',
+    block_hash: null,
+    status: 'preparing',
+    last_error: null,
+    created_at: '2026-10-14 00:00:00',
+  };
+}
+
+function deferPaymentLock() {
+  let release!: () => void;
+  let tail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const request = vi.fn((name: string, callback: (lock: Lock) => unknown) => {
+    const result = tail.then(() => callback({ name, mode: 'exclusive' }));
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  });
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } });
+  return {
+    request,
+    release: async () => {
+      release();
+      await tail;
+    },
+  };
+}
+
 beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
@@ -161,6 +203,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  Object.defineProperty(navigator, 'locks', testLocks);
 });
 
 describe('WalletPage', () => {
@@ -404,6 +447,127 @@ describe('WalletPage', () => {
       expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
     },
   );
+
+  it.each([
+    ['send', 'resume-first'],
+    ['send', 'forget-first'],
+    ['faucet', 'resume-first'],
+    ['faucet', 'forget-first'],
+  ] as const)('preserves a queued %s request when %s races for its lock', async (kind, order) => {
+    mockWalletApis();
+    const fallback = vi.mocked(fetch).getMockImplementation()!;
+    const name = savedName(kind);
+    const key = 'queued-payment-key';
+    const record = `ths:${kind}:retained:${key}`;
+    retainSaved(kind, key);
+    let payment: Activity | null = null;
+    vi.spyOn(api, 'payment').mockImplementation(() => Promise.resolve(payment));
+    let finishPost!: (response: Response) => void;
+    const response = new Promise<Response>((resolve) => {
+      finishPost = resolve;
+    });
+    vi.mocked(fetch).mockImplementation((input, init) =>
+      init?.method === 'POST' && requestUrl(input).endsWith(`/${kind}`)
+        ? response
+        : fallback(input, init),
+    );
+    const posts = () =>
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(
+          ([input, init]) => init?.method === 'POST' && requestUrl(input).endsWith(`/${kind}`),
+        );
+    const bodies = () =>
+      posts().map(([, init]): unknown =>
+        JSON.parse(typeof init?.body === 'string' ? init.body : '{}'),
+      );
+
+    renderWithWalletActions(<WalletPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /View payments/ }));
+    const forget = await screen.findByRole('button', { name: 'Forget saved request' });
+    const resume = screen.getByRole('button', { name: 'Resume' });
+    const row = forget.closest('article')!;
+    const lock = deferPaymentLock();
+    const removed = vi.spyOn(Storage.prototype, 'removeItem');
+
+    // Batch both clicks to exercise an already-rendered Forget control as well as its UI gate.
+    act(() => {
+      if (order === 'resume-first') {
+        resume.click();
+        forget.click();
+      } else {
+        forget.click();
+        resume.click();
+      }
+    });
+    await waitFor(() => expect(lock.request).toHaveBeenCalledTimes(2));
+    expect(lock.request.mock.calls.every(([lockedName]) => lockedName === name)).toBe(true);
+    expect(posts()).toHaveLength(0);
+    const forgetWhileQueued = screen.queryByRole('button', { name: 'Forget saved request' });
+    await act(lock.release);
+    await waitFor(() => expect(posts()).toHaveLength(1));
+
+    payment = preparingPayment(kind, key);
+    await act(async () => {
+      finishPost(
+        new Response(JSON.stringify({ ...payment, amount_zatoshi: 100_000_000 }), {
+          status: 202,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      await response;
+    });
+    expect(forgetWhileQueued).toBeNull();
+    expect(document.body).toContainElement(row);
+    expect(localStorage.getItem(name)).toBe(key);
+    expect(localStorage.getItem(record)).toBe(name);
+    expect(sessionStorage.getItem(`${name}:tab`)).toBe(key);
+    expect(removed).not.toHaveBeenCalledWith(record);
+    expect(bodies()[0]).toMatchObject({ idempotency_key: key });
+    await userEvent.click(await within(row).findByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(posts()).toHaveLength(2));
+    expect(bodies()[1]).toMatchObject({ idempotency_key: key });
+    expect(await within(row).findByText('Preparing payment')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(screen.getByRole('button', { name: /View payments/ })).toHaveAccessibleName(
+      /1 unresolved/,
+    );
+  });
+
+  it.each([
+    ['send', 'record'],
+    ['send', 'lookup-failure'],
+    ['faucet', 'record'],
+    ['faucet', 'lookup-failure'],
+  ] as const)('keeps a %s request if %s arrives while Forget waits', async (kind, outcome) => {
+    mockWalletApis();
+    const name = savedName(kind);
+    const key = 'lookup-race-key';
+    const record = `ths:${kind}:retained:${key}`;
+    retainSaved(kind, key);
+    const lookup = vi.spyOn(api, 'payment').mockResolvedValue(null);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderWithWalletActions(<WalletPage />, client);
+    await userEvent.click(await screen.findByRole('button', { name: /View payments/ }));
+    const forget = await screen.findByRole('button', { name: 'Forget saved request' });
+    const row = forget.closest('article')!;
+    const lock = deferPaymentLock();
+    const removed = vi.spyOn(Storage.prototype, 'removeItem');
+    await userEvent.click(forget);
+    await waitFor(() => expect(lock.request).toHaveBeenCalledTimes(1));
+
+    if (outcome === 'record') lookup.mockResolvedValue(preparingPayment(kind, key));
+    else lookup.mockRejectedValue(new Error('status offline'));
+    await act(() => client.refetchQueries({ queryKey: queryKeys.payment(key) }));
+    await act(lock.release);
+
+    expect(document.body).toContainElement(row);
+    expect(localStorage.getItem(name)).toBe(key);
+    expect(localStorage.getItem(record)).toBe(name);
+    expect(removed).not.toHaveBeenCalledWith(record);
+    expect(screen.queryByRole('button', { name: 'Forget saved request' })).not.toBeInTheDocument();
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === 'POST')).toBe(false);
+  });
 
   it.each(['send', 'faucet'] as const)(
     'handles a delayed %s startup failure across reload and same-origin restart',
