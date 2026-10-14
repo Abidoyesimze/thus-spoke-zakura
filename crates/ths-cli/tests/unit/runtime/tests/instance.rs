@@ -370,3 +370,33 @@ fn docker_timestamps_parse_to_unix_seconds() {
     assert_eq!(parse_docker_time("0001-01-01T00:00:00Z"), None);
     assert_eq!(parse_docker_time("not a time"), None);
 }
+
+#[test]
+fn stop_waits_for_the_stopped_launcher_to_exit() {
+    let runtime = runtime_for_tests();
+    let owner = runtime.claim_start(&name("alpha")).unwrap();
+    let error = runtime
+        .wait_for_start_exit(
+            &name("alpha"),
+            Deadline::after(Duration::from_millis(20)),
+            Duration::from_millis(1),
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("has not exited yet"),
+        "{error:#}"
+    );
+
+    let release = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(20));
+        drop(owner);
+    });
+    runtime
+        .wait_for_start_exit(
+            &name("alpha"),
+            Deadline::after(Duration::from_secs(5)),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+    release.join().unwrap();
+}

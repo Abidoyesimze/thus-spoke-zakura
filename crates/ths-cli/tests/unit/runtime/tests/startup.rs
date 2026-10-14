@@ -314,3 +314,113 @@ fn shutdown_wait_keeps_a_deletion_notice_that_arrived_first() {
     assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
     assert!(shutdown.try_interrupted());
 }
+
+fn metadata_snapshot(dir: &Path) -> Vec<(OsString, Vec<u8>)> {
+    let mut entries = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            (entry.file_name(), fs::read(entry.path()).unwrap())
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn second_start_is_refused_before_touching_a_running_environment() {
+    let runtime = runtime_for_tests();
+    let root = runtime.root.clone();
+    let observed = Arc::new(Mutex::new(None));
+    let (mut first, first_events) = RecordingHost::new();
+    let record = observed.clone();
+    first.while_running = Some(Box::new(move || {
+        let second = Runtime { root: root.clone() };
+        let metadata = second.instance_dir(&name("alpha"));
+        fs::write(metadata.join("instance.json"), "first launcher").unwrap();
+        let before = metadata_snapshot(&metadata);
+        let (mut host, events) = RecordingHost::new();
+        host.while_running = Some(Box::new(|| Ended::Interrupted));
+        let (_sender, shutdown) = Shutdown::channel();
+        let result = second
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+            .map_err(|error| format!("{error:#}"));
+        let unchanged = metadata_snapshot(&metadata) == before;
+        *record.lock().unwrap() = Some((result, events.lock().unwrap().clone(), unchanged));
+        Ended::Interrupted
+    }));
+    let (_sender, shutdown) = Shutdown::channel();
+
+    runtime
+        .start_with(&name("alpha"), true, false, 0, &first, &shutdown)
+        .unwrap();
+
+    let (result, second_events, unchanged) = observed.lock().unwrap().take().unwrap();
+    let error = result.expect_err("a second start replaced the running environment");
+    assert!(
+        error.contains("already running in another `ths start`"),
+        "{error}"
+    );
+    assert!(second_events.is_empty(), "{second_events:?}");
+    assert!(unchanged, "the second start changed instance metadata");
+    assert!(
+        first_events
+            .lock()
+            .unwrap()
+            .contains(&"final_cleanup:alpha".into())
+    );
+}
+
+#[test]
+fn stopped_launcher_keeps_the_name_until_its_cleanup_ends() {
+    let runtime = runtime_for_tests();
+    let root = runtime.root.clone();
+    let observed = Arc::new(Mutex::new(None));
+    let (mut first, first_events) = RecordingHost::new();
+    let record = observed.clone();
+    first.while_running = Some(Box::new(move || {
+        let other_shell = Runtime { root: root.clone() };
+        let stop = other_shell.lock_instance(&name("alpha")).map(drop);
+        let (mut host, events) = RecordingHost::new();
+        host.while_running = Some(Box::new(|| Ended::DeletedElsewhere));
+        let (_sender, shutdown) = Shutdown::channel();
+        let restart = other_shell
+            .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+            .map_err(|error| format!("{error:#}"));
+        *record.lock().unwrap() = Some((stop.is_ok(), restart, events.lock().unwrap().clone()));
+        Ended::Interrupted
+    }));
+    let (_sender, shutdown) = Shutdown::channel();
+
+    runtime
+        .start_with(&name("alpha"), true, false, 0, &first, &shutdown)
+        .unwrap();
+
+    let (stop_admitted, restart, restart_events) = observed.lock().unwrap().take().unwrap();
+    assert!(stop_admitted, "stop was locked out by the running launcher");
+    let error = restart.expect_err("a new start ran before the old launcher's cleanup");
+    assert!(
+        error.contains("already running in another `ths start`"),
+        "{error}"
+    );
+    assert!(restart_events.is_empty(), "{restart_events:?}");
+    assert!(
+        first_events
+            .lock()
+            .unwrap()
+            .contains(&"final_cleanup:alpha".into())
+    );
+
+    let (mut next, next_events) = RecordingHost::new();
+    next.while_running = Some(Box::new(|| Ended::DeletedElsewhere));
+    let (_sender, shutdown) = Shutdown::channel();
+    runtime
+        .start_with(&name("alpha"), true, false, 0, &next, &shutdown)
+        .unwrap();
+    assert!(
+        next_events
+            .lock()
+            .unwrap()
+            .contains(&"allocate:alpha".into())
+    );
+}

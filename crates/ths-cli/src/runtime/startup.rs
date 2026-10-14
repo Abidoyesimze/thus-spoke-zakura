@@ -645,6 +645,7 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<()> {
         host_ports(port_offset)?;
+        let _owner = self.claim_start(name)?;
         let mut lifecycle = Some(self.lock_instance(name)?);
         let mut cleanup = CleanupOnDrop {
             runtime: self,

@@ -63,7 +63,10 @@ allocation identities. A per-name lock serializes startup, stop, and reset.
 `run` holds that lock until cleanup; ordinary foreground start releases it
 once ready so another command can stop the environment. Once ready,
 the foreground launcher watches the allocated app container and exits when
-another command deletes it, without deleting the environment again.
+another command deletes it, without deleting the environment again. A second
+per-name lock is held by the foreground start until it exits, so another
+`start` with the same name is refused instead of replacing the running
+environment, and `stop` and `reset` wait for that launcher to exit.
 
 ![Wallet dashboard with five development accounts](book/images/wallet.png)
 

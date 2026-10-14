@@ -152,6 +152,7 @@ struct RecordingHost {
     deleted_elsewhere: bool,
     allocate_delay: Duration,
     run_status: Option<RuntimeStatus>,
+    while_running: Option<Box<dyn Fn() -> Ended>>,
 }
 
 impl RecordingHost {
@@ -169,6 +170,7 @@ impl RecordingHost {
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
                 run_status: None,
+                while_running: None,
             },
             events,
         )
@@ -333,6 +335,9 @@ impl StartHost for RecordingHost {
     ) -> Result<Ended> {
         self.push(&format!("wait_for_shutdown:{}", app_container.id));
         assert_eq!(app_container, &watched("app-1"));
+        if let Some(while_running) = &self.while_running {
+            return Ok(while_running());
+        }
         if self.shutdown_collision.is_some() {
             return Ok(Ended::Interrupted);
         }

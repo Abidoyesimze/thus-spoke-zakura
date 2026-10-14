@@ -206,6 +206,36 @@ impl Drop for InstanceLock {
 
 impl Runtime {
     pub(super) fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
+        self.try_lock(&format!("{name}.lock"))?
+            .with_context(|| format!("environment {name} is already in use by another command"))
+    }
+
+    pub(super) fn claim_start(&self, name: &InstanceName) -> Result<InstanceLock> {
+        self.try_lock(&format!("{name}.start.lock"))?.with_context(|| {
+            format!(
+                "environment {name} is already running in another `ths start`; stop it first with `ths --name {name} stop`"
+            )
+        })
+    }
+
+    pub(super) fn wait_for_start_exit(
+        &self,
+        name: &InstanceName,
+        deadline: Deadline,
+        poll: Duration,
+    ) -> Result<()> {
+        loop {
+            if self.try_lock(&format!("{name}.start.lock"))?.is_some() {
+                return Ok(());
+            }
+            if deadline.expired() {
+                bail!("deleted {name}, but its `ths start` launcher has not exited yet");
+            }
+            thread::sleep(poll.min(deadline.remaining()));
+        }
+    }
+
+    fn try_lock(&self, file_name: &str) -> Result<Option<InstanceLock>> {
         let lock_dir = self.root.join(".locks");
         fs::create_dir_all(&lock_dir)?;
         let file = OpenOptions::new()
@@ -213,12 +243,10 @@ impl Runtime {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(lock_dir.join(format!("{name}.lock")))?;
+            .open(lock_dir.join(file_name))?;
         match file.try_lock() {
-            Ok(()) => Ok(InstanceLock(file)),
-            Err(TryLockError::WouldBlock) => {
-                bail!("environment {name} is already in use by another command")
-            }
+            Ok(()) => Ok(Some(InstanceLock(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error).context("locking environment"),
         }
     }
