@@ -9,6 +9,7 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
   of failing with a 500 against the unscanned wallet. An unscanned wallet
   after startup is also reported as unavailable rather than as an
   unexpected error.
+  [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299)
 
 - **Explorer search feedback:** Numeric 64-character hashes are searched as hashes,
   missing hashes are distinguished from service failures, and transparent
