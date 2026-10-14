@@ -13,6 +13,9 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     if cli.json && matches!(cli.command, Some(Command::Run { .. })) {
         anyhow::bail!("--json cannot be used with `run`; the child command owns stdout");
     }
+    if cli.json && matches!(cli.command, Some(Command::Endpoints { env: true })) {
+        anyhow::bail!("--json cannot be used with `endpoints --env`");
+    }
     if let Some(Command::Update { version, check }) = &cli.command {
         return updater::run(version.as_deref(), *check, cli.json);
     }
@@ -47,7 +50,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Uninstall => unreachable!("uninstall is handled before runtime discovery"),
         Command::Status => runtime.status(&name, cli.json),
         Command::Open => runtime.open(&name),
-        Command::Endpoints => runtime.endpoints(&name, cli.json),
+        Command::Endpoints { env } => runtime.endpoints(&name, cli.json, env),
         Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
         Command::Faucet { address, amount } => {
             runtime.faucet(&name, &address, amount.zatoshi(), cli.json)

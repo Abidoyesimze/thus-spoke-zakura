@@ -355,9 +355,10 @@ resources.
 Startup and settlement have a 120-second default timeout. The child command
 has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
 `THS_ZAKURA_RPC_URL`, `THS_LIGHTWALLETD_URL`, `THS_LIGHTWALLETD_TLS`, and
-`THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
-the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
-endpoint. `ths run` chooses a fresh `run-<UUID>` name unless `--name` is supplied and
+`THS_P2P_ADDR`. `eval "$(ths endpoints --env)"` exports those same variables
+from an environment that is already running. Seeds and spending keys are not
+exported; projects that need the deterministic development seed can use the
+explicit `POST /api/v1/dev/seed` endpoint. `ths run` chooses a fresh `run-<UUID>` name unless `--name` is supplied and
 refuses an existing environment. It uses the default loopback ports, so they
 must be free. `ths run` supports non-interactive commands; commands that read from
 the controlling terminal are not supported.
@@ -381,6 +382,7 @@ Running `ths` with no command starts the default environment.
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
+| `ths endpoints --env` | Print `export` lines for the variables `ths run` passes to its child |
 | `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
 | `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
