@@ -381,7 +381,7 @@ impl StartHost for DockerHost {
         fs::create_dir_all(runtime.instance_dir(name))?;
         shutdown.check()?;
         let prefix = prefix(name);
-        let ports = port_offset.map(host_ports).transpose()?.unwrap_or_default();
+        let mut ports = port_offset.map(host_ports).transpose()?.unwrap_or_default();
         for port in [ports.dashboard, ports.rpc, ports.p2p, ports.lightwalletd] {
             if port != 0 {
                 require_free_loopback(port)?;
@@ -519,6 +519,12 @@ impl StartHost for DockerHost {
         )?;
         shutdown.check()?;
         let app_budget = context.startup_deadline(context.policy.startup_docker);
+        if port_offset.is_none() {
+            let docker = docker.scoped(app_budget, context.policy.startup_docker);
+            ports.rpc = published_port_with(&docker, &zakura_id, "18232/tcp")?;
+            ports.p2p = published_port_with(&docker, &zakura_id, "18233/tcp")?;
+            ports.lightwalletd = published_port_with(&docker, &lightwalletd_id, "9067/tcp")?;
+        }
         let app_container = ensure_app(
             &prefix,
             name,
