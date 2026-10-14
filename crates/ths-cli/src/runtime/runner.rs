@@ -83,8 +83,8 @@ impl Runtime {
         shutdown: &Shutdown,
         context: &LifecycleContext,
     ) -> Result<u8> {
-        host_ports(0)?;
-        let _lifecycle = self.lock_instance(name)?;
+        let mut lifecycle = self.lock_instance(name)?;
+        lifecycle.remove_when_dropped();
         let deadline = context.overall_deadline.context("missing run deadline")?;
         if deadline.expired() {
             bail!("environment did not start before the timeout");
@@ -108,7 +108,7 @@ impl Runtime {
         println!("Preparing a fresh {name} environment…");
         let primary = (|| {
             let mut journal = recovery::RecoveryJournal::create(self.recovery_path(name), name)?;
-            let allocated = host.allocate(self, name, shutdown, 0, context, &mut journal)?;
+            let allocated = host.allocate(self, name, shutdown, None, context, &mut journal)?;
             if allocated.zakura_container_id.is_empty()
                 || allocated
                     .resources
@@ -148,6 +148,11 @@ impl Runtime {
         let cleaned = host
             .delete_partial(self, name, context, Deadline::after(context.policy.cleanup))
             .and_then(CleanupReport::into_result);
+        let unlocked = lifecycle.finish();
+        let cleaned = match (cleaned, unlocked) {
+            (Ok(()), result) | (result, Ok(())) => result,
+            (Err(cleanup), Err(unlock)) => Err(anyhow!("{cleanup:#}; {unlock:#}")),
+        };
         match (primary, cleaned) {
             (Ok(ChildOutcome::Exited(code)), Ok(())) => Ok(code),
             (Ok(ChildOutcome::Signaled), Ok(())) => Ok(1),

@@ -358,8 +358,8 @@ has no runtime limit and receives `THS_INSTANCE`, `THS_NETWORK`, `THS_API_URL`,
 `THS_P2P_ADDR`. Seeds and spending keys are not exported; projects that need
 the deterministic development seed can use the explicit `POST /api/v1/dev/seed`
 endpoint. `ths run` chooses a fresh `run-<UUID>` name unless `--name` is supplied and
-refuses an existing environment. It uses the default loopback ports, so they
-must be free. `ths run` supports non-interactive commands; commands that read from
+refuses an existing environment. Docker assigns free loopback ports to each run.
+`ths run` supports non-interactive commands; commands that read from
 the controlling terminal are not supported.
 
 To wait for an environment you started separately:
@@ -381,7 +381,7 @@ Running `ths` with no command starts the default environment.
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
-| `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
+| `ths run -- npm test` | Run a command in a fresh, settled environment on free loopback ports and delete it afterward |
 | `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
 | `ths faucet <ADDRESS>` | Send 1 disposable ZEC to a Regtest unified or transparent address; repeat the same command to check a pending payment |

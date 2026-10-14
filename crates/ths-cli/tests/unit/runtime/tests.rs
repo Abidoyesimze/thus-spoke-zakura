@@ -152,6 +152,7 @@ struct RecordingHost {
     deleted_elsewhere: bool,
     allocate_delay: Duration,
     run_status: Option<RuntimeStatus>,
+    allocated_offsets: Mutex<Vec<Option<u16>>>,
 }
 
 impl RecordingHost {
@@ -169,6 +170,7 @@ impl RecordingHost {
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
                 run_status: None,
+                allocated_offsets: Mutex::new(Vec::new()),
             },
             events,
         )
@@ -279,11 +281,12 @@ impl StartHost for RecordingHost {
         _runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
-        _port_offset: u16,
+        port_offset: Option<u16>,
         _context: &LifecycleContext,
         _journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance> {
         self.push(&format!("allocate:{name}"));
+        self.allocated_offsets.lock().unwrap().push(port_offset);
         std::thread::sleep(self.allocate_delay);
         shutdown.check()?;
         Ok(AllocatedInstance {

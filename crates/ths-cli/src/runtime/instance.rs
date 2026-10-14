@@ -124,7 +124,7 @@ impl Runtime {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct HostPorts {
     pub(super) dashboard: u16,
     pub(super) rpc: u16,
@@ -153,7 +153,11 @@ pub(super) fn host_ports(offset: u16) -> Result<HostPorts> {
 }
 
 pub(super) fn loopback_publish(host: u16, container: u16) -> String {
-    format!("127.0.0.1:{host}:{container}")
+    if host == 0 {
+        format!("127.0.0.1::{container}")
+    } else {
+        format!("127.0.0.1:{host}:{container}")
+    }
 }
 
 pub(super) fn require_free_loopback(port: u16) -> Result<()> {
@@ -195,10 +199,71 @@ pub(super) fn endpoint_lines(e: &Endpoints) -> String {
     )
 }
 
-pub(super) struct InstanceLock(File);
+pub(super) struct InstanceLock {
+    file: File,
+    path: PathBuf,
+    remove_on_drop: bool,
+}
+
+fn lock_registry(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::WouldBlock) => bail!("instance lock registry is busy; try again"),
+            Err(TryLockError::Error(error)) => {
+                return Err(error).context("locking instance registry");
+            }
+        }
+    }
+}
+
+impl InstanceLock {
+    pub(super) fn remove_when_dropped(&mut self) {
+        self.remove_on_drop = true;
+    }
+
+    pub(super) fn finish(mut self) -> Result<()> {
+        self.remove_on_drop = false;
+        let _registry = lock_registry(&self.path.with_file_name(".registry.lock"))?;
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("removing the instance lock"),
+        }
+        self.file.unlock().context("releasing the instance lock")
+    }
+}
+
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        if let Err(error) = self.0.unlock() {
+        let registry = if self.remove_on_drop {
+            match lock_registry(&self.path.with_file_name(".registry.lock")) {
+                Ok(registry) => Some(registry),
+                Err(error) => {
+                    eprintln!("could not remove the instance lock: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if registry.is_some()
+            && let Err(error) = fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("could not remove the instance lock: {error}");
+        }
+        if let Err(error) = self.file.unlock() {
             eprintln!("could not release the instance lock: {error}");
         }
     }
@@ -208,14 +273,22 @@ impl Runtime {
     pub(super) fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
         let lock_dir = self.root.join(".locks");
         fs::create_dir_all(&lock_dir)?;
+        // Serialize opening and unlinking locks so a contender cannot lock an
+        // unlinked inode while another command locks a newly created file.
+        let _registry = lock_registry(&lock_dir.join(".registry.lock"))?;
+        let path = lock_dir.join(format!("{name}.lock"));
         let file = OpenOptions::new()
             .create(true)
             .read(true)
             .write(true)
             .truncate(false)
-            .open(lock_dir.join(format!("{name}.lock")))?;
+            .open(&path)?;
         match file.try_lock() {
-            Ok(()) => Ok(InstanceLock(file)),
+            Ok(()) => Ok(InstanceLock {
+                file,
+                path,
+                remove_on_drop: false,
+            }),
             Err(TryLockError::WouldBlock) => {
                 bail!("environment {name} is already in use by another command")
             }

@@ -248,7 +248,7 @@ pub(super) trait StartHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
-        port_offset: u16,
+        port_offset: Option<u16>,
         context: &LifecycleContext,
         journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance>;
@@ -367,7 +367,7 @@ impl StartHost for DockerHost {
         runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
-        port_offset: u16,
+        port_offset: Option<u16>,
         context: &LifecycleContext,
         journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance> {
@@ -381,11 +381,12 @@ impl StartHost for DockerHost {
         fs::create_dir_all(runtime.instance_dir(name))?;
         shutdown.check()?;
         let prefix = prefix(name);
-        let ports = host_ports(port_offset)?;
-        require_free_loopback(ports.dashboard)?;
-        require_free_loopback(ports.rpc)?;
-        require_free_loopback(ports.p2p)?;
-        require_free_loopback(ports.lightwalletd)?;
+        let ports = port_offset.map(host_ports).transpose()?.unwrap_or_default();
+        for port in [ports.dashboard, ports.rpc, ports.p2p, ports.lightwalletd] {
+            if port != 0 {
+                require_free_loopback(port)?;
+            }
+        }
         shutdown.check()?;
         let network_budget = context.startup_deadline(context.policy.startup_docker);
         let network = ensure_network_with(
@@ -537,7 +538,16 @@ impl StartHost for DockerHost {
             app_start,
         )?;
         shutdown.check()?;
-        let endpoints = endpoints_for(&ports);
+        let endpoints = if port_offset.is_none() {
+            inspect_endpoints_with(
+                &docker.scoped(app_start, context.policy.startup_docker),
+                &app_container.id,
+                &zakura_id,
+                &lightwalletd_id,
+            )?
+        } else {
+            endpoints_for(&ports)
+        };
         runtime.write_instance(name, &endpoints)?;
         Ok(AllocatedInstance {
             endpoints,
@@ -664,8 +674,14 @@ impl Runtime {
         let primary = (|| {
             fs::create_dir_all(self.instance_dir(name))?;
             let mut journal = recovery::RecoveryJournal::create(self.recovery_path(name), name)?;
-            let allocated =
-                host.allocate(self, name, shutdown, port_offset, context, &mut journal)?;
+            let allocated = host.allocate(
+                self,
+                name,
+                shutdown,
+                Some(port_offset),
+                context,
+                &mut journal,
+            )?;
             if allocated.zakura_container_id.is_empty()
                 || allocated
                     .resources
