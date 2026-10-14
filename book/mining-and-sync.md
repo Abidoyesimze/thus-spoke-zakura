@@ -72,6 +72,10 @@ saved, the Mine dialog stays open and shows a storage error; no mining request
 is sent. Allow site storage before retrying. After an uncertain response, keep
 the existing session storage so a retry can reuse the same key.
 
+If storage cleanup fails after the server accepts a job, the dashboard still
+shows the accepted job and follows its progress. The dialog reports cleanup
+failure separately; it does not mean the mining request was rejected.
+
 Read the node and wallet view through the running instance's API:
 
 ```console

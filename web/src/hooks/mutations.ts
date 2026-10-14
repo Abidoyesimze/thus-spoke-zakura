@@ -261,31 +261,43 @@ export function usePaymentRequest(): UseMutationResult<
   return useMutation({ mutationFn: (variables) => api.paymentRequest(variables) });
 }
 
-export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
+export function useStartMining(): UseMutationResult<MiningJob, Error, number> & {
+  cleanupError: string | null;
+} {
   const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: (blocks: number) => {
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: async (blocks: number) => {
+      setCleanupError(null);
       const state = queryClient.getQueryData<{ job: MiningJob | null }>(queryKeys.mining)?.job
         ?.state;
       let key: string;
+      let clear: () => void;
       try {
         // Storage policy may deny even the getter. Resolve it only on submit,
         // and retain the retry identity before the server can accept a job.
         const operation = operationKey('mine', (blocks: number) => String(blocks));
         if (state === 'completed' || state === 'failed') operation.clear(blocks);
         key = operation.keyFor(blocks);
+        clear = () => operation.clear(blocks);
       } catch (cause) {
         throw new Error(
           'Browser session storage is unavailable. Allow site storage and retry. No mining request was sent.',
           { cause },
         );
       }
-      return api.startMining(blocks, key);
+      const job = await api.startMining(blocks, key);
+      try {
+        // Acceptance is authoritative even if storage cleanup becomes denied.
+        // Use the submitted handle so success never reacquires sessionStorage.
+        clear();
+      } catch (error) {
+        setCleanupError(error instanceof DOMException ? error.message : errorMessage(error));
+      }
+      return job;
     },
     retry: false,
-    onSuccess: async (job, blocks) => {
-      const operation = operationKey('mine', (blocks: number) => String(blocks));
-      operation.clear(blocks);
+    onSuccess: async (job) => {
       queryClient.setQueryData(queryKeys.mining, { job });
       await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
     },
@@ -293,4 +305,5 @@ export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
       await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
     },
   });
+  return { ...mutation, cleanupError };
 }
