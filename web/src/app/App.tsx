@@ -52,7 +52,7 @@ export function App() {
             <ThemeToggle />
           </div>
           <PaymentUpdates />
-          <Button variant="ghost" onClick={openMine} className="max-sm:hidden">
+          <Button variant="ghost" onClick={openMine}>
             <Pickaxe />
             Mine
           </Button>
