@@ -11,6 +11,7 @@ impl Runtime {
         host_ports(port_offset)?;
         let shutdown = Shutdown::install()?;
         let context = LifecycleContext::new_for_start(LifecyclePolicy::default(), json);
+        let ownership = self.own_start(name, &shutdown, &context)?;
         let prepared = {
             let requested = || shutdown.try_interrupted();
             let docker = LifecycleDocker::production(
@@ -28,6 +29,7 @@ impl Runtime {
             })()
         };
         if let Err(error) = prepared {
+            let error = ownership.session.explain(name, error);
             let failures = context.finish_helpers(Deadline::after(context.policy.startup_docker));
             if !failures.is_empty() {
                 return Err(anyhow!(
@@ -41,7 +43,7 @@ impl Runtime {
             }
             return Err(error);
         }
-        self.start_with_policy(
+        self.start_owned(
             name,
             no_open,
             json,
@@ -49,11 +51,18 @@ impl Runtime {
             &DockerHost,
             &shutdown,
             &context,
+            ownership,
         )
     }
     pub fn open(&self, name: &InstanceName) -> Result<()> {
         open_url(&self.read_instance(name)?.endpoints.dashboard)
     }
+}
+
+struct StartOwnership {
+    session: StartSession,
+    lifecycle: Option<InstanceLock>,
+    _owner: InstanceLock,
 }
 
 pub(super) struct Shutdown {
@@ -634,6 +643,7 @@ impl Runtime {
         self.start_with_policy(name, no_open, json, port_offset, host, shutdown, &context)
     }
     #[allow(clippy::too_many_arguments)]
+    #[cfg(test)]
     pub(super) fn start_with_policy(
         &self,
         name: &InstanceName,
@@ -645,9 +655,52 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<()> {
         host_ports(port_offset)?;
-        let _owner = self.claim_start(name)?;
-        let mut lifecycle = Some(self.lock_instance(name)?);
+        let ownership = self.own_start(name, shutdown, context)?;
+        self.start_owned(
+            name,
+            no_open,
+            json,
+            port_offset,
+            host,
+            shutdown,
+            context,
+            ownership,
+        )
+    }
+
+    fn own_start(
+        &self,
+        name: &InstanceName,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+    ) -> Result<StartOwnership> {
+        let owner = self.claim_start(name)?;
+        let lifecycle = Some(self.lock_instance(name)?);
         let session = self.publish_session(name, shutdown, context.policy.poll)?;
+        Ok(StartOwnership {
+            session,
+            lifecycle,
+            _owner: owner,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn start_owned(
+        &self,
+        name: &InstanceName,
+        no_open: bool,
+        json: bool,
+        port_offset: u16,
+        host: &dyn StartHost,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+        ownership: StartOwnership,
+    ) -> Result<()> {
+        let StartOwnership {
+            session,
+            mut lifecycle,
+            _owner,
+        } = ownership;
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
