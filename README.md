@@ -391,6 +391,7 @@ Running `ths` with no command starts the default environment.
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo; repeat the same command to check a pending payment |
 | `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address; repeat the same command to check a pending payment |
 | `ths wallet activity --limit 20` | Print recent wallet transfers and faucet activity |
+| `ths wallet quote --from 1 --source-pool ironwood --destination-pool transparent` | Show an account's spendable funds, fee, and maximum send for one pool route without sending |
 | `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
 | `ths wallet unshield --from 1 --to 2 --amount 0.2` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs app -f` | Follow dashboard/server logs |
