@@ -20,6 +20,11 @@ export function useServerEvents(): void {
   useEffect(() => {
     const source = new EventSource('/api/v1/events');
 
+    // The stream does not replay updates missed before connecting or reconnecting.
+    const onOpen = () => {
+      void queryClient.invalidateQueries();
+    };
+
     const onUpdate = (event: MessageEvent<string>) => {
       const keys = TOPICS[event.data] ?? Object.values(TOPICS).flat();
       for (const key of keys) {
@@ -27,8 +32,10 @@ export function useServerEvents(): void {
       }
     };
 
+    source.addEventListener('open', onOpen);
     source.addEventListener('update', onUpdate as EventListener);
     return () => {
+      source.removeEventListener('open', onOpen);
       source.removeEventListener('update', onUpdate as EventListener);
       source.close();
     };
