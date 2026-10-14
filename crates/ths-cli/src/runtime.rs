@@ -77,6 +77,10 @@ impl Runtime {
     }
 
     pub fn doctor(&self, json: bool) -> Result<()> {
+        self.doctor_with(json, false)
+    }
+
+    fn doctor_with(&self, json: bool, diagnostics_to_stderr: bool) -> Result<()> {
         let docker = docker_output(["version", "--format", "{{.Server.Version}}"]);
         let result = serde_json::json!({
             "docker": docker.as_ref().ok(),
@@ -88,12 +92,23 @@ impl Runtime {
         }
         if let Ok(version) = docker {
             if !json {
-                println!("✓ Docker {version}\n✓ Config: {}", self.root.display());
+                print_progress(
+                    diagnostics_to_stderr,
+                    format_args!("✓ Docker {version}\n✓ Config: {}", self.root.display()),
+                );
             }
         } else {
             bail!("Docker is not reachable; start Docker Desktop or the Docker daemon");
         }
         Ok(())
+    }
+}
+
+fn print_progress(diagnostics_to_stderr: bool, message: std::fmt::Arguments<'_>) {
+    if diagnostics_to_stderr {
+        eprintln!("{message}");
+    } else {
+        println!("{message}");
     }
 }
 

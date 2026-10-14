@@ -10,7 +10,7 @@ impl Runtime {
     ) -> Result<()> {
         host_ports(port_offset)?;
         let shutdown = Shutdown::install()?;
-        let context = LifecycleContext::new(LifecyclePolicy::default());
+        let context = LifecycleContext::new_for_start(LifecyclePolicy::default(), json);
         let prepared = {
             let requested = || shutdown.try_interrupted();
             let docker = LifecycleDocker::production(
@@ -20,7 +20,7 @@ impl Runtime {
                 Cancellation::Observe(&requested),
             );
             (|| {
-                startup_docker_reachable(&docker)?;
+                startup_docker_reachable(&docker, json)?;
                 for image in [app_image(), lightwalletd_image(), ZAKURA_IMAGE.to_owned()] {
                     startup_require_image(&docker, &image)?;
                 }
@@ -653,14 +653,14 @@ impl Runtime {
             context,
             state: CleanupGuard::Inactive,
         };
-        println!("Preparing a fresh {name} environment…");
+        print_progress(json, format_args!("Preparing a fresh {name} environment…"));
         let initial_deadline = Deadline::after(context.policy.cleanup);
         let initial = host.delete(self, name, context, initial_deadline)?;
         if !initial.verified() {
             return initial.into_result();
         }
         cleanup.state = CleanupGuard::Armed;
-        println!("Starting {name}…");
+        print_progress(json, format_args!("Starting {name}…"));
         let primary = (|| {
             fs::create_dir_all(self.instance_dir(name))?;
             let mut journal = recovery::RecoveryJournal::create(self.recovery_path(name), name)?;
@@ -695,11 +695,14 @@ impl Runtime {
         })();
         cleanup.state = CleanupGuard::Explicit;
         if matches!(primary, Ok(Ended::DeletedElsewhere)) {
-            println!("\n{name} was stopped and deleted by another command.");
+            print_progress(
+                json,
+                format_args!("\n{name} was stopped and deleted by another command."),
+            );
             return Ok(());
         }
         if primary.is_ok() {
-            println!("\nStopping and deleting {name}…");
+            print_progress(json, format_args!("\nStopping and deleting {name}…"));
         }
         let final_deadline = Deadline::after(context.policy.cleanup);
         let cleaned = host
@@ -707,7 +710,10 @@ impl Runtime {
             .and_then(CleanupReport::into_result);
         match (primary, cleaned) {
             (Ok(_), Ok(())) => {
-                println!("Deleted {name} and all of its development data.");
+                print_progress(
+                    json,
+                    format_args!("Deleted {name} and all of its development data."),
+                );
                 Ok(())
             }
             (Err(primary), Ok(())) => Err(primary),
@@ -717,11 +723,14 @@ impl Runtime {
     }
 }
 
-pub(super) fn startup_docker_reachable(docker: &impl DockerResourceCommands) -> Result<()> {
+pub(super) fn startup_docker_reachable(
+    docker: &impl DockerResourceCommands,
+    diagnostics_to_stderr: bool,
+) -> Result<()> {
     let version = docker
         .output(&["version", "--format", "{{.Server.Version}}"])
         .context("Docker is not reachable; start Docker Desktop or the Docker daemon")?;
-    println!("✓ Docker {version}");
+    print_progress(diagnostics_to_stderr, format_args!("✓ Docker {version}"));
     Ok(())
 }
 
