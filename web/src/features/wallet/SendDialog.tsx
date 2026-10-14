@@ -55,6 +55,12 @@ export function SendDialog({
   } = useWalletPayments();
   const busy = sendOperation.isPending || faucetOperation.isPending;
   const mounted = useRef(true);
+  const sendSubmissionPending = useRef(false);
+  const [checkingSendQuote, setCheckingSendQuote] = useState(false);
+  const releaseSendSubmission = () => {
+    sendSubmissionPending.current = false;
+    setCheckingSendQuote(false);
+  };
   const [submittedHere, setSubmittedHere] = useState(false);
   const [receipt, setReceipt] = useState<{
     text: string;
@@ -128,8 +134,12 @@ export function SendDialog({
   // A direct confirmation finishes only the submitted draft. Inputs remain
   // editable during the POST, and a later confirmation must preserve edits.
   const submitted = (uriRevision: number) => ({
-    onError: failed,
+    onError: (error: Error, variables: SendVariables, key: string | undefined) => {
+      releaseSendSubmission();
+      failed(error, variables, key);
+    },
     onSuccess: (result: PaymentResult, variables: SendVariables) => {
+      releaseSendSubmission();
       if (!mounted.current) return;
       if (result.activity.status === 'confirmed') announce(result);
       if (result.activity.status === 'failed') {
@@ -233,12 +243,14 @@ export function SendDialog({
       // or a new proposal; it may already have spent those funds.
       if (
         busy ||
+        sendSubmissionPending.current ||
         matchTerminal ||
         parseUri.isPending ||
         paymentUriNeedsApply ||
         uriRevision !== paymentUriRevision.current
       )
         return;
+      sendSubmissionPending.current = true;
       setSubmittedHere(true);
       setReceipt(null);
       const variables = variablesFor(values);
@@ -251,14 +263,42 @@ export function SendDialog({
         form.setError('amount', {
           message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
         });
+        releaseSendSubmission();
         return;
       }
-      const quoted = quote.data ?? (await quote.refetch()).data;
-      if (uriRevision !== paymentUriRevision.current) return;
+      let quoted = quote.data;
+      if (quoted === undefined) {
+        setCheckingSendQuote(true);
+        try {
+          quoted = (await quote.refetch()).data;
+        } catch (error) {
+          releaseSendSubmission();
+          throw error;
+        } finally {
+          setCheckingSendQuote(false);
+        }
+      }
+      if (uriRevision !== paymentUriRevision.current) {
+        releaseSendSubmission();
+        return;
+      }
+      const currentDraft = sendSchema.safeParse(form.getValues());
+      if (
+        !currentDraft.success ||
+        formName(variablesFor(currentDraft.data)) !== formName(variables)
+      ) {
+        setReceipt({
+          text: 'The send details changed while checking the fee. Review the current draft and submit again.',
+          kind: 'error',
+        });
+        releaseSendSubmission();
+        return;
+      }
       if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
         form.setError('amount', {
           message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
         });
+        releaseSendSubmission();
         return;
       }
 
@@ -463,20 +503,23 @@ export function SendDialog({
           type="submit"
           variant="primary"
           size="block"
-          loading={busy}
+          loading={busy || checkingSendQuote}
           disabled={
             busy ||
+            checkingSendQuote ||
             matchTerminal ||
             Boolean(payments.error) ||
             parseUri.isPending ||
             paymentUriNeedsApply
           }
         >
-          {busy
-            ? send.isPending && submittedHere
-              ? 'Submitting payment…'
-              : 'Another payment is submitting…'
-            : (retryLabel ?? 'Send ZEC')}
+          {checkingSendQuote
+            ? 'Checking fee…'
+            : busy
+              ? send.isPending && submittedHere
+                ? 'Submitting payment…'
+                : 'Another payment is submitting…'
+              : (retryLabel ?? 'Send ZEC')}
           {!send.isPending && <ArrowRight />}
         </Button>
       </form>
