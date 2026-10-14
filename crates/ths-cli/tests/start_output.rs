@@ -350,6 +350,15 @@ fn json_start_stdout_is_one_document_after_external_deletion() {
 #[test]
 fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
     let fixture = Fixture::new();
+    let doctor = fixture
+        .command()
+        .args(["--json", "doctor"])
+        .output()
+        .unwrap();
+    assert!(doctor.status.success());
+    let doctor: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let instance_dir =
+        std::path::PathBuf::from(doctor["config_dir"].as_str().unwrap()).join(&fixture.name);
     let mut child = fixture.start_with_browser_failure();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -377,6 +386,10 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
         thread::sleep(Duration::from_millis(10));
     }
     assert!(marker.exists(), "browser opener was not invoked");
+    assert!(
+        instance_dir.join("instance.json").exists(),
+        "instance metadata was not written to the configured directory"
+    );
 
     let stop_deadline = Instant::now() + Duration::from_secs(20);
     let stopped = loop {
@@ -421,10 +434,7 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
             "fake {kind} resources were not removed"
         );
     }
-    assert!(
-        !fixture.directory.path().join(&fixture.name).exists(),
-        "instance metadata was not removed"
-    );
+    assert!(!instance_dir.exists(), "instance metadata was not removed");
     let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
     assert!(commands.contains("rm -f"));
     assert!(commands.contains("volume rm"));
