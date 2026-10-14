@@ -159,6 +159,7 @@ describe('useServerEvents', () => {
       '/status': () => ({
         instance: 'test',
         account_count: 5,
+        mining_mode: 'auto',
         auto_mine: true,
         network: 'regtest',
         node: { blocks: 106 + confirmations - 1, bestblockhash: 'ab'.repeat(32) },

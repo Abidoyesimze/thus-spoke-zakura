@@ -91,11 +91,58 @@ fn separates_building_from_starting() {
         cli.command,
         Some(Command::Start {
             no_open: false,
-            port_offset: 10
+            port_offset: 10,
+            block_time: None,
+            mine_on_mempool: false,
+            no_auto_mine: false,
         })
     ));
 
     assert!(Cli::try_parse_from(["ths", "start", "--port-offset", "1"]).is_ok());
+}
+
+#[test]
+fn start_selects_one_mining_mode() {
+    let cli = Cli::try_parse_from(["ths", "start", "--block-time", "2"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Start {
+            block_time: Some(2),
+            mine_on_mempool: false,
+            no_auto_mine: false,
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "start", "--mine-on-mempool"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Start {
+            block_time: None,
+            mine_on_mempool: true,
+            no_auto_mine: false,
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "start", "--no-auto-mine"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Start {
+            block_time: None,
+            mine_on_mempool: false,
+            no_auto_mine: true,
+            ..
+        })
+    ));
+
+    // A zero interval cannot produce blocks, and the modes are exclusive.
+    assert!(Cli::try_parse_from(["ths", "start", "--block-time", "0"]).is_err());
+    assert!(
+        Cli::try_parse_from(["ths", "start", "--block-time", "2", "--mine-on-mempool"]).is_err()
+    );
+    assert!(Cli::try_parse_from(["ths", "start", "--block-time", "2", "--no-auto-mine"]).is_err());
+    assert!(Cli::try_parse_from(["ths", "start", "--mine-on-mempool", "--no-auto-mine"]).is_err());
 }
 
 #[test]
