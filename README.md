@@ -23,7 +23,7 @@ seconds, even if startup was already cancelled. Killing the `docker` process
 does not cancel work the daemon has already accepted.
 
 If cleanup cannot prove that this instance's resources, helpers, and metadata
-are gone, the command fails. It keeps `lifecycle-recovery.json` and any
+are gone, the command fails. It keeps any existing `lifecycle-recovery.json` and
 remaining `instance.json` so the instance can be identified. Do not delete
 those files by hand, retry a create whose result is unknown, or prune shared
 Docker state.
@@ -86,7 +86,7 @@ Keep this terminal open. Press Ctrl+C when you are finished. The launcher then
 uses a separate 120 second cleanup allowance to stop the environment and delete
 its chain, wallets, keys, volumes, and containers. That allowance is not
 restarted by the shutdown signal. An incomplete or uncertain cleanup is a
-failed command and leaves `lifecycle-recovery.json` beside any remaining
+failed command and keeps any existing `lifecycle-recovery.json` and remaining
 `instance.json`.
 
 ## What can I do?
@@ -374,7 +374,7 @@ Running `ths` with no command starts the default environment.
 | `ths logs --tail 200 -f` | Print the last 200 app log lines, then follow |
 | `ths logs zakura --head 200` | Print the first 200 node log lines |
 | `ths list` | List environments and their container status |
-| `ths stop` | Stop and delete the environment after verified cleanup. Incomplete or uncertain cleanup fails and keeps `lifecycle-recovery.json` |
+| `ths stop` | Stop and delete the environment after verified cleanup. Incomplete or uncertain cleanup fails and keeps any existing `lifecycle-recovery.json` |
 | `ths reset --force` | Force-delete one environment and all its data after verified cleanup. A failed cleanup keeps recovery metadata and does not prune other Docker resources |
 | `ths doctor [--json]` | Check Docker and local configuration; exit nonzero if Docker is unreachable |
 | `ths pull` | Pull the exact images for this launcher version |
@@ -630,8 +630,8 @@ does not mean the daemon cancelled the request.
 
 An incomplete cleanup still knows which of this instance's resources remain. An
 uncertain cleanup does not, and uncertainty takes precedence when both apply.
-The command exits nonzero either way. `lifecycle-recovery.json` is the record
-of the unfinished mutations.
+The command exits nonzero either way. When present, `lifecycle-recovery.json`
+is the record of the unfinished mutations.
 
 **Uninstall the launcher**
 
