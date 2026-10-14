@@ -153,6 +153,7 @@ struct RecordingHost {
     allocate_delay: Duration,
     run_status: Option<RuntimeStatus>,
     while_running: Option<Box<dyn Fn() -> Ended>>,
+    real_child: bool,
 }
 
 impl RecordingHost {
@@ -171,6 +172,7 @@ impl RecordingHost {
                 allocate_delay: Duration::ZERO,
                 run_status: None,
                 while_running: None,
+                real_child: false,
             },
             events,
         )
@@ -200,13 +202,23 @@ impl StartHost for RecordingHost {
 
     fn run_child(
         &self,
-        _command: &[OsString],
-        _current_dir: &Path,
+        command: &[OsString],
+        current_dir: &Path,
         name: &InstanceName,
-        _endpoints: &Endpoints,
-        _shutdown: &Shutdown,
+        endpoints: &Endpoints,
+        shutdown: &Shutdown,
     ) -> Result<ChildOutcome> {
         self.push(&format!("child:{name}"));
+        if self.real_child {
+            return run_child(
+                command,
+                current_dir,
+                name,
+                endpoints,
+                shutdown,
+                Duration::from_millis(100),
+            );
+        }
         Ok(ChildOutcome::Exited(42))
     }
 

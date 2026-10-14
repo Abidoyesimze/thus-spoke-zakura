@@ -429,7 +429,7 @@ type OwnerOutcome = (Result<(), String>, Vec<String>);
 
 fn spawn_owner(
     root: PathBuf,
-    allocate_delay: Duration,
+    configure: impl FnOnce(&mut RecordingHost) + Send + 'static,
 ) -> (
     thread::JoinHandle<OwnerOutcome>,
     mpsc::Sender<Ended>,
@@ -438,7 +438,7 @@ fn spawn_owner(
     let (handoff, received) = mpsc::channel();
     let owner = thread::spawn(move || {
         let (mut host, events) = RecordingHost::new();
-        host.allocate_delay = allocate_delay;
+        configure(&mut host);
         let (interrupt, shutdown) = Shutdown::channel();
         handoff.send((interrupt, events.clone())).unwrap();
         let result = Runtime { root }
@@ -450,7 +450,7 @@ fn spawn_owner(
     (owner, interrupt, events)
 }
 
-fn wait_for_event(events: &Mutex<Vec<String>>, event: &str) {
+pub(super) fn wait_for_event(events: &Mutex<Vec<String>>, event: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !events.lock().unwrap().iter().any(|e| e == event) {
         assert!(Instant::now() < deadline, "{event} never happened");
@@ -458,7 +458,7 @@ fn wait_for_event(events: &Mutex<Vec<String>>, event: &str) {
     }
 }
 
-fn stop_policy() -> LifecyclePolicy {
+pub(super) fn stop_policy() -> LifecyclePolicy {
     LifecyclePolicy {
         poll: Duration::from_millis(1),
         cleanup: Duration::from_secs(5),
@@ -466,7 +466,7 @@ fn stop_policy() -> LifecyclePolicy {
     }
 }
 
-fn session_files(runtime: &Runtime) -> Vec<String> {
+pub(super) fn session_files(runtime: &Runtime) -> Vec<String> {
     fs::read_dir(runtime.root.join(".locks"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
@@ -475,30 +475,45 @@ fn session_files(runtime: &Runtime) -> Vec<String> {
 }
 
 fn stop_after_owner(runtime: &Runtime, owner: &Mutex<Vec<String>>) -> Result<CleanupReport> {
-    let docker = RecordingDocker::new("", "", "");
+    stop_after_owner_with(
+        runtime,
+        owner,
+        "final_cleanup:alpha",
+        &RecordingDocker::new("", "", ""),
+    )
+}
+
+pub(super) fn stop_after_owner_with(
+    runtime: &Runtime,
+    owner: &Mutex<Vec<String>>,
+    owner_cleanup: &str,
+    docker: &RecordingDocker,
+) -> Result<CleanupReport> {
     runtime.verified_cleanup_with(&name("alpha"), &stop_policy(), || {
         assert!(
-            owner
-                .lock()
-                .unwrap()
-                .contains(&"final_cleanup:alpha".into()),
+            owner.lock().unwrap().iter().any(|e| e == owner_cleanup),
             "stop cleaned up before the owner did"
         );
-        runtime.cleanup_with(&name("alpha"), &docker, false, &stop_policy())
+        runtime.cleanup_with(&name("alpha"), docker, false, &stop_policy())
     })
 }
 
 #[test]
 fn stop_during_startup_aborts_the_owner_and_verifies_cleanup() {
     let runtime = runtime_for_tests();
-    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::from_millis(300));
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |host| {
+        host.allocate_delay = Duration::from_millis(300)
+    });
     wait_for_event(&events, "allocate:alpha");
 
     let report = stop_after_owner(&runtime, &events).unwrap();
 
     assert!(report.verified());
     let (result, events) = owner.join().unwrap();
-    assert_eq!(result.unwrap_err(), "interrupted");
+    assert_eq!(
+        result.unwrap_err(),
+        "alpha was stopped by another command during startup"
+    );
     assert!(!events.iter().any(|e| e == "wait_ready"), "{events:?}");
     assert!(session_files(&runtime).is_empty());
 }
@@ -506,7 +521,7 @@ fn stop_during_startup_aborts_the_owner_and_verifies_cleanup() {
 #[test]
 fn stop_while_ready_routes_through_the_owner() {
     let runtime = runtime_for_tests();
-    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |_| {});
     wait_for_event(&events, "wait_for_shutdown:app-1");
 
     let report = stop_after_owner(&runtime, &events).unwrap();
@@ -527,7 +542,7 @@ fn stop_while_ready_routes_through_the_owner() {
 #[test]
 fn concurrent_stops_both_wait_for_the_owner() {
     let runtime = runtime_for_tests();
-    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |_| {});
     wait_for_event(&events, "wait_for_shutdown:app-1");
 
     let stops = [(); 2].map(|()| {
@@ -555,7 +570,7 @@ fn stale_stop_request_does_not_stop_a_new_session() {
     fs::create_dir_all(&locks).unwrap();
     let stale = locks.join(format!("alpha.{}.stop", uuid::Uuid::new_v4()));
     fs::write(&stale, "").unwrap();
-    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), |_| {});
     wait_for_event(&events, "wait_for_shutdown:app-1");
 
     thread::sleep(Duration::from_millis(200));
@@ -613,7 +628,7 @@ fn stop_without_an_owner_cleans_leftovers() {
 #[test]
 fn reset_without_force_does_not_request_shutdown() {
     let runtime = runtime_for_tests();
-    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), Duration::ZERO);
+    let (owner, interrupt, events) = spawn_owner(runtime.root.clone(), |_| {});
     wait_for_event(&events, "wait_for_shutdown:app-1");
 
     let error = runtime.reset(&name("alpha"), false).unwrap_err();
@@ -623,4 +638,126 @@ fn reset_without_force_does_not_request_shutdown() {
     assert!(!owner.is_finished());
     interrupt.send(Ended::Interrupted).unwrap();
     owner.join().unwrap().0.unwrap();
+}
+
+#[test]
+fn stop_refuses_a_launcher_that_replaced_its_target() {
+    let runtime = runtime_for_tests();
+    let _owner = runtime.claim_start(&name("alpha")).unwrap();
+    let locks = runtime.root.join(".locks");
+    fs::write(locks.join("alpha.session"), "old-session").unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !locks.join("alpha.old-session.stop").exists() {
+        assert!(Instant::now() < deadline, "stop never requested shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    fs::write(locks.join("alpha.session"), "new-session").unwrap();
+
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("a newer one took over"), "{error}");
+    assert!(
+        error.contains("Run `ths --name alpha stop` again"),
+        "{error}"
+    );
+    assert!(!cleaned.load(Ordering::SeqCst));
+}
+
+#[test]
+fn start_reports_a_stop_in_progress() {
+    let runtime = runtime_for_tests();
+    let (inside, entered) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let stop = thread::spawn(move || {
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+                inside.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(verified_report())
+            })
+            .map(|report| report.verified())
+            .map_err(|error| format!("{error:#}"))
+    });
+    entered.recv().unwrap();
+    let (host, events) = RecordingHost::new();
+    let (_sender, shutdown) = Shutdown::channel();
+
+    let error = runtime
+        .start_with(&name("alpha"), true, false, 0, &host, &shutdown)
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("is being stopped or reset by another command"),
+        "{error:#}"
+    );
+    assert!(events.lock().unwrap().is_empty());
+    release.send(()).unwrap();
+    assert_eq!(stop.join().unwrap(), Ok(true));
+    assert!(session_files(&runtime).is_empty());
+}
+
+fn owned_leftovers() -> RecordingDocker {
+    let mut docker = RecordingDocker::new("ths-alpha-app", "", "");
+    docker.inspect(
+        "container",
+        "ths-alpha-app",
+        r#"[{"Id":"owned-app","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
+    );
+    docker
+}
+
+#[test]
+fn stop_cleans_what_the_owner_left_behind() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |host| {
+        host.final_cleanup_failure = Some("could not remove ths-alpha-app".into())
+    });
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+    let docker = owned_leftovers();
+
+    let report = stop_after_owner_with(&runtime, &events, "final_cleanup:alpha", &docker).unwrap();
+
+    assert!(report.verified());
+    assert_eq!(*docker.runs.lock().unwrap(), ["rm -f owned-app"]);
+    let error = owner.join().unwrap().0.unwrap_err();
+    assert!(error.contains("could not remove ths-alpha-app"), "{error}");
+}
+
+#[test]
+fn stop_reports_leftovers_it_cannot_remove() {
+    let runtime = runtime_for_tests();
+    let (owner, _interrupt, events) = spawn_owner(runtime.root.clone(), |host| {
+        host.final_cleanup_failure = Some("could not remove ths-alpha-app".into())
+    });
+    wait_for_event(&events, "wait_for_shutdown:app-1");
+    let docker = owned_leftovers();
+    docker.retain.lock().unwrap().push("owned-app".into());
+
+    let report = stop_after_owner_with(&runtime, &events, "final_cleanup:alpha", &docker).unwrap();
+
+    assert!(!report.verified());
+    let recovery = report.recovery_path.clone().unwrap();
+    assert!(recovery.exists(), "{}", recovery.display());
+    let error = format!("{:#}", report.into_result().unwrap_err());
+    assert!(error.contains("recovery remains at"), "{error}");
+    owner.join().unwrap().0.unwrap_err();
 }

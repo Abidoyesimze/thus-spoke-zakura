@@ -84,7 +84,9 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<u8> {
         host_ports(0)?;
+        let _owner = self.claim_start(name)?;
         let _lifecycle = self.lock_instance(name)?;
+        let session = self.publish_session(name, shutdown, context.policy.poll)?;
         let deadline = context.overall_deadline.context("missing run deadline")?;
         if deadline.expired() {
             bail!("environment did not start before the timeout");
@@ -145,6 +147,10 @@ impl Runtime {
             }
         }
         cleanup.state = CleanupGuard::Explicit;
+        let primary = primary.map_err(|error| session.explain(name, error));
+        if session.requested() && matches!(primary, Ok(ChildOutcome::Signaled)) {
+            eprintln!("{name} was stopped by another command.");
+        }
         let cleaned = host
             .delete_partial(self, name, context, Deadline::after(context.policy.cleanup))
             .and_then(CleanupReport::into_result);

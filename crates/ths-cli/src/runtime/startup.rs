@@ -647,7 +647,7 @@ impl Runtime {
         host_ports(port_offset)?;
         let _owner = self.claim_start(name)?;
         let mut lifecycle = Some(self.lock_instance(name)?);
-        let _session = self.publish_session(name, shutdown, context.policy.poll)?;
+        let session = self.publish_session(name, shutdown, context.policy.poll)?;
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
@@ -696,6 +696,7 @@ impl Runtime {
             host.wait_for_shutdown(&allocated.app_container, shutdown)
         })();
         cleanup.state = CleanupGuard::Explicit;
+        let primary = primary.map_err(|error| session.explain(name, error));
         if matches!(primary, Ok(Ended::DeletedElsewhere)) {
             print_progress(
                 json,

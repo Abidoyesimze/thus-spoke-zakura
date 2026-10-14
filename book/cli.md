@@ -109,7 +109,9 @@ bounded grace before forced termination. Cleanup failure after a successful
 child makes `run` fail; after a nonzero child exit its code is preserved and
 cleanup errors are reported separately. Recovery metadata remains when deletion
 cannot be verified. Settlement is an observation before the child starts,
-not a lock against later chain changes.
+not a lock against later chain changes. `ths --name <name> stop` or
+`reset --force` from another shell stops the child as Ctrl+C would, cleans
+up, and exits with status 1.
 
 ### `ths build [--dev]`
 
@@ -181,9 +183,9 @@ ths logs zakura --head 200     # first 200 node lines
 ### `ths stop`
 
 Stops the named environment and deletes its containers, volumes, and network.
-If a `ths start` for it is still running, even while starting, `stop` asks that
-launcher to shut down, waits for its cleanup, and succeeds only once the
-deletion is verified.
+If a `ths start` or `ths run` for it is still running, even while starting,
+`stop` asks that launcher to shut down as Ctrl+C would, waits for its cleanup,
+and succeeds only once the deletion is verified.
 
 ```console
 ths stop

@@ -370,3 +370,29 @@ fn docker_timestamps_parse_to_unix_seconds() {
     assert_eq!(parse_docker_time("0001-01-01T00:00:00Z"), None);
     assert_eq!(parse_docker_time("not a time"), None);
 }
+
+#[test]
+fn start_refusal_names_what_holds_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let _held = runtime.claim_start(&alpha).unwrap();
+    let refusal = || match runtime.claim_start(&alpha) {
+        Ok(_) => panic!("a held start lock was claimed twice"),
+        Err(error) => error.to_string(),
+    };
+    let session = dir.path().join(".locks/alpha.session");
+    let stopping = dir.path().join(".locks/alpha.stopping");
+
+    assert_eq!(
+        refusal(),
+        "environment alpha is already in use by another command"
+    );
+    fs::write(&session, "session").unwrap();
+    assert!(refusal().contains("already running in another `ths start` or `ths run`"));
+    fs::remove_file(&session).unwrap();
+    fs::write(&stopping, "").unwrap();
+    assert!(refusal().contains("being stopped or reset by another command"));
+}

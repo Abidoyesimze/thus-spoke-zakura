@@ -60,16 +60,18 @@ ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
 allocation identities. A per-name lock serializes startup, stop, and reset.
-`run` holds that lock until cleanup; ordinary foreground start releases it
-once ready so another command can stop the environment. Once ready,
-the foreground launcher watches the allocated app container and exits when
-another command deletes it, without deleting the environment again. A second
-per-name lock is held by the foreground start until it exits, so another
-`start` with the same name is refused instead of replacing the running
-environment. While that launcher runs, `stop` and `reset --force` ask it to
-shut down, as Ctrl+C would, during startup or once ready, wait for its cleanup,
-and then verify that nothing is left. Requests name the launcher's session, so
-a leftover request cannot stop a later `start`.
+`run` holds that lock until cleanup; foreground start releases it once ready.
+A second per-name lock is held by `start` or `run` until it exits, so another
+`start` or `run` with the same name is refused instead of replacing the
+running environment. While that launcher runs, `stop` and `reset --force` ask
+it to shut down, as Ctrl+C would, during startup, once ready, or while `run`'s
+command runs. They wait for its cleanup and then verify that nothing is left.
+Requests name the launcher's session, so a leftover request cannot stop a
+later launcher. A launcher stopped before it was ready exits with an error.
+Without a running launcher, `stop` and `reset --force` delete what is left
+themselves. The foreground launcher also watches the allocated app container
+and exits when it is deleted some other way, without deleting the environment
+again.
 
 ![Wallet dashboard with five development accounts](book/images/wallet.png)
 

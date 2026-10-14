@@ -205,9 +205,23 @@ impl Drop for InstanceLock {
 }
 
 pub(super) struct StartSession {
-    files: [PathBuf; 2],
+    requested: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     watcher: Option<thread::JoinHandle<()>>,
+    _files: [RemovedOnDrop; 2],
+}
+impl StartSession {
+    pub(super) fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn explain(&self, name: &InstanceName, error: anyhow::Error) -> anyhow::Error {
+        if self.requested() {
+            anyhow!("{name} was stopped by another command during startup")
+        } else {
+            error
+        }
+    }
 }
 impl Drop for StartSession {
     fn drop(&mut self) {
@@ -217,10 +231,14 @@ impl Drop for StartSession {
         {
             eprintln!("stop request monitoring stopped unexpectedly");
         }
-        for file in &self.files {
-            if let Err(error) = remove_if_present(file) {
-                eprintln!("could not remove {}: {error}", file.display());
-            }
+    }
+}
+
+struct RemovedOnDrop(PathBuf);
+impl Drop for RemovedOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = remove_if_present(&self.0) {
+            eprintln!("could not remove {}: {error}", self.0.display());
         }
     }
 }
@@ -239,11 +257,16 @@ impl Runtime {
     }
 
     pub(super) fn claim_start(&self, name: &InstanceName) -> Result<InstanceLock> {
-        self.try_lock(&format!("{name}.start.lock"))?.with_context(|| {
-            format!(
-                "environment {name} is already running in another `ths start`; stop it first with `ths --name {name} stop`"
-            )
-        })
+        match self.try_lock(&format!("{name}.start.lock"))? {
+            Some(lock) => Ok(lock),
+            None if self.stopping_path(name).exists() => bail!(
+                "environment {name} is being stopped or reset by another command; start it again once that finishes"
+            ),
+            None if self.session_path(name).exists() => bail!(
+                "environment {name} is already running in another `ths start` or `ths run`; stop it first with `ths --name {name} stop`"
+            ),
+            None => bail!("environment {name} is already in use by another command"),
+        }
     }
 
     pub(super) fn publish_session(
@@ -264,6 +287,7 @@ impl Runtime {
                 remove_if_present(&path)?;
             }
         }
+        remove_if_present(&self.stopping_path(name))?;
         let id = uuid::Uuid::new_v4().to_string();
         let session = self.session_path(name);
         let pending = lock_dir.join(format!("{name}.session.pending"));
@@ -271,12 +295,15 @@ impl Runtime {
         fs::rename(&pending, &session)?;
         let request = self.stop_request_path(name, &id);
         let (stop, stopped) = mpsc::channel();
+        let requested = Arc::new(AtomicBool::new(false));
+        let seen = requested.clone();
         let flag = shutdown.flag.clone();
         let notify = shutdown.sender.clone();
         let watched = request.clone();
         let watcher = thread::spawn(move || {
             while matches!(stopped.recv_timeout(poll), Err(RecvTimeoutError::Timeout)) {
                 if watched.exists() {
+                    seen.store(true, Ordering::SeqCst);
                     flag.store(true, Ordering::SeqCst);
                     let _ = notify.send(Ended::Interrupted);
                     return;
@@ -284,9 +311,10 @@ impl Runtime {
             }
         });
         Ok(StartSession {
-            files: [request, session],
+            requested,
             stop: Some(stop),
             watcher: Some(watcher),
+            _files: [RemovedOnDrop(request), RemovedOnDrop(session)],
         })
     }
 
@@ -304,6 +332,9 @@ impl Runtime {
                     remove_if_present(request)?;
                 }
                 remove_if_present(&self.session_path(name))?;
+                let stopping = self.stopping_path(name);
+                fs::write(&stopping, "")?;
+                let _stopping = RemovedOnDrop(stopping);
                 let _lock = self.lock_instance(name)?;
                 return cleanup();
             }
@@ -311,16 +342,16 @@ impl Runtime {
                 (None, Some(id)) => {
                     let request = self.stop_request_path(name, &id);
                     fs::write(&request, "")?;
-                    println!("Asking the running `ths start` for {name} to stop…");
+                    println!("Asking the launcher that owns {name} to stop…");
                     requested = Some((id, request));
                 }
-                (Some((target, _)), Some(id)) if *target != id => {
-                    bail!("{name} is now owned by a newer `ths start`; it was not stopped")
-                }
+                (Some((target, _)), Some(id)) if *target != id => bail!(
+                    "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+                ),
                 _ => {}
             }
             if deadline.expired() {
-                bail!("the `ths start` launcher for {name} did not stop and clean up in time");
+                bail!("the launcher that owns {name} did not stop and clean up in time");
             }
             thread::sleep(policy.poll.min(deadline.remaining()));
         }
@@ -328,6 +359,10 @@ impl Runtime {
 
     fn session_path(&self, name: &InstanceName) -> PathBuf {
         self.root.join(".locks").join(format!("{name}.session"))
+    }
+
+    fn stopping_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.stopping"))
     }
 
     fn stop_request_path(&self, name: &InstanceName, session: &str) -> PathBuf {
@@ -341,7 +376,7 @@ impl Runtime {
             Ok(id) if !id.trim().is_empty() => Ok(Some(id.trim().to_owned())),
             Ok(_) => Ok(None),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).context("reading the `ths start` session"),
+            Err(error) => Err(error).context("reading the launcher session"),
         }
     }
 
