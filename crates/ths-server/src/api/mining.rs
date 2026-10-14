@@ -1,6 +1,6 @@
 use super::error::require_started;
 use super::{
-    error::{ApiError, ApiResult},
+    error::{ApiError, ApiJson, ApiResult},
     payments::require_key,
 };
 use crate::mining::{MiningJob, MiningState};
@@ -21,7 +21,7 @@ pub(crate) struct StartMiningRequest {
 
 pub(crate) async fn start_mining_job(
     State(state): State<AppState>,
-    Json(req): Json<StartMiningRequest>,
+    ApiJson(req): ApiJson<StartMiningRequest>,
 ) -> ApiResult<(StatusCode, Json<MiningJob>)> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
@@ -55,7 +55,7 @@ pub(crate) struct MineRequest {
 }
 pub(crate) async fn mine(
     State(state): State<AppState>,
-    Json(req): Json<MineRequest>,
+    ApiJson(req): ApiJson<MineRequest>,
 ) -> ApiResult<Json<Value>> {
     require_started(&state)?;
     if !(1..=10_000).contains(&req.blocks) {

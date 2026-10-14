@@ -1,9 +1,9 @@
-use super::error::{ApiError, ApiResult, not_found};
+use super::error::{ApiError, ApiQuery, ApiResult, not_found};
 use crate::network::regtest_network;
 use crate::state::AppState;
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Path, State},
     http::StatusCode,
 };
 use serde::Deserialize;
@@ -52,7 +52,7 @@ pub(crate) struct BlocksQuery {
 }
 pub(crate) async fn blocks(
     State(state): State<AppState>,
-    Query(query): Query<BlocksQuery>,
+    ApiQuery(query): ApiQuery<BlocksQuery>,
 ) -> ApiResult<Json<Value>> {
     let info = state.0.rpc.chain_info().await?;
     let end = query.before.unwrap_or(info.blocks).min(info.blocks);
@@ -166,7 +166,7 @@ pub(crate) struct SearchQuery {
 }
 pub(crate) async fn search(
     State(state): State<AppState>,
-    Query(query): Query<SearchQuery>,
+    ApiQuery(query): ApiQuery<SearchQuery>,
 ) -> ApiResult<Json<Value>> {
     if query.q.starts_with('t') {
         return address(State(state), Path(query.q)).await;
