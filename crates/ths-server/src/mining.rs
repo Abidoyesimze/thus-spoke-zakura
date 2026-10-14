@@ -2,6 +2,7 @@ use crate::state::{AppState, notify};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serde::Serialize;
@@ -14,6 +15,97 @@ pub enum MiningState {
     Syncing,
     Completed,
     Failed,
+}
+
+/// How an instance produces automatic blocks. One mode is active for the whole
+/// server lifetime; it is chosen at startup and never changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MiningMode {
+    /// Every payment, faucet, and treasury operation mines its own confirming block.
+    Auto,
+    /// A background task mines an empty block every `block_time` seconds.
+    Interval,
+    /// A background task mines when the mempool has a new, nonempty transaction set.
+    Mempool,
+    /// No automatic blocks; unresolved work waits for an explicit `ths mine`.
+    Manual,
+}
+
+impl MiningMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Interval => "interval",
+            Self::Mempool => "mempool",
+            Self::Manual => "manual",
+        }
+    }
+
+    /// Whether the mode mines a block as part of a payment operation. Interval
+    /// and mempool modes still produce blocks, but from a background task.
+    pub fn auto_mine(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+/// The instance's mining configuration, decoded from the launcher's environment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MiningConfig {
+    pub mode: MiningMode,
+    pub block_time: Option<u64>,
+}
+
+impl Default for MiningConfig {
+    fn default() -> Self {
+        Self {
+            mode: MiningMode::Auto,
+            block_time: None,
+        }
+    }
+}
+
+impl MiningConfig {
+    /// Decodes `THS_MINING_MODE` and `THS_BLOCK_TIME`. An absent mode is
+    /// `auto`, preserving the pre-existing behavior for older launchers.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_values(
+            std::env::var("THS_MINING_MODE").ok().as_deref(),
+            std::env::var("THS_BLOCK_TIME").ok().as_deref(),
+        )
+    }
+
+    fn from_values(mode: Option<&str>, block_time: Option<&str>) -> anyhow::Result<Self> {
+        let mode = match mode {
+            None | Some("") | Some("auto") => MiningMode::Auto,
+            Some("interval") => MiningMode::Interval,
+            Some("mempool") => MiningMode::Mempool,
+            Some("manual") => MiningMode::Manual,
+            Some(other) => anyhow::bail!("unsupported THS_MINING_MODE {other:?}"),
+        };
+        let block_time = match block_time {
+            Some(value) => Some(
+                value
+                    .parse::<u64>()
+                    .with_context(|| format!("invalid THS_BLOCK_TIME {value:?}"))?,
+            ),
+            None => None,
+        };
+        Self { mode, block_time }.validate()
+    }
+
+    fn validate(self) -> anyhow::Result<Self> {
+        match (self.mode, self.block_time) {
+            (MiningMode::Interval, Some(seconds)) if seconds > 0 => Ok(self),
+            (MiningMode::Interval, _) => {
+                anyhow::bail!("interval mining requires a positive THS_BLOCK_TIME")
+            }
+            (_, Some(_)) => {
+                anyhow::bail!("THS_BLOCK_TIME is only valid with interval mining")
+            }
+            _ => Ok(self),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -224,6 +316,12 @@ impl MiningCoordinator {
         self.state.lock().await.jobs.get(id).cloned()
     }
 
+    /// A manual job is admitted but not yet terminal. Background mining skips
+    /// while one is active so its blocks never interleave with a manual count.
+    pub async fn is_active(&self) -> bool {
+        self.state.lock().await.active_id.is_some()
+    }
+
     async fn publish(&self, update: MiningUpdate) {
         let sender = {
             let mut state = self.state.lock().await;
@@ -349,5 +447,106 @@ impl AppState {
         #[cfg(test)]
         let runtime = self.0.mining_runtime.clone().unwrap_or(runtime);
         self.0.mining.start(runtime, blocks, key).await
+    }
+
+    /// Mines one block outside the manual coordinator and synchronizes the
+    /// wallet. Used by the interval and mempool background loops, so it never
+    /// counts toward a manual mining job.
+    pub(crate) async fn mine_and_sync_background(&self) -> anyhow::Result<()> {
+        let mut hashes = self.0.rpc.generate(1).await?;
+        anyhow::ensure!(
+            hashes.len() == 1 && !hashes[0].is_empty(),
+            "Zakura must return exactly one nonempty mined block hash"
+        );
+        let tip_hash = hashes.remove(0);
+        let height = self
+            .0
+            .rpc
+            .block(&tip_hash)
+            .await?
+            .get("height")
+            .and_then(Value::as_u64)
+            .context("Zakura mined block omitted its height")?;
+        self.synchronize_wallet(Some(height)).await?;
+        notify(self, "chain");
+        Ok(())
+    }
+}
+
+/// Mines an empty block every `block_time` once startup has finished. Interval
+/// mining is intentional block production, not a reaction to pending work.
+pub(crate) async fn interval_mining_loop(state: AppState, block_time: Duration) {
+    let mut interval = tokio::time::interval(block_time);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if !state.started() || state.0.mining.is_active().await {
+            continue;
+        }
+        if let Err(error) = state.mine_and_sync_background().await {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background interval mining failed"
+            );
+        }
+    }
+}
+
+/// The sorted transaction set to mine, or `None` when there is nothing new.
+/// An empty mempool is nothing to do; a nonempty set identical to `attempted`
+/// is skipped so a transaction the node cannot include does not produce
+/// repeated empty blocks. This does not record the set: the caller records it
+/// only once it commits to mining, so an in-flight manual job cannot swallow it.
+fn new_mempool_set(attempted: Option<&[String]>, mempool: &mut [String]) -> Option<Vec<String>> {
+    if mempool.is_empty() {
+        return None;
+    }
+    mempool.sort_unstable();
+    if attempted == Some(mempool) {
+        return None;
+    }
+    Some(mempool.to_vec())
+}
+
+/// Mines a block when the mempool holds a transaction set it has not yet tried
+/// to include. An unchanged, still-nonempty mempool is left alone.
+pub(crate) async fn mempool_mining_loop(state: AppState) {
+    let mut interval = tokio::time::interval(Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut attempted: Option<Vec<String>> = None;
+    loop {
+        interval.tick().await;
+        if !state.started() {
+            continue;
+        }
+        let mut mempool = match state.0.rpc.mempool().await {
+            Ok(mempool) => mempool,
+            Err(error) => {
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background mempool mining could not read the mempool"
+                );
+                continue;
+            }
+        };
+        if mempool.is_empty() {
+            attempted = None;
+            continue;
+        }
+        let Some(set) = new_mempool_set(attempted.as_deref(), &mut mempool) else {
+            continue;
+        };
+        if state.0.mining.is_active().await {
+            continue;
+        }
+        // Record the set before mining: if the node includes it, the next read
+        // is empty; if not, the identical set is skipped until it changes.
+        attempted = Some(set);
+        if let Err(error) = state.mine_and_sync_background().await {
+            tracing::warn!(
+                error = %format_args!("{error:#}"),
+                "background mempool mining failed"
+            );
+        }
     }
 }

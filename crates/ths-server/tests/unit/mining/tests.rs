@@ -487,3 +487,94 @@ async fn mining_adapter_accepts_one_nonempty_rpc_hash_and_forwards_events() {
     server.abort();
     assert!(server.await.unwrap_err().is_cancelled());
 }
+
+#[test]
+fn mining_config_defaults_to_auto() {
+    assert_eq!(
+        MiningConfig::from_values(None, None).unwrap(),
+        MiningConfig::default()
+    );
+    assert_eq!(
+        MiningConfig::from_values(Some(""), None).unwrap().mode,
+        MiningMode::Auto
+    );
+    assert!(
+        MiningConfig::from_values(None, None)
+            .unwrap()
+            .mode
+            .auto_mine()
+    );
+}
+
+#[test]
+fn mining_config_decodes_every_mode() {
+    let interval = MiningConfig::from_values(Some("interval"), Some("3")).unwrap();
+    assert_eq!(interval.mode, MiningMode::Interval);
+    assert_eq!(interval.block_time, Some(3));
+    assert!(!interval.mode.auto_mine());
+
+    let mempool = MiningConfig::from_values(Some("mempool"), None).unwrap();
+    assert_eq!(mempool.mode, MiningMode::Mempool);
+    assert_eq!(mempool.block_time, None);
+    assert!(!mempool.mode.auto_mine());
+
+    let manual = MiningConfig::from_values(Some("manual"), None).unwrap();
+    assert_eq!(manual.mode, MiningMode::Manual);
+    assert!(!manual.mode.auto_mine());
+}
+
+#[test]
+fn mining_config_rejects_inconsistent_values() {
+    // Interval mode requires a positive interval.
+    assert!(MiningConfig::from_values(Some("interval"), None).is_err());
+    assert!(MiningConfig::from_values(Some("interval"), Some("0")).is_err());
+    assert!(MiningConfig::from_values(Some("interval"), Some("soon")).is_err());
+    // A block time belongs only to interval mode.
+    assert!(MiningConfig::from_values(Some("auto"), Some("2")).is_err());
+    assert!(MiningConfig::from_values(Some("manual"), Some("2")).is_err());
+    // Unknown modes fail loudly rather than silently falling back to auto.
+    assert!(MiningConfig::from_values(Some("turbo"), None).is_err());
+}
+
+#[tokio::test]
+async fn mining_coordinator_reports_an_active_job() {
+    let runtime = Arc::new(FakeRuntime::blocked());
+    let jobs = Arc::new(MiningCoordinator::new());
+    assert!(!jobs.is_active().await);
+    let admission = jobs
+        .start(runtime.clone(), 1, "active-probe".into())
+        .await
+        .unwrap();
+    let observer = admission.updates.clone();
+    assert!(jobs.is_active().await);
+    runtime.release(1);
+    let update = terminal(observer).await;
+    assert_eq!(update.job.state, MiningState::Completed);
+    assert!(!jobs.is_active().await);
+}
+
+#[test]
+fn mempool_mining_skips_an_unchanged_nonempty_set() {
+    let mut first = vec!["b".to_owned(), "a".to_owned()];
+    let set = new_mempool_set(None, &mut first).expect("a first nonempty set is new");
+    assert_eq!(set, vec!["a".to_owned(), "b".to_owned()]);
+
+    // The same transactions, freshly read, must not mine another empty block.
+    let mut again = vec!["a".to_owned(), "b".to_owned()];
+    assert!(new_mempool_set(Some(set.as_slice()), &mut again).is_none());
+
+    // A changed set is new again.
+    let mut changed = vec!["a".to_owned(), "c".to_owned()];
+    assert_eq!(
+        new_mempool_set(Some(set.as_slice()), &mut changed),
+        Some(vec!["a".to_owned(), "c".to_owned()])
+    );
+}
+
+#[test]
+fn mempool_mining_ignores_an_empty_set() {
+    let mut empty: Vec<String> = Vec::new();
+    assert!(new_mempool_set(None, &mut empty).is_none());
+    let previous = vec!["a".to_owned()];
+    assert!(new_mempool_set(Some(previous.as_slice()), &mut empty).is_none());
+}
