@@ -255,6 +255,11 @@ fn interrupted_child_terminates_its_background_process_group() {
 fn stop_routes_through_a_running_run() {
     let runtime = runtime_for_tests();
     let root = runtime.root.clone();
+    let received_signal = root.join("child-signal");
+    let script = format!(
+        "trap 'echo INT > {0}; exit 0' INT; trap 'echo TERM > {0}; exit 0' TERM; while :; do sleep 0.05; done",
+        received_signal.display()
+    );
     let (handoff, received) = mpsc::channel();
     let owner = thread::spawn(move || {
         let (mut host, events) = RecordingHost::new();
@@ -275,7 +280,11 @@ fn stop_routes_through_a_running_run() {
         let code = runtime
             .run_with_policy(
                 &name("alpha"),
-                &[OsString::from("sleep"), OsString::from("30")],
+                &[
+                    OsString::from("sh"),
+                    OsString::from("-c"),
+                    OsString::from(script),
+                ],
                 &runtime.root,
                 &host,
                 &shutdown,
@@ -302,4 +311,9 @@ fn stop_routes_through_a_running_run() {
     assert_eq!(code, Ok(1));
     assert_eq!(events.last().map(String::as_str), Some("delete:alpha"));
     assert!(startup::session_files(&runtime).is_empty());
+    assert_eq!(
+        fs::read_to_string(&received_signal).unwrap().trim(),
+        "INT",
+        "stop must reach the child the way Ctrl+C does"
+    );
 }

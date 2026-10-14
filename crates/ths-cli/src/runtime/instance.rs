@@ -208,7 +208,8 @@ pub(super) struct StartSession {
     requested: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     watcher: Option<thread::JoinHandle<()>>,
-    _files: [RemovedOnDrop; 2],
+    _request: RemovedOnDrop,
+    _session: SessionFile,
 }
 impl StartSession {
     pub(super) fn requested(&self) -> bool {
@@ -230,6 +231,25 @@ impl Drop for StartSession {
             && watcher.join().is_err()
         {
             eprintln!("stop request monitoring stopped unexpectedly");
+        }
+    }
+}
+
+struct SessionFile {
+    path: PathBuf,
+    id: String,
+}
+impl Drop for SessionFile {
+    fn drop(&mut self) {
+        match fs::read_to_string(&self.path) {
+            Ok(id) if id.trim() == self.id => {
+                if let Err(error) = remove_if_present(&self.path) {
+                    eprintln!("could not remove {}: {error}", self.path.display());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("could not read {}: {error}", self.path.display()),
         }
     }
 }
@@ -259,7 +279,7 @@ impl Runtime {
     pub(super) fn claim_start(&self, name: &InstanceName) -> Result<InstanceLock> {
         match self.try_lock(&format!("{name}.start.lock"))? {
             Some(lock) => Ok(lock),
-            None if self.stopping_path(name).exists() => bail!(
+            None if self.stopping_path(name).exists() || self.stop_requested(name)? => bail!(
                 "environment {name} is being stopped or reset by another command; start it again once that finishes"
             ),
             None if self.session_path(name).exists() => bail!(
@@ -298,12 +318,19 @@ impl Runtime {
         let requested = Arc::new(AtomicBool::new(false));
         let seen = requested.clone();
         let flag = shutdown.flag.clone();
+        let signal = shutdown.signal.clone();
         let notify = shutdown.sender.clone();
         let watched = request.clone();
         let watcher = thread::spawn(move || {
             while matches!(stopped.recv_timeout(poll), Err(RecvTimeoutError::Timeout)) {
                 if watched.exists() {
                     seen.store(true, Ordering::SeqCst);
+                    let _ = signal.compare_exchange(
+                        0,
+                        signal_hook::consts::SIGINT,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
                     flag.store(true, Ordering::SeqCst);
                     let _ = notify.send(Ended::Interrupted);
                     return;
@@ -314,7 +341,8 @@ impl Runtime {
             requested,
             stop: Some(stop),
             watcher: Some(watcher),
-            _files: [RemovedOnDrop(request), RemovedOnDrop(session)],
+            _request: RemovedOnDrop(request),
+            _session: SessionFile { path: session, id },
         })
     }
 
@@ -369,6 +397,12 @@ impl Runtime {
         self.root
             .join(".locks")
             .join(format!("{name}.{session}.stop"))
+    }
+
+    fn stop_requested(&self, name: &InstanceName) -> Result<bool> {
+        Ok(self
+            .read_session(name)?
+            .is_some_and(|id| self.stop_request_path(name, &id).exists()))
     }
 
     fn read_session(&self, name: &InstanceName) -> Result<Option<String>> {

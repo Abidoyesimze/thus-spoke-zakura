@@ -120,3 +120,38 @@ fn a_start_in_docker_preflight_already_owns_the_environment() {
     );
     assert!(started.elapsed() < PREFLIGHT);
 }
+
+#[test]
+fn a_run_in_docker_preflight_already_owns_the_environment() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let mut run = fixture.spawn(&["--name", "pre", "run", "--", "true"]);
+    wait_for_lock(fixture.home.path());
+
+    let start = fixture.run(&["--name", "pre", "start", "--no-open"]);
+    assert_eq!(start.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&start.stderr)
+            .contains("already running in another `ths start` or `ths run`"),
+        "{}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    assert!(run.try_wait().unwrap().is_none());
+
+    let stop = fixture.run(&["--name", "pre", "stop"]);
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(String::from_utf8_lossy(&stop.stdout).contains("Asking the launcher"));
+    let run = run.wait_with_output().unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&run.stderr)
+            .contains("pre was stopped by another command during startup"),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(started.elapsed() < PREFLIGHT);
+}

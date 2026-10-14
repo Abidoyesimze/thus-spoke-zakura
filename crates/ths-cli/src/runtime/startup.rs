@@ -29,7 +29,7 @@ impl Runtime {
             })()
         };
         if let Err(error) = prepared {
-            let error = ownership.session.explain(name, error);
+            let error = ownership.session().explain(name, error);
             let failures = context.finish_helpers(Deadline::after(context.policy.startup_docker));
             if !failures.is_empty() {
                 return Err(anyhow!(
@@ -59,10 +59,28 @@ impl Runtime {
     }
 }
 
-struct StartOwnership {
-    session: StartSession,
+pub(super) struct StartOwnership {
+    session: Option<StartSession>,
     lifecycle: Option<InstanceLock>,
-    _owner: InstanceLock,
+    owner: Option<InstanceLock>,
+}
+impl StartOwnership {
+    pub(super) fn session(&self) -> &StartSession {
+        self.session
+            .as_ref()
+            .expect("the session is held until ownership is dropped")
+    }
+
+    pub(super) fn release_lifecycle(&mut self) {
+        drop(self.lifecycle.take());
+    }
+}
+impl Drop for StartOwnership {
+    fn drop(&mut self) {
+        drop(self.session.take());
+        drop(self.lifecycle.take());
+        drop(self.owner.take());
+    }
 }
 
 pub(super) struct Shutdown {
@@ -668,7 +686,7 @@ impl Runtime {
         )
     }
 
-    fn own_start(
+    pub(super) fn own_start(
         &self,
         name: &InstanceName,
         shutdown: &Shutdown,
@@ -678,9 +696,9 @@ impl Runtime {
         let lifecycle = Some(self.lock_instance(name)?);
         let session = self.publish_session(name, shutdown, context.policy.poll)?;
         Ok(StartOwnership {
-            session,
+            session: Some(session),
             lifecycle,
-            _owner: owner,
+            owner: Some(owner),
         })
     }
 
@@ -694,13 +712,8 @@ impl Runtime {
         host: &dyn StartHost,
         shutdown: &Shutdown,
         context: &LifecycleContext,
-        ownership: StartOwnership,
+        mut ownership: StartOwnership,
     ) -> Result<()> {
-        let StartOwnership {
-            session,
-            mut lifecycle,
-            _owner,
-        } = ownership;
         let mut cleanup = CleanupOnDrop {
             runtime: self,
             name,
@@ -745,11 +758,11 @@ impl Runtime {
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
             }
-            drop(lifecycle.take());
+            ownership.release_lifecycle();
             host.wait_for_shutdown(&allocated.app_container, shutdown)
         })();
         cleanup.state = CleanupGuard::Explicit;
-        let primary = primary.map_err(|error| session.explain(name, error));
+        let primary = primary.map_err(|error| ownership.session().explain(name, error));
         if matches!(primary, Ok(Ended::DeletedElsewhere)) {
             print_progress(
                 json,

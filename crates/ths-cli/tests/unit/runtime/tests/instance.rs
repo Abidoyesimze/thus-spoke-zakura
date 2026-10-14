@@ -392,7 +392,38 @@ fn start_refusal_names_what_holds_the_environment() {
     );
     fs::write(&session, "session").unwrap();
     assert!(refusal().contains("already running in another `ths start` or `ths run`"));
+    let request = dir.path().join(".locks/alpha.session.stop");
+    fs::write(&request, "").unwrap();
+    assert!(refusal().contains("being stopped or reset by another command"));
+    fs::remove_file(&request).unwrap();
     fs::remove_file(&session).unwrap();
     fs::write(&stopping, "").unwrap();
     assert!(refusal().contains("being stopped or reset by another command"));
+}
+
+#[test]
+fn an_exiting_session_keeps_a_newer_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let (_sender, shutdown) = Shutdown::channel();
+    let session_file = dir.path().join(".locks/alpha.session");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+
+    let old = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    fs::write(&session_file, "newer-session").unwrap();
+    drop(old);
+    assert_eq!(fs::read_to_string(&session_file).unwrap(), "newer-session");
+
+    fs::remove_file(&session_file).unwrap();
+    let only = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    assert!(session_file.exists());
+    drop(only);
+    assert!(!session_file.exists());
 }
