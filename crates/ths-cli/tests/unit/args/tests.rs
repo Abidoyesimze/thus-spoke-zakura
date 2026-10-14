@@ -301,3 +301,38 @@ fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
     assert!(parse(&["--amount", "1"]).is_err());
     assert!(parse(&["--to", "2"]).is_err());
 }
+
+#[test]
+fn completions_accept_only_bash_zsh_and_fish() {
+    for (shell, expected) in [
+        ("bash", CompletionShell::Bash),
+        ("zsh", CompletionShell::Zsh),
+        ("fish", CompletionShell::Fish),
+    ] {
+        let cli = Cli::try_parse_from(["ths", "completions", shell]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Completions { shell }) if shell == expected
+        ));
+    }
+
+    let cli =
+        Cli::try_parse_from(["ths", "--name", "alice", "--json", "completions", "zsh"]).unwrap();
+    assert!(cli.json);
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Completions {
+            shell: CompletionShell::Zsh
+        })
+    ));
+
+    assert!(Cli::try_parse_from(["ths", "completions"]).is_err());
+    assert!(Cli::try_parse_from(["ths", "completions", "zsh", "bash"]).is_err());
+    for shell in ["", " ", "powershell", "elvish", "ZSH", "Bash", "nu"] {
+        assert!(
+            Cli::try_parse_from(["ths", "completions", shell]).is_err(),
+            "accepted shell {shell:?}"
+        );
+    }
+}
