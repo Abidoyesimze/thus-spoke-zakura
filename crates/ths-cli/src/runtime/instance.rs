@@ -29,7 +29,7 @@ pub(super) fn default_regtest() -> String {
     "regtest".to_owned()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoints {
     pub dashboard: String,
     pub rpc: String,
@@ -41,7 +41,7 @@ pub struct Endpoints {
     pub tls: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Instance {
     pub(super) name: String,
     pub(super) version: u32,
@@ -49,6 +49,8 @@ pub(crate) struct Instance {
     /// unix seconds; missing for environments created before it was recorded.
     #[serde(default)]
     pub(super) created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) session: Option<String>,
 }
 
 impl Runtime {
@@ -103,6 +105,7 @@ impl Runtime {
             version: 1,
             endpoints: endpoints.clone(),
             created_at: Some(now_unix()?),
+            session: self.read_session(name)?,
         };
         fs::write(
             self.instance_dir(name).join("instance.json"),
@@ -356,8 +359,13 @@ impl Runtime {
         let mut requested: Option<(String, PathBuf)> = None;
         loop {
             if let Some(_owner) = self.try_lock(&format!("{name}.start.lock"))? {
-                if let Some((_, request)) = &requested {
+                if let Some((target, request)) = &requested {
                     remove_if_present(request)?;
+                    if self.replaced_since(name, target)? {
+                        bail!(
+                            "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+                        );
+                    }
                 }
                 remove_if_present(&self.session_path(name))?;
                 let stopping = self.stopping_path(name);
@@ -383,6 +391,19 @@ impl Runtime {
             }
             thread::sleep(policy.poll.min(deadline.remaining()));
         }
+    }
+
+    fn replaced_since(&self, name: &InstanceName, target: &str) -> Result<bool> {
+        let current = self.read_session(name)?;
+        let persisted = if self.instance_dir(name).join("instance.json").exists() {
+            self.read_instance(name)?.session
+        } else {
+            None
+        };
+        Ok([current, persisted]
+            .into_iter()
+            .flatten()
+            .any(|id| id != target))
     }
 
     fn session_path(&self, name: &InstanceName) -> PathBuf {
@@ -486,6 +507,10 @@ pub(super) fn environment_status(
     instance: Instance,
     containers: Result<Vec<ContainerStatus>>,
 ) -> EnvironmentStatus {
+    let instance = Instance {
+        session: None,
+        ..instance
+    };
     let (state, containers) = match containers {
         Ok(containers) => (environment_state(&containers), containers),
         Err(_) => ("unknown", Vec::new()),

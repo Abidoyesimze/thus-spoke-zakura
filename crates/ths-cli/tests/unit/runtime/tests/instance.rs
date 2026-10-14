@@ -131,6 +131,7 @@ fn environment(name: &str, states: [&str; 4]) -> EnvironmentStatus {
                 p2p: 18233,
             }),
             created_at: Some(1_000),
+            session: None,
         },
         state: environment_state(&containers),
         containers,
@@ -426,4 +427,29 @@ fn an_exiting_session_keeps_a_newer_session_file() {
     assert!(session_file.exists());
     drop(only);
     assert!(!session_file.exists());
+}
+
+#[test]
+fn listed_environments_do_not_expose_the_launcher_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+    fs::write(dir.path().join(".locks/alpha.session"), "secret-session").unwrap();
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    assert_eq!(
+        runtime.read_instance(&alpha).unwrap().session.as_deref(),
+        Some("secret-session")
+    );
+
+    let environments = runtime
+        .environments(&docker_holding(&[("app", Some("alpha"), "running")]))
+        .unwrap();
+    let listed = serde_json::to_string(&environments).unwrap();
+    assert!(!listed.contains("session"), "{listed}");
 }

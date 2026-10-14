@@ -678,6 +678,108 @@ fn stop_refuses_a_launcher_that_replaced_its_target() {
 }
 
 #[test]
+fn a_delayed_stop_keeps_a_replacement_that_exited() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let locks = runtime.root.join(".locks");
+    let first = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "first-session").unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !locks.join("alpha.first-session.stop").exists() {
+        assert!(Instant::now() < deadline, "stop never requested shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    fs::remove_file(locks.join("alpha.session")).unwrap();
+    drop(first);
+    let replacement = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "second-session").unwrap();
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    drop(replacement);
+
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("a newer one took over"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+    assert_eq!(
+        fs::read_to_string(locks.join("alpha.session")).unwrap(),
+        "second-session"
+    );
+    assert_eq!(
+        runtime.read_instance(&alpha).unwrap().session.as_deref(),
+        Some("second-session")
+    );
+}
+
+#[test]
+fn a_delayed_stop_keeps_a_replacement_that_left_only_metadata() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let locks = runtime.root.join(".locks");
+    let first = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "first-session").unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !locks.join("alpha.first-session.stop").exists() {
+        assert!(Instant::now() < deadline, "stop never requested shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    fs::remove_file(locks.join("alpha.session")).unwrap();
+    drop(first);
+    let replacement = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "second-session").unwrap();
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    fs::remove_file(locks.join("alpha.session")).unwrap();
+    drop(replacement);
+
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("a newer one took over"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+    assert!(runtime.instance_dir(&alpha).join("instance.json").exists());
+}
+
+#[test]
 fn start_reports_a_stop_in_progress() {
     let runtime = runtime_for_tests();
     let (inside, entered) = mpsc::channel();
