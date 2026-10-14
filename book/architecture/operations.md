@@ -50,6 +50,9 @@ The terms are deliberately narrow:
    recorded account activity independently of wallet synchronization.
 
 The important ordering is **record intent → save transaction → broadcast**.
+Send, account faucet, and address faucet reject transparent outputs below
+54 zatoshi with **HTTP 400** before recording a claim. Smaller positive
+shielded amounts remain valid.
 Concurrent requests with the same key share the recorded intent and serialized
 submission. Saved payments can be resumed across a server restart while the
 instance's databases remain intact. This is not an end-to-end exactly-once
