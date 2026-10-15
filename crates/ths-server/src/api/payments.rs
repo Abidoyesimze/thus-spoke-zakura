@@ -1,5 +1,4 @@
-use super::error::require_started;
-use super::error::{ApiError, ApiResult};
+use super::error::{ApiError, ApiJson, ApiQuery, ApiResult, require_started};
 use crate::state::AppState;
 use crate::wallet::PaymentError;
 use crate::{
@@ -9,11 +8,7 @@ use crate::{
     wallet::SendQuote,
 };
 use anyhow::Context;
-use axum::{
-    Json,
-    extract::{Query, State},
-    http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use axum::{
     http::{HeaderValue, header::LOCATION},
     response::{IntoResponse, Response},
@@ -40,7 +35,7 @@ pub(crate) struct SendRequest {
 }
 pub(crate) async fn send(
     State(state): State<AppState>,
-    Json(req): Json<SendRequest>,
+    ApiJson(req): ApiJson<SendRequest>,
 ) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
     let (recipient, _) = validate_send(&req)?;
@@ -92,7 +87,7 @@ pub(crate) struct PaymentUri {
 
 pub(crate) async fn parse_payment_uri(
     State(state): State<AppState>,
-    Json(req): Json<PaymentUriRequest>,
+    ApiJson(req): ApiJson<PaymentUriRequest>,
 ) -> ApiResult<Json<PaymentUri>> {
     Ok(Json(payment_uri(&state.0.store, &req.uri)?))
 }
@@ -149,7 +144,7 @@ pub(crate) struct PaymentRequestResponse {
 
 pub(crate) async fn payment_request(
     State(state): State<AppState>,
-    Json(req): Json<PaymentRequest>,
+    ApiJson(req): ApiJson<PaymentRequest>,
 ) -> ApiResult<Json<PaymentRequestResponse>> {
     require_user_account(req.account_id)?;
     let amount = req
@@ -190,7 +185,7 @@ pub(crate) struct SendQuoteRequest {
 }
 pub(crate) async fn send_quote(
     State(state): State<AppState>,
-    Json(req): Json<SendQuoteRequest>,
+    ApiJson(req): ApiJson<SendQuoteRequest>,
 ) -> ApiResult<Json<SendQuote>> {
     require_user_account(req.from_account)?;
     require_pool(&req.source_pool, "source_pool")?;
@@ -221,7 +216,7 @@ pub(crate) struct FaucetRequest {
 }
 pub(crate) async fn faucet(
     State(state): State<AppState>,
-    Json(req): Json<FaucetRequest>,
+    ApiJson(req): ApiJson<FaucetRequest>,
 ) -> ApiResult<PaymentResponse<Activity>> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
@@ -388,7 +383,7 @@ async fn execute_address_faucet<R: AddressFaucetRuntime>(
 
 pub(crate) async fn faucet_address(
     State(state): State<AppState>,
-    Json(req): Json<FaucetAddressRequest>,
+    ApiJson(req): ApiJson<FaucetAddressRequest>,
 ) -> ApiResult<PaymentResponse<FaucetAddressResponse>> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
@@ -583,7 +578,7 @@ pub(crate) struct FaucetAddressQuery {
 
 pub(crate) async fn faucet_address_status(
     State(state): State<AppState>,
-    Query(query): Query<FaucetAddressQuery>,
+    ApiQuery(query): ApiQuery<FaucetAddressQuery>,
 ) -> ApiResult<Json<FaucetAddressResponse>> {
     require_key(&query.idempotency_key)?;
     stored_address_faucet(&state.0.store, &query.idempotency_key)?
