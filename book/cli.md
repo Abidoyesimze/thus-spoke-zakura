@@ -433,7 +433,7 @@ rerunning the same command requests a new set of payments. JSON returns
 `{funded:[confirmed operations],pending:[operations with retained keys],
 failed:[diagnostic strings]}`; unknown pending members include `error`.
 
-### `ths wallet send --from <N> --to <N> --amount <ZEC> [--source-pool <POOL>] [--destination-pool <POOL>] [--memo <TEXT>]`
+### `ths wallet send --from <N> --to <N> (--amount <ZEC> | --max) [--source-pool <POOL>] [--destination-pool <POOL>] [--memo <TEXT>]`
 
 Sends funds between development accounts or pools. It does the same thing as
 the dashboard's **Send ZEC** dialog and uses the same endpoint
@@ -442,9 +442,10 @@ the dashboard's **Send ZEC** dialog and uses the same endpoint
 - `--from <N>` / `--to <N>` (required): two account indices,
   1–5. They may match when the source and destination pools differ. The treasury
   account cannot be used.
-- `--amount <ZEC>` (required): spendable source funds must cover the amount
-  plus the fee. Use the send quote's `max_zatoshi` as the ceiling, rather than
-  the displayed balance; see [quoting a send](accounts-and-balances.md#zec-zatoshi-and-spendability).
+- `--amount <ZEC>` / `--max` (exactly one required): send an explicit amount,
+  or ask `POST /api/v1/send/quote` for the maximum spendable amount after the
+  network fee. The CLI submits the server's quoted `max_zatoshi`; it does not
+  calculate the fee itself.
 - `--source-pool <ironwood|transparent>`: pool to spend from (default
   `ironwood`).
 - `--destination-pool <ironwood|transparent>`: pool the destination account
@@ -454,6 +455,9 @@ the dashboard's **Send ZEC** dialog and uses the same endpoint
 ```console
 # Move 1 ZEC from account 2's Ironwood balance to account 3's Ironwood balance
 ths wallet send --from 2 --to 3 --amount 1
+
+# Empty account 2's spendable Ironwood balance into account 3
+ths wallet send --from 2 --to 3 --max
 
 # Spend account 1's transparent balance into account 4's Ironwood balance
 ths wallet send --from 1 --to 4 --amount 0.5 --source-pool transparent
@@ -479,7 +483,7 @@ arguments and the same instance to resume. Observing `confirmed` or terminal
 Pending/unknown output includes the key (also in JSON) and exits nonzero;
 see the [caller table](architecture/operations.md#which-caller-are-you-retrying).
 
-### `ths wallet send --from <N> --uri <URI> [--amount <ZEC>] [--source-pool <POOL>]`
+### `ths wallet send --from <N> --uri <URI> [--amount <ZEC> | --max] [--source-pool <POOL>]`
 
 Pays a single-payment ZIP-321 `zcash:` URI, like the **Payment request** field
 in the dashboard's **Send ZEC** dialog. The URI sets the destination (any
@@ -490,16 +494,25 @@ accept exactly the same URIs: one payment to a supported Regtest address,
 with a text memo only for Ironwood. Multipayment, wrong-network, unsupported
 receiver, and nontext-memo requests are rejected.
 
-- `--amount <ZEC>`: required when the URI has no amount, and rejected when it
-  sets one.
+- `--amount <ZEC>` or `--max`: required when the URI has no amount, and rejected
+  when it sets one. `--max` quotes against the destination pool parsed from the
+  URI.
 
 ```console
 DASHBOARD_URL="$(ths endpoints --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["dashboard"])')"
 URI="$(curl -fsS "$DASHBOARD_URL/api/v1/zip321/request" -H 'content-type: application/json' --data '{"account_id":2,"amount_zatoshi":1000000,"memo":"coffee"}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["uri"])')"
 ths wallet send --from 1 --uri "$URI"
+# Pay a request for 0.01 ZEC with the memo "coffee"
+ths wallet send --from 1 --uri "zcash:uregtest1...?amount=0.01&memo=Y29mZmVl"
+
+# A URI without an amount needs --amount
+ths wallet send --from 1 --uri "zcash:tm..." --amount 0.5
+
+# Or send the maximum available after fees
+ths wallet send --from 1 --uri "zcash:tm..." --max
 ```
 
-### `ths wallet shield --from <N> --to <N> --amount <ZEC> [--memo <TEXT>]`
+### `ths wallet shield --from <N> --to <N> (--amount <ZEC> | --max) [--memo <TEXT>]`
 
 Shorthand for `ths wallet send` with `--source-pool transparent
 --destination-pool ironwood`: spends one account's transparent balance into
@@ -508,7 +521,7 @@ the same or another account's Ironwood balance.
 - `--from <N>` (required): account to spend transparent funds from.
 - `--to <N>` (required): account to receive them as Ironwood funds; may match
   `--from`.
-- `--amount <ZEC>` (required).
+- `--amount <ZEC>` / `--max` (exactly one required).
 - `--memo <TEXT>`: optional memo on the Ironwood output (up to 512 bytes).
 
 ```console
@@ -517,6 +530,9 @@ ths wallet shield --from 4 --to 2 --amount 0.5
 
 # Shield within account 1
 ths wallet shield --from 1 --to 1 --amount 0.005
+
+# Shield the maximum spendable transparent balance after fees
+ths wallet shield --from 1 --to 1 --max
 
 # The same, with a memo
 ths wallet shield --from 4 --to 2 --amount 0.5 --memo "welcome to the shielded pool"
@@ -529,7 +545,7 @@ These transfers require sufficient spendable funds for the amount and fee.
 > 1 transparent ZEC can leave that account with its change in Ironwood
 > rather than transparent.
 
-### `ths wallet unshield --from <N> --to <N> --amount <ZEC>`
+### `ths wallet unshield --from <N> --to <N> (--amount <ZEC> | --max)`
 
 Shorthand for `ths wallet send` with `--source-pool ironwood
 --destination-pool transparent`: spends one account's Ironwood balance into
@@ -539,7 +555,7 @@ transparent outputs cannot carry one.
 - `--from <N>` (required): account to spend Ironwood funds from.
 - `--to <N>` (required): account to receive them as transparent funds; may match
   `--from`.
-- `--amount <ZEC>` (required).
+- `--amount <ZEC>` / `--max` (exactly one required).
 
 ```console
 # Unshield 0.2 ZEC from account 1's Ironwood balance into account 3's transparent balance
@@ -547,6 +563,9 @@ ths wallet unshield --from 1 --to 3 --amount 0.2
 
 # Unshield within account 1
 ths wallet unshield --from 1 --to 1 --amount 0.01
+
+# Unshield the maximum spendable Ironwood balance after fees
+ths wallet unshield --from 1 --to 1 --max
 ```
 
 ### Memos
@@ -628,10 +647,10 @@ account 1 to account 3, all without opening the dashboard.
 | `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet activity [--limit N] [--json]` | Print recent development-wallet activity |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
-| `ths wallet send --from --to --amount [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
-| `ths wallet send --from --uri [--amount] [--source-pool]` | Pay a ZIP-321 `zcash:` URI to any Regtest address |
-| `ths wallet shield --from --to --amount [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |
-| `ths wallet unshield --from --to --amount` | Spend Ironwood funds into the same or another account's transparent balance |
+| `ths wallet send --from --to (--amount \| --max) [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
+| `ths wallet send --from --uri [--amount \| --max] [--source-pool]` | Pay a ZIP-321 `zcash:` URI to any Regtest address |
+| `ths wallet shield --from --to (--amount \| --max) [--memo]` | Spend transparent funds into the same or another account's Ironwood balance |
+| `ths wallet unshield --from --to (--amount \| --max)` | Spend Ironwood funds into the same or another account's transparent balance |
 | `ths logs [service] [-f] [--tail N \| --head N]` | Stream or print service logs |
 | `ths list` | List environments and their container status |
 | `ths stop` | Stop and delete the environment |
