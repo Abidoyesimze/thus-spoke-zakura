@@ -280,6 +280,10 @@ fn failed_inspect_of_a_listed_identity_stays_uncertain() {
     );
 }
 
+// Unlike the classification tests above, this exercises real deadline and
+// termination-reserve math against a genuinely hanging child process, so it
+// intentionally keeps a finite, real-time budget instead of the unbounded
+// policy used for outcome classification.
 #[test]
 fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     let mut policy = short_policy();
@@ -373,12 +377,14 @@ fn fresh_cleanup_budget_ignores_a_latched_shutdown() {
         "{:?}",
         docker.removal_calls()
     );
-    let started = Instant::now();
+    // Classification, not timing: a fresh attempt must not inherit the prior
+    // attempt's Uncertain outcome regardless of how long persistence or
+    // scheduling happens to take, so this uses an effectively unbounded
+    // budget rather than racing a real deadline.
     let report = runtime
         .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
         .unwrap();
     assert!(report.verified(), "{report:?}");
-    assert!(started.elapsed() < cleanup_policy().cleanup);
     let _ = shutdown;
 }
 

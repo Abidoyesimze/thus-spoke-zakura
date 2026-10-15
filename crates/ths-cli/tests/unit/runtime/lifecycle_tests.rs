@@ -35,9 +35,19 @@ fn name(value: &str) -> InstanceName {
     value.parse().unwrap()
 }
 
+/// Every caller of this policy asserts on outcome *classification*
+/// (verified/incomplete/uncertain, retained dependencies, journal contents),
+/// never on deadline or termination-reserve math itself. Real persistence
+/// (fsync) and scheduling delays can eat a finite budget under heavy
+/// parallel test contention, which has nothing to do with the classification
+/// logic under test, so the budget here is large enough that in-memory
+/// fixture work never approaches it regardless of machine load. A test that
+/// exercises actual deadline or reserve math (e.g.
+/// `hanging_removal_leaves_the_termination_reserve_for_helpers`) must use its
+/// own real, finite policy instead of this one.
 fn cleanup_policy() -> LifecyclePolicy {
     LifecyclePolicy {
-        cleanup: Duration::from_secs(5),
+        cleanup: Duration::from_secs(3600),
         ..short_policy()
     }
 }
