@@ -470,7 +470,7 @@ pub(super) fn session_files(runtime: &Runtime) -> Vec<String> {
     fs::read_dir(runtime.root.join(".locks"))
         .unwrap()
         .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|file| !file.ends_with(".lock"))
+        .filter(|file| !file.ends_with(".lock") && !file.ends_with(".owner"))
         .collect()
 }
 
@@ -777,6 +777,201 @@ fn a_delayed_stop_keeps_a_replacement_that_left_only_metadata() {
     assert!(error.contains("a newer one took over"), "{error}");
     assert!(!cleaned.load(Ordering::SeqCst));
     assert!(runtime.instance_dir(&alpha).join("instance.json").exists());
+}
+
+#[test]
+fn a_delayed_stop_keeps_a_replacement_that_failed_before_writing_metadata() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let locks = runtime.root.join(".locks");
+    let first = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "first-session").unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !locks.join("alpha.first-session.stop").exists() {
+        assert!(Instant::now() < deadline, "stop never requested shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    fs::remove_file(locks.join("alpha.session")).unwrap();
+    drop(first);
+    let (mut replacement, events) = RecordingHost::new();
+    replacement.wait_ready_result = Err("container lookup failed".into());
+    replacement.final_cleanup_failure = Some("removal failed".into());
+    let (_sender, shutdown) = Shutdown::channel();
+    let failed = runtime.start_with(&alpha, true, false, 0, &replacement, &shutdown);
+
+    assert!(failed.is_err());
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"allocate:alpha".to_owned())
+    );
+    assert!(!locks.join("alpha.session").exists());
+    assert!(!runtime.instance_dir(&alpha).join("instance.json").exists());
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("a newer one took over"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+}
+
+#[test]
+fn a_stop_queued_behind_another_stop_keeps_a_launcher_that_started_after_it() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let locks = runtime.root.join(".locks");
+    let (inside, entered) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let first_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let first_stop = thread::spawn(move || {
+        first_shell
+            .verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+                inside.send(()).unwrap();
+                released.recv().unwrap();
+                Ok(verified_report())
+            })
+            .map(|report| report.verified())
+            .map_err(|error| format!("{error:#}"))
+    });
+    entered.recv().unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let second_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let second_stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        second_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    thread::sleep(Duration::from_millis(100));
+    release.send(()).unwrap();
+    assert_eq!(first_stop.join().unwrap(), Ok(true));
+
+    let replacement = runtime.claim_start(&alpha).unwrap();
+    fs::write(locks.join("alpha.session"), "second-session").unwrap();
+
+    let error = second_stop.join().unwrap().unwrap_err();
+    assert!(error.contains("another launcher started alpha"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+    assert!(!locks.join("alpha.second-session.stop").exists());
+    drop(replacement);
+}
+
+#[test]
+fn a_stop_keeps_a_replacement_for_a_launcher_that_crashed_before_publishing() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let first = runtime.claim_start(&alpha).unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    thread::sleep(Duration::from_millis(100));
+    drop(first);
+    let (mut replacement, events) = RecordingHost::new();
+    replacement.wait_ready_result = Err("container lookup failed".into());
+    replacement.final_cleanup_failure = Some("removal failed".into());
+    let (_sender, shutdown) = Shutdown::channel();
+    let failed = runtime.start_with(&alpha, true, false, 0, &replacement, &shutdown);
+
+    assert!(failed.is_err());
+    assert!(
+        events
+            .lock()
+            .unwrap()
+            .contains(&"allocate:alpha".to_owned())
+    );
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("another launcher started alpha"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+    assert!(session_files(&runtime).is_empty());
+}
+
+#[test]
+fn a_stop_cleans_leftovers_older_than_the_launcher_it_stopped() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    let crashed = Instance {
+        name: "alpha".into(),
+        version: 1,
+        endpoints: endpoints_for(&host_ports(0).unwrap()),
+        created_at: None,
+        session: Some("crashed-session".into()),
+    };
+    fs::write(
+        runtime.instance_dir(&alpha).join("instance.json"),
+        serde_json::to_vec(&crashed).unwrap(),
+    )
+    .unwrap();
+    let (_sender, shutdown) = Shutdown::channel();
+    let context = LifecycleContext::new(stop_policy());
+    let ownership = runtime.own_start(&alpha, &shutdown, &context).unwrap();
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &stop_policy(), || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|report| report.verified())
+            .map_err(|error| format!("{error:#}"))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ownership.session().requested() {
+        assert!(Instant::now() < deadline, "stop never requested shutdown");
+        thread::sleep(Duration::from_millis(1));
+    }
+    drop(ownership);
+
+    assert_eq!(stop.join().unwrap(), Ok(true));
+    assert!(cleaned.load(Ordering::SeqCst));
 }
 
 #[test]

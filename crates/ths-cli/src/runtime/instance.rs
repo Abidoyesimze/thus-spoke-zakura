@@ -266,6 +266,20 @@ impl Drop for RemovedOnDrop {
     }
 }
 
+fn superseded(name: &InstanceName, requested: &Option<(String, PathBuf)>) -> Result<anyhow::Error> {
+    Ok(match requested {
+        Some((_, request)) => {
+            remove_if_present(request)?;
+            anyhow!(
+                "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+            )
+        }
+        None => anyhow!(
+            "another launcher started {name} while this command was waiting; it was not stopped. Run `ths --name {name} stop` again to stop it"
+        ),
+    })
+}
+
 fn remove_if_present(path: &Path) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
@@ -281,7 +295,13 @@ impl Runtime {
 
     pub(super) fn claim_start(&self, name: &InstanceName) -> Result<InstanceLock> {
         match self.try_lock(&format!("{name}.start.lock"))? {
-            Some(lock) => Ok(lock),
+            Some(lock) => {
+                let owner = self.owner_path(name);
+                let pending = owner.with_extension("owner.pending");
+                fs::write(&pending, uuid::Uuid::new_v4().to_string())?;
+                fs::rename(&pending, &owner)?;
+                Ok(lock)
+            }
             None if self.stopping_path(name).exists() || self.stop_requested(name)? => bail!(
                 "environment {name} is being stopped or reset by another command; start it again once that finishes"
             ),
@@ -357,8 +377,12 @@ impl Runtime {
     ) -> Result<CleanupReport> {
         let deadline = Deadline::after(policy.startup_docker + policy.cleanup * 2);
         let mut requested: Option<(String, PathBuf)> = None;
+        let claimed = self.read_owner(name)?;
         loop {
             if let Some(_owner) = self.try_lock(&format!("{name}.start.lock"))? {
+                if self.read_owner(name)? != claimed {
+                    return Err(superseded(name, &requested)?);
+                }
                 if let Some((target, request)) = &requested {
                     remove_if_present(request)?;
                     if self.replaced_since(name, target)? {
@@ -373,6 +397,9 @@ impl Runtime {
                 let _stopping = RemovedOnDrop(stopping);
                 let _lock = self.lock_instance(name)?;
                 return cleanup();
+            }
+            if self.read_owner(name)? != claimed {
+                return Err(superseded(name, &requested)?);
             }
             match (&requested, self.read_session(name)?) {
                 (None, Some(id)) => {
@@ -394,16 +421,19 @@ impl Runtime {
     }
 
     fn replaced_since(&self, name: &InstanceName, target: &str) -> Result<bool> {
-        let current = self.read_session(name)?;
-        let persisted = if self.instance_dir(name).join("instance.json").exists() {
-            self.read_instance(name)?.session
-        } else {
-            None
-        };
-        Ok([current, persisted]
-            .into_iter()
-            .flatten()
-            .any(|id| id != target))
+        Ok(self.read_session(name)?.is_some_and(|id| id != target))
+    }
+
+    fn read_owner(&self, name: &InstanceName) -> Result<Option<String>> {
+        match fs::read_to_string(self.owner_path(name)) {
+            Ok(id) => Ok(Some(id.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading the environment owner"),
+        }
+    }
+
+    fn owner_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.owner"))
     }
 
     fn session_path(&self, name: &InstanceName) -> PathBuf {
