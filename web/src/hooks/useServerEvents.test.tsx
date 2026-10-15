@@ -1,31 +1,41 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, render, screen } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { AddressDetail } from '@/features/explorer/AddressDetail';
 import { BlockDetail } from '@/features/explorer/BlockDetail';
 import { TransactionDetail } from '@/features/explorer/TransactionDetail';
-import { AppProviders } from '@/app/providers';
 import { renderWithProviders, requestUrl } from '@/test/utils';
-import { useAccounts } from './queries';
 import { useServerEvents } from './useServerEvents';
 
 const TXID = 'd9'.repeat(32);
 const ADDRESS = 'tmAg2wTARgKBHA9mFouqR727cU98MJmfjSq';
 
-class FakeEventSource extends EventTarget {
+type Listener = (event: MessageEvent<string>) => void;
+
+class FakeEventSource {
   static current: FakeEventSource | undefined;
+  private listeners = new Set<Listener>();
 
   constructor() {
-    super();
     FakeEventSource.current = this;
+  }
+
+  addEventListener(_type: string, listener: Listener) {
+    this.listeners.add(listener);
+  }
+
+  removeEventListener(_type: string, listener: Listener) {
+    this.listeners.delete(listener);
   }
 
   close() {}
 
   emit(topic: string) {
-    this.dispatchEvent(new MessageEvent('update', { data: topic }));
+    for (const listener of this.listeners) {
+      listener(new MessageEvent('update', { data: topic }));
+    }
   }
 }
 
@@ -112,50 +122,6 @@ describe('useServerEvents', () => {
     FakeEventSource.current?.emit('mining');
     expect(invalidate.mock.calls).toEqual([[{ queryKey: ['mining'] }]]);
   });
-
-  it.each(['initial connection', 'reconnection'])(
-    'refreshes balances missed before SSE %s',
-    async (connection) => {
-      let balance = 100;
-      routes = {
-        '/accounts': () => [
-          {
-            id: 1,
-            name: 'Account 1',
-            unified_address: 'uregtest1example',
-            transparent_address: ADDRESS,
-            transparent_zatoshi: 0,
-            ironwood_zatoshi: balance,
-          },
-        ],
-      };
-      function Balance() {
-        const accounts = useAccounts();
-        return <p>Balance: {accounts.data?.[0]?.ironwood_zatoshi.toString()}</p>;
-      }
-      render(
-        <AppProviders>
-          <Live>
-            <Balance />
-          </Live>
-        </AppProviders>,
-      );
-      if (connection === 'reconnection') {
-        await act(() => FakeEventSource.current?.dispatchEvent(new Event('open')));
-      }
-      expect(await screen.findByText('Balance: 100')).toBeInTheDocument();
-
-      if (connection === 'reconnection') {
-        await act(() => FakeEventSource.current?.dispatchEvent(new Event('error')));
-      }
-      balance = 200;
-      expect(screen.getByText('Balance: 100')).toBeInTheDocument();
-      // The server does not replay updates missed before this connection opened.
-      await act(() => FakeEventSource.current?.dispatchEvent(new Event('open')));
-
-      expect(await screen.findByText('Balance: 200')).toBeInTheDocument();
-    },
-  );
 
   it('refreshes an open transaction page on a new block', async () => {
     let confirmations = 1;

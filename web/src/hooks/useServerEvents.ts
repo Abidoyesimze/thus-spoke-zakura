@@ -20,9 +20,9 @@ export function useServerEvents(): void {
   useEffect(() => {
     const source = new EventSource('/api/v1/events');
 
-    // The stream does not replay updates missed before connecting or reconnecting.
-    const onOpen = () => {
-      void queryClient.invalidateQueries();
+    // Discard pre-subscription reads; the stream does not replay missed updates.
+    source.onopen = () => {
+      void queryClient.cancelQueries().then(() => queryClient.invalidateQueries());
     };
 
     const onUpdate = (event: MessageEvent<string>) => {
@@ -32,10 +32,8 @@ export function useServerEvents(): void {
       }
     };
 
-    source.addEventListener('open', onOpen);
     source.addEventListener('update', onUpdate as EventListener);
     return () => {
-      source.removeEventListener('open', onOpen);
       source.removeEventListener('update', onUpdate as EventListener);
       source.close();
     };

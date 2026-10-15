@@ -141,8 +141,8 @@ curl -N "$DASHBOARD_URL/api/v1/events"
 Leave it running, perform a faucet or mine in another terminal, and watch
 for `update` events. Press Ctrl+C to stop the stream. Your client should
 read the relevant HTTP endpoint after an event; it should also fetch
-initial state when it connects, since a stream starts with no full
-snapshot. A `mining` event prompts a job-status refresh. A `resync` event means
+fresh state on each connection, cancelling pending older reads first.
+The stream has no replay. A `mining` event prompts a job-status refresh. A `resync` event means
 updates were missed; refetch the state your client uses.
 
 ## Read chain state directly
