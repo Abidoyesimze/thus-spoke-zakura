@@ -117,18 +117,46 @@ fn shutdown_collision_removes_owned_resources_and_preserves_foreign_container() 
 }
 
 #[test]
-fn browser_open_failure_deletes_and_does_not_wait() {
+fn browser_open_failure_keeps_environment_running_until_shutdown() {
     let (mut host, events) = RecordingHost::new();
     host.open_url_result = Err("opening http://127.0.0.1:1".into());
-    let (_sender, shutdown) = Shutdown::channel();
-    let err = runtime_for_tests()
+    let (sender, shutdown) = Shutdown::channel();
+    let watched = Arc::clone(&events);
+    thread::spawn(move || {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            let waiting = watched
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.starts_with("wait_for_shutdown"));
+            if waiting {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        sender.send(Ended::Interrupted).unwrap();
+    });
+
+    runtime_for_tests()
         .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
-        .unwrap_err();
-    assert!(err.to_string().contains("opening"));
+        .unwrap();
+
     let events = events.lock().unwrap().clone();
-    assert!(events.iter().any(|e| e.starts_with("open_url:")));
-    assert!(events.iter().any(|e| e == "delete:alpha"));
-    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
+    let open_url = events
+        .iter()
+        .position(|event| event.starts_with("open_url:"))
+        .unwrap();
+    let wait_for_shutdown = events
+        .iter()
+        .position(|event| event.starts_with("wait_for_shutdown:"))
+        .unwrap();
+    let final_delete = events
+        .iter()
+        .rposition(|event| event == "delete:alpha")
+        .unwrap();
+    assert!(open_url < wait_for_shutdown);
+    assert!(wait_for_shutdown < final_delete);
 }
 
 #[test]

@@ -752,8 +752,15 @@ impl Runtime {
                     endpoint_lines(&allocated.endpoints)
                 );
             }
-            if !no_open {
-                host.open_url(&allocated.endpoints.dashboard, shutdown, context)?;
+            if !no_open
+                && let Err(error) = host.open_url(&allocated.endpoints.dashboard, shutdown, context)
+            {
+                shutdown.check()?;
+                eprintln!("Warning: could not open the dashboard automatically: {error:#}");
+                eprintln!(
+                    "The {name} environment is still running at {}. Run `ths --name {name} open` to open it later.",
+                    allocated.endpoints.dashboard,
+                );
             }
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
