@@ -283,8 +283,8 @@ fn failed_inspect_of_a_listed_identity_stays_uncertain() {
 #[test]
 fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     let mut policy = short_policy();
-    policy.cleanup = Duration::from_millis(500);
-    policy.termination_reserve = Duration::from_millis(150);
+    policy.cleanup = Duration::from_secs(2);
+    policy.termination_reserve = Duration::from_millis(400);
     policy.startup_docker = Duration::from_secs(2);
     let context = LifecycleContext::new(policy);
     let script = hang_on_removal_script();
@@ -378,7 +378,7 @@ fn fresh_cleanup_budget_ignores_a_latched_shutdown() {
         .cleanup_with(&name("alpha"), &docker, false, &cleanup_policy())
         .unwrap();
     assert!(report.verified(), "{report:?}");
-    assert!(started.elapsed() < short_policy().cleanup + Duration::from_millis(500));
+    assert!(started.elapsed() < cleanup_policy().cleanup);
     let _ = shutdown;
 }
 

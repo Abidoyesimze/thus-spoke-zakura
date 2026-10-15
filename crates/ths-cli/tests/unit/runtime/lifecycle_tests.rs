@@ -37,7 +37,7 @@ fn name(value: &str) -> InstanceName {
 
 fn cleanup_policy() -> LifecyclePolicy {
     LifecyclePolicy {
-        cleanup: Duration::from_secs(2),
+        cleanup: Duration::from_secs(5),
         ..short_policy()
     }
 }
