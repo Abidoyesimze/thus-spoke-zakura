@@ -45,7 +45,9 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
 
 #[test]
 fn internal_transfer_is_returned_once_with_both_accounts() {
-    let canonical = canonical_activity("internal", "internal-tx");
+    let mut canonical = canonical_activity("outgoing", "internal-tx");
+    canonical.to_account = None;
+    canonical.recipient_addresses = vec!["uregtest1account2".to_owned()];
     let activity = unified_activity(
         vec![journal_send("internal-tx")],
         vec![canonical.clone(), canonical],
@@ -58,7 +60,27 @@ fn internal_transfer_is_returned_once_with_both_accounts() {
     assert_eq!(activity[0].direction, "internal");
     assert_eq!(activity[0].from_account, Some(1));
     assert_eq!(activity[0].to_account, Some(2));
-    assert!(activity[0].recipient_addresses.is_empty());
+    assert_eq!(activity[0].to_address, None);
+    assert_eq!(activity[0].recipient_addresses, ["uregtest1account2"]);
+}
+
+#[test]
+fn canonical_confirmation_clears_a_stale_journal_error() {
+    let mut journal = journal_send("confirmed-tx");
+    journal.status = "broadcast".to_owned();
+    journal.block_hash = None;
+    journal.last_error = Some("auto-mine failed".to_owned());
+
+    let activity = unified_activity(
+        vec![journal],
+        vec![canonical_activity("internal", "confirmed-tx")],
+        30,
+    );
+
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].status, "confirmed");
+    assert_eq!(activity[0].block_hash.as_deref(), Some("block"));
+    assert_eq!(activity[0].last_error, None);
 }
 
 #[test]

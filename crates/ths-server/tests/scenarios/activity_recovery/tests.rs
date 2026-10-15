@@ -24,25 +24,14 @@ fn activity(created_at: &str) -> Activity {
 }
 
 #[test]
-fn persistence_normalization_excludes_only_generated_fields() -> Result<()> {
+fn timestamp_normalization_excludes_only_the_immediate_send_timestamp() -> Result<()> {
     let immediate = activity("");
     let persisted = activity("2026-09-23 12:00:00");
     assert_persisted_send_response(&immediate, &persisted)?;
 
-    let mut retried = persisted.clone();
-    retried.last_error = Some("newer recovery error".to_owned());
-    assert_persisted_send_response(&immediate, &retried)?;
-
     let mut changed_amount = persisted.clone();
     changed_amount.amount_zatoshi += 1;
     assert!(assert_persisted_send_response(&immediate, &changed_amount).is_err());
-
-    let mut immediate_confirmed = immediate.clone();
-    immediate_confirmed.status = "confirmed".to_owned();
-    let mut confirmed_with_error = persisted.clone();
-    confirmed_with_error.status = "confirmed".to_owned();
-    confirmed_with_error.last_error = Some("unexpected terminal error".to_owned());
-    assert!(assert_persisted_send_response(&immediate_confirmed, &confirmed_with_error).is_err());
 
     let mut confirmed = persisted.clone();
     confirmed.status = "confirmed".to_owned();

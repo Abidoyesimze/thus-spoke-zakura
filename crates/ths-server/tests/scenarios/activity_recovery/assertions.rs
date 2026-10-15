@@ -236,18 +236,9 @@ pub(super) fn assert_persisted_send_response(
     );
     let mut expected = immediate.clone();
     expected.created_at = persisted.created_at.clone();
-    if matches!(
-        expected.status.as_str(),
-        "preparing" | "prepared" | "broadcast"
-    ) && persisted.status == expected.status
-    {
-        // Recovery retries can replace or clear the latest execution error
-        // between the keyed response and the subsequent activity-list read.
-        expected.last_error = persisted.last_error.clone();
-    }
     anyhow::ensure!(
         persisted == &expected,
-        "persisted activity changed beyond its generated timestamp or retry error: expected {expected:?}, got {persisted:?}"
+        "persisted activity changed beyond its generated timestamp: expected {expected:?}, got {persisted:?}"
     );
     Ok(())
 }

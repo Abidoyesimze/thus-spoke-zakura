@@ -201,26 +201,26 @@ pub(crate) struct ActivityEntry {
     last_error: Option<String>,
 }
 
+fn journal_direction(activity: &Activity) -> &'static str {
+    if activity.kind == "faucet" {
+        "incoming"
+    } else if activity.from_account.is_some() && activity.from_account == activity.to_account {
+        "self"
+    } else if activity.from_account.is_some() && activity.to_account.is_some() {
+        "internal"
+    } else {
+        "outgoing"
+    }
+}
+
 impl ActivityEntry {
     fn journal(activity: Activity) -> Self {
-        let incoming = activity.kind == "faucet";
-        let self_transfer =
-            activity.from_account.is_some() && activity.from_account == activity.to_account;
-        let internal = activity.from_account.is_some() && activity.to_account.is_some();
+        let direction = journal_direction(&activity).to_owned();
         let recipient_addresses = activity.to_address.iter().cloned().collect();
         Self {
             id: activity.id,
             kind: activity.kind,
-            direction: if incoming {
-                "incoming"
-            } else if self_transfer {
-                "self"
-            } else if internal {
-                "internal"
-            } else {
-                "outgoing"
-            }
-            .to_owned(),
+            direction,
             from_account: activity.from_account,
             to_account: activity.to_account,
             to_address: activity.to_address,
@@ -280,11 +280,16 @@ impl ActivityEntry {
     }
 
     fn merge_journal(mut self, journal: Activity) -> Self {
+        self.direction = journal_direction(&journal).to_owned();
         self.id = journal.id;
         self.kind = journal.kind;
         self.from_account = journal.from_account;
         self.to_account = journal.to_account;
-        self.to_address = journal.to_address.clone().or(self.to_address);
+        self.to_address = if journal.to_account.is_some() {
+            None
+        } else {
+            journal.to_address.clone().or(self.to_address)
+        };
         if let Some(address) = journal.to_address.as_ref()
             && !self.recipient_addresses.contains(address)
         {
@@ -299,9 +304,9 @@ impl ActivityEntry {
         self.block_hash = self.block_hash.or(journal.block_hash);
         if self.mined_height.is_none() {
             self.status = journal.status;
+            self.last_error = journal.last_error;
         }
         self.created_at = Some(journal.created_at);
-        self.last_error = journal.last_error;
         self
     }
 }
