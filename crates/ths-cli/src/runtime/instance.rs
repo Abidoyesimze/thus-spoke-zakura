@@ -29,7 +29,7 @@ pub(super) fn default_regtest() -> String {
     "regtest".to_owned()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Endpoints {
     pub dashboard: String,
     pub rpc: String,
@@ -41,7 +41,7 @@ pub struct Endpoints {
     pub tls: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Instance {
     pub(super) name: String,
     pub(super) version: u32,
@@ -49,6 +49,8 @@ pub(crate) struct Instance {
     /// unix seconds; missing for environments created before it was recorded.
     #[serde(default)]
     pub(super) created_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) session: Option<String>,
 }
 
 impl Runtime {
@@ -103,6 +105,7 @@ impl Runtime {
             version: 1,
             endpoints: endpoints.clone(),
             created_at: Some(now_unix()?),
+            session: self.read_session(name)?,
         };
         fs::write(
             self.instance_dir(name).join("instance.json"),
@@ -204,8 +207,265 @@ impl Drop for InstanceLock {
     }
 }
 
+pub(super) struct StartSession {
+    requested: Arc<AtomicBool>,
+    stop: Option<mpsc::Sender<()>>,
+    watcher: Option<thread::JoinHandle<()>>,
+    _request: RemovedOnDrop,
+    _session: SessionFile,
+}
+impl StartSession {
+    pub(super) fn requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn explain(&self, name: &InstanceName, error: anyhow::Error) -> anyhow::Error {
+        if self.requested() {
+            anyhow!("{name} was stopped by another command during startup")
+        } else {
+            error
+        }
+    }
+}
+impl Drop for StartSession {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(watcher) = self.watcher.take()
+            && watcher.join().is_err()
+        {
+            eprintln!("stop request monitoring stopped unexpectedly");
+        }
+    }
+}
+
+struct SessionFile {
+    path: PathBuf,
+    id: String,
+}
+impl Drop for SessionFile {
+    fn drop(&mut self) {
+        match fs::read_to_string(&self.path) {
+            Ok(id) if id.trim() == self.id => {
+                if let Err(error) = remove_if_present(&self.path) {
+                    eprintln!("could not remove {}: {error}", self.path.display());
+                }
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!("could not read {}: {error}", self.path.display()),
+        }
+    }
+}
+
+struct RemovedOnDrop(PathBuf);
+impl Drop for RemovedOnDrop {
+    fn drop(&mut self) {
+        if let Err(error) = remove_if_present(&self.0) {
+            eprintln!("could not remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+fn superseded(name: &InstanceName, requested: &Option<(String, PathBuf)>) -> Result<anyhow::Error> {
+    Ok(match requested {
+        Some((_, request)) => {
+            remove_if_present(request)?;
+            anyhow!(
+                "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+            )
+        }
+        None => anyhow!(
+            "another launcher started {name} while this command was waiting; it was not stopped. Run `ths --name {name} stop` again to stop it"
+        ),
+    })
+}
+
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 impl Runtime {
     pub(super) fn lock_instance(&self, name: &InstanceName) -> Result<InstanceLock> {
+        self.try_lock(&format!("{name}.lock"))?
+            .with_context(|| format!("environment {name} is already in use by another command"))
+    }
+
+    pub(super) fn claim_start(&self, name: &InstanceName) -> Result<InstanceLock> {
+        match self.try_lock(&format!("{name}.start.lock"))? {
+            Some(lock) => {
+                let owner = self.owner_path(name);
+                let pending = owner.with_extension("owner.pending");
+                fs::write(&pending, uuid::Uuid::new_v4().to_string())?;
+                fs::rename(&pending, &owner)?;
+                Ok(lock)
+            }
+            None if self.stopping_path(name).exists() || self.stop_requested(name)? => bail!(
+                "environment {name} is being stopped or reset by another command; start it again once that finishes"
+            ),
+            None if self.session_path(name).exists() => bail!(
+                "environment {name} is already running in another `ths start` or `ths run`; stop it first with `ths --name {name} stop`"
+            ),
+            None => bail!("environment {name} is already in use by another command"),
+        }
+    }
+
+    pub(super) fn publish_session(
+        &self,
+        name: &InstanceName,
+        shutdown: &Shutdown,
+        poll: Duration,
+    ) -> Result<StartSession> {
+        let lock_dir = self.root.join(".locks");
+        let stale = format!("{name}.");
+        for entry in fs::read_dir(&lock_dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|file| file.to_str())
+                .is_some_and(|file| file.starts_with(&stale) && file.ends_with(".stop"))
+            {
+                remove_if_present(&path)?;
+            }
+        }
+        remove_if_present(&self.stopping_path(name))?;
+        let id = uuid::Uuid::new_v4().to_string();
+        let session = self.session_path(name);
+        let pending = lock_dir.join(format!("{name}.session.pending"));
+        fs::write(&pending, &id)?;
+        fs::rename(&pending, &session)?;
+        let request = self.stop_request_path(name, &id);
+        let (stop, stopped) = mpsc::channel();
+        let requested = Arc::new(AtomicBool::new(false));
+        let seen = requested.clone();
+        let flag = shutdown.flag.clone();
+        let signal = shutdown.signal.clone();
+        let notify = shutdown.sender.clone();
+        let watched = request.clone();
+        let watcher = thread::spawn(move || {
+            while matches!(stopped.recv_timeout(poll), Err(RecvTimeoutError::Timeout)) {
+                if watched.exists() {
+                    seen.store(true, Ordering::SeqCst);
+                    let _ = signal.compare_exchange(
+                        0,
+                        signal_hook::consts::SIGINT,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                    flag.store(true, Ordering::SeqCst);
+                    let _ = notify.send(Ended::Interrupted);
+                    return;
+                }
+            }
+        });
+        Ok(StartSession {
+            requested,
+            stop: Some(stop),
+            watcher: Some(watcher),
+            _request: RemovedOnDrop(request),
+            _session: SessionFile { path: session, id },
+        })
+    }
+
+    pub(super) fn verified_cleanup_with(
+        &self,
+        name: &InstanceName,
+        policy: &LifecyclePolicy,
+        cleanup: impl FnOnce() -> Result<CleanupReport>,
+    ) -> Result<CleanupReport> {
+        let deadline = Deadline::after(policy.startup_docker + policy.cleanup * 2);
+        let mut requested: Option<(String, PathBuf)> = None;
+        let claimed = self.read_owner(name)?;
+        loop {
+            if let Some(_owner) = self.try_lock(&format!("{name}.start.lock"))? {
+                if self.read_owner(name)? != claimed {
+                    return Err(superseded(name, &requested)?);
+                }
+                if let Some((target, request)) = &requested {
+                    remove_if_present(request)?;
+                    if self.replaced_since(name, target)? {
+                        bail!(
+                            "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+                        );
+                    }
+                }
+                remove_if_present(&self.session_path(name))?;
+                let stopping = self.stopping_path(name);
+                fs::write(&stopping, "")?;
+                let _stopping = RemovedOnDrop(stopping);
+                let _lock = self.lock_instance(name)?;
+                return cleanup();
+            }
+            if self.read_owner(name)? != claimed {
+                return Err(superseded(name, &requested)?);
+            }
+            match (&requested, self.read_session(name)?) {
+                (None, Some(id)) => {
+                    let request = self.stop_request_path(name, &id);
+                    fs::write(&request, "")?;
+                    println!("Asking the launcher that owns {name} to stop…");
+                    requested = Some((id, request));
+                }
+                (Some((target, _)), Some(id)) if *target != id => bail!(
+                    "the launcher that owned {name} exited and a newer one took over; it was not stopped. Run `ths --name {name} stop` again to stop it"
+                ),
+                _ => {}
+            }
+            if deadline.expired() {
+                bail!("the launcher that owns {name} did not stop and clean up in time");
+            }
+            thread::sleep(policy.poll.min(deadline.remaining()));
+        }
+    }
+
+    fn replaced_since(&self, name: &InstanceName, target: &str) -> Result<bool> {
+        Ok(self.read_session(name)?.is_some_and(|id| id != target))
+    }
+
+    fn read_owner(&self, name: &InstanceName) -> Result<Option<String>> {
+        match fs::read_to_string(self.owner_path(name)) {
+            Ok(id) => Ok(Some(id.trim().to_owned())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading the environment owner"),
+        }
+    }
+
+    fn owner_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.owner"))
+    }
+
+    fn session_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.session"))
+    }
+
+    fn stopping_path(&self, name: &InstanceName) -> PathBuf {
+        self.root.join(".locks").join(format!("{name}.stopping"))
+    }
+
+    fn stop_request_path(&self, name: &InstanceName, session: &str) -> PathBuf {
+        self.root
+            .join(".locks")
+            .join(format!("{name}.{session}.stop"))
+    }
+
+    fn stop_requested(&self, name: &InstanceName) -> Result<bool> {
+        Ok(self
+            .read_session(name)?
+            .is_some_and(|id| self.stop_request_path(name, &id).exists()))
+    }
+
+    fn read_session(&self, name: &InstanceName) -> Result<Option<String>> {
+        match fs::read_to_string(self.session_path(name)) {
+            Ok(id) if !id.trim().is_empty() => Ok(Some(id.trim().to_owned())),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).context("reading the launcher session"),
+        }
+    }
+
+    fn try_lock(&self, file_name: &str) -> Result<Option<InstanceLock>> {
         let lock_dir = self.root.join(".locks");
         fs::create_dir_all(&lock_dir)?;
         let file = OpenOptions::new()
@@ -213,12 +473,10 @@ impl Runtime {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(lock_dir.join(format!("{name}.lock")))?;
+            .open(lock_dir.join(file_name))?;
         match file.try_lock() {
-            Ok(()) => Ok(InstanceLock(file)),
-            Err(TryLockError::WouldBlock) => {
-                bail!("environment {name} is already in use by another command")
-            }
+            Ok(()) => Ok(Some(InstanceLock(file))),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error).context("locking environment"),
         }
     }
@@ -279,6 +537,10 @@ pub(super) fn environment_status(
     instance: Instance,
     containers: Result<Vec<ContainerStatus>>,
 ) -> EnvironmentStatus {
+    let instance = Instance {
+        session: None,
+        ..instance
+    };
     let (state, containers) = match containers {
         Ok(containers) => (environment_state(&containers), containers),
         Err(_) => ("unknown", Vec::new()),

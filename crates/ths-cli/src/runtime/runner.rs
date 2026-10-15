@@ -35,6 +35,8 @@ impl Runtime {
                 .context("startup timeout is too large")?,
         );
         context.overall_deadline = Some(deadline);
+        host_ports(0)?;
+        let ownership = self.own_start(name, &shutdown, &context)?;
         let prepared = {
             let requested = || shutdown.try_interrupted();
             let docker = LifecycleDocker::production(
@@ -52,6 +54,7 @@ impl Runtime {
             })()
         };
         if let Err(error) = prepared {
+            let error = ownership.session().explain(name, error);
             let failures = context.finish_helpers(Deadline::after(context.policy.cleanup));
             if failures.is_empty() {
                 return Err(error);
@@ -65,15 +68,17 @@ impl Runtime {
                     .join("; ")
             ));
         }
-        self.run_with_policy(
+        self.run_owned(
             name,
             command,
             &std::env::current_dir().context("reading the current directory")?,
             &DockerHost,
             &shutdown,
             &context,
+            ownership,
         )
     }
+    #[cfg(test)]
     pub(super) fn run_with_policy(
         &self,
         name: &InstanceName,
@@ -84,7 +89,30 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<u8> {
         host_ports(0)?;
-        let _lifecycle = self.lock_instance(name)?;
+        let ownership = self.own_start(name, shutdown, context)?;
+        self.run_owned(
+            name,
+            command,
+            current_dir,
+            host,
+            shutdown,
+            context,
+            ownership,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_owned(
+        &self,
+        name: &InstanceName,
+        command: &[OsString],
+        current_dir: &Path,
+        host: &dyn StartHost,
+        shutdown: &Shutdown,
+        context: &LifecycleContext,
+        ownership: StartOwnership,
+    ) -> Result<u8> {
+        let session = ownership.session();
         let deadline = context.overall_deadline.context("missing run deadline")?;
         if deadline.expired() {
             bail!("environment did not start before the timeout");
@@ -145,6 +173,10 @@ impl Runtime {
             }
         }
         cleanup.state = CleanupGuard::Explicit;
+        let primary = primary.map_err(|error| session.explain(name, error));
+        if session.requested() && matches!(primary, Ok(ChildOutcome::Signaled)) {
+            eprintln!("{name} was stopped by another command.");
+        }
         let cleaned = host
             .delete_partial(self, name, context, Deadline::after(context.policy.cleanup))
             .and_then(CleanupReport::into_result);
