@@ -30,7 +30,7 @@ function PoolLabel({ pool }: { pool: Activity['source_pool'] }) {
         pool === 'ironwood' ? 'text-accent' : 'text-ink-muted',
       )}
     >
-      {pool}
+      {pool ?? 'unknown'}
     </span>
   );
 }
@@ -44,10 +44,13 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
   const id = useId();
   const errorId = activity.last_error ? id : undefined;
   const isFaucet = activity.kind === 'faucet';
+  const isIncoming = activity.direction === 'incoming';
   const transactionPath = activity.txid ? `/explorer/tx/${activity.txid}` : null;
   const transfer = isFaucet
     ? `Faucet → ${recipientLabel(activity)}`
-    : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`;
+    : isIncoming
+      ? `${activity.from_account === null ? 'External' : `Account ${activity.from_account}`} → ${recipientLabel(activity)}`
+      : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`;
   const navigate = useNavigate();
 
   return (
@@ -67,11 +70,11 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
             <span
               className={cn(
                 'xp-raised grid size-6 shrink-0 place-items-center rounded-xs',
-                isFaucet ? 'bg-accent-soft text-accent' : 'bg-raised text-ink-muted',
+                isFaucet || isIncoming ? 'bg-accent-soft text-accent' : 'bg-raised text-ink-muted',
               )}
               aria-hidden
             >
-              {isFaucet ? (
+              {isFaucet || isIncoming ? (
                 <ArrowDownToLine className="size-3" />
               ) : (
                 <ArrowRight className="size-3" />
@@ -113,9 +116,15 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
         <NumCell className="font-semibold">{formatZecAmount(activity.amount_zatoshi)}</NumCell>
 
         <NumCell className="text-ink-muted max-sm:hidden">
-          <time dateTime={activity.created_at} title={absoluteTime(activity.created_at)}>
-            {timeAgo(activity.created_at)}
-          </time>
+          {activity.created_at ? (
+            <time dateTime={activity.created_at} title={absoluteTime(activity.created_at)}>
+              {timeAgo(activity.created_at)}
+            </time>
+          ) : activity.mined_height !== null && activity.mined_height !== undefined ? (
+            `Block ${activity.mined_height}`
+          ) : (
+            <span aria-label="Time unknown">—</span>
+          )}
         </NumCell>
 
         <td className="text-right">

@@ -402,7 +402,7 @@ and Send dialogs, from a script or terminal:
 | Subcommand | What it does |
 | --- | --- |
 | `ths wallet balances` | Print each account's balances and addresses |
-| `ths wallet activity` | Print recent sends, shields, unshields, and faucet payments |
+| `ths wallet activity` | Print canonical incoming and outgoing wallet history, plus pending or failed payments |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
@@ -430,12 +430,16 @@ ths wallet balances --json
 
 ### `ths wallet activity [--limit <N>]`
 
-Prints recent activity recorded by the development wallet, newest first. The
-output distinguishes sends, shields, unshields, and faucet payments, and shows
-their status, route, amount, transaction ID and confirmation block (when
-available), creation time, and any retained payment error. External Regtest
-recipients are shown by their full address. Faucet routes are labeled `faucet`;
-the hidden treasury account is never exposed as a user account.
+Prints recent canonical activity for the five development accounts, newest
+first, together with pending or failed payment-journal entries. The output
+includes external incoming payments. Each transaction appears once; internal
+transfers retain both their source and destination accounts. It distinguishes
+receives, sends, shields, unshields, and faucet payments, and shows their
+status, route, amount,
+transaction ID and confirmation block (when available), creation time, and any
+retained payment error. External Regtest recipients are shown by their full
+address. Faucet routes are labeled `faucet`; the hidden treasury account is
+never exposed as a user account.
 
 Without `--limit`, the server's default of 30 entries is used. An explicit
 limit must be between 1 and 100. An environment with no activity prints a
@@ -449,7 +453,8 @@ ths wallet activity --limit 20 --json
 ```
 
 JSON output is the unmodified activity schema returned by
-`GET /api/v1/activity`, including `created_at` and nullable `block_hash`.
+`GET /api/v1/activity`, including transaction direction, pools, decoded text
+memos, mining metadata, `created_at`, and nullable `block_hash`.
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
