@@ -48,6 +48,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Status => runtime.status(&name, cli.json),
         Command::Open => runtime.open(&name),
         Command::Endpoints => runtime.endpoints(&name, cli.json),
+        Command::Rpc {
+            raw,
+            yes,
+            method,
+            params,
+        } => runtime.rpc(&name, &method, &params, raw, yes),
         Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
         Command::Faucet { address, amount } => {
             runtime.faucet(&name, &address, amount.zatoshi(), cli.json)

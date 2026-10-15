@@ -301,3 +301,59 @@ fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
     assert!(parse(&["--amount", "1"]).is_err());
     assert!(parse(&["--to", "2"]).is_err());
 }
+
+#[test]
+fn parses_rpc_method_params_and_flags() {
+    let cli = Cli::try_parse_from([
+        "ths",
+        "--name",
+        "alice",
+        "rpc",
+        "--raw",
+        "getblockhash",
+        "0",
+    ])
+    .unwrap();
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
+    let Some(Command::Rpc {
+        raw,
+        yes,
+        method,
+        params,
+    }) = cli.command
+    else {
+        panic!("expected rpc");
+    };
+    assert!(raw);
+    assert!(!yes);
+    assert_eq!(method, "getblockhash");
+    assert_eq!(params, ["0"]);
+
+    let cli = Cli::try_parse_from(["ths", "rpc", "getblockcount", "--raw"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Rpc {
+            raw: true,
+            yes: false,
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "rpc", "--yes", "stop"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Rpc {
+            raw: false,
+            yes: true,
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "rpc", "getblock", "-1"]).unwrap();
+    let Some(Command::Rpc { params, .. }) = cli.command else {
+        panic!("expected rpc");
+    };
+    assert_eq!(params, ["-1"]);
+
+    assert!(Cli::try_parse_from(["ths", "rpc"]).is_err());
+}
