@@ -1,3 +1,5 @@
+use crate::state::{AppState, notify};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -293,329 +295,49 @@ impl MiningCoordinator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
-    use tokio::sync::Semaphore;
+#[path = "../tests/unit/mining/tests.rs"]
+mod tests;
 
-    struct FakeRuntime {
-        permits: Semaphore,
-        sync_permits: Semaphore,
-        calls: AtomicU32,
-        scans: AtomicU32,
-        fail_call: u32,
-        panic_call: u32,
-        fail_sync: bool,
-    }
+struct ManualMiningAdapter(AppState);
 
-    impl FakeRuntime {
-        fn blocked() -> Self {
-            Self {
-                permits: Semaphore::new(0),
-                sync_permits: Semaphore::new(1),
-                calls: AtomicU32::new(0),
-                scans: AtomicU32::new(0),
-                fail_call: 0,
-                panic_call: 0,
-                fail_sync: false,
-            }
-        }
-
-        fn release(&self, count: u32) {
-            self.permits.add_permits(count as usize);
-        }
-
-        fn calls(&self) -> u32 {
-            self.calls.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl MiningRuntime for FakeRuntime {
-        async fn generate_one(&self) -> anyhow::Result<String> {
-            self.permits.acquire().await.unwrap().forget();
-            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            assert_ne!(call, self.panic_call, "injected worker panic");
-            anyhow::ensure!(call != self.fail_call, "injected RPC failure");
-            Ok(format!("{call:064x}"))
-        }
-
-        async fn synchronize(&self, tip_hash: &str) -> anyhow::Result<()> {
-            assert_eq!(tip_hash.len(), 64);
-            self.scans.fetch_add(1, Ordering::SeqCst);
-            self.sync_permits.acquire().await.unwrap().forget();
-            anyhow::ensure!(!self.fail_sync, "injected sync failure");
-            Ok(())
-        }
-
-        fn notify(&self, _topic: &'static str) {}
-    }
-
-    async fn terminal(mut updates: tokio::sync::watch::Receiver<MiningUpdate>) -> MiningUpdate {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let update = updates.borrow_and_update().clone();
-                if matches!(
-                    update.job.state,
-                    MiningState::Completed | MiningState::Failed
-                ) {
-                    return update;
-                }
-                updates.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn mining_continues_without_request_receiver() {
-        let runtime = Arc::new(FakeRuntime::blocked());
-        let jobs = Arc::new(MiningCoordinator::new());
-        let admission = jobs
-            .start(runtime.clone(), 3, "disconnect-test".into())
-            .await
-            .unwrap();
-        let id = admission.job.id;
-        let observer = admission.updates.clone();
-        drop(admission.updates);
-        runtime.release(3);
-        let update = terminal(observer).await;
-        assert_eq!(update.job.state, MiningState::Completed);
-        assert_eq!(update.hashes.unwrap().len(), 3);
-        let persisted = jobs.get(&id).await.unwrap();
-        assert_eq!(persisted.completed_blocks, 3);
-        assert_eq!(persisted.hashes.unwrap().len(), 3);
-        assert_eq!(runtime.calls(), 3);
-        assert_eq!(runtime.scans.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn mining_continues_with_zero_receivers() {
-        let runtime = Arc::new(FakeRuntime::blocked());
-        let jobs = Arc::new(MiningCoordinator::new());
-        let admission = jobs
-            .start(runtime.clone(), 2, "zero-receivers".into())
-            .await
-            .unwrap();
-        drop(admission.updates);
-        runtime.release(2);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let replay = jobs
-                    .start(runtime.clone(), 2, "zero-receivers".into())
-                    .await
-                    .unwrap();
-                if replay.job.state == MiningState::Completed {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(runtime.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn concurrent_replay_has_one_worker_and_conflicts_are_rejected() {
-        let runtime = Arc::new(FakeRuntime::blocked());
-        let jobs = Arc::new(MiningCoordinator::new());
-        let (first, replay) = tokio::join!(
-            jobs.start(runtime.clone(), 2, "same-key".into()),
-            jobs.start(runtime.clone(), 2, "same-key".into()),
+#[async_trait::async_trait]
+impl MiningRuntime for ManualMiningAdapter {
+    async fn generate_one(&self) -> anyhow::Result<String> {
+        let mut hashes = self.0.0.rpc.generate(1).await?;
+        anyhow::ensure!(
+            hashes.len() == 1 && !hashes[0].is_empty(),
+            "Zakura must return exactly one nonempty mined block hash"
         );
-        let first = first.unwrap();
-        assert_eq!(first.job.id, replay.unwrap().job.id);
-        assert!(matches!(
-            jobs.start(runtime.clone(), 3, "same-key".into()).await,
-            Err(MiningAdmissionError::KeyConflict)
-        ));
-        assert!(matches!(
-            jobs.start(runtime.clone(), 2, "other-key".into()).await,
-            Err(MiningAdmissionError::Busy)
-        ));
-        runtime.release(2);
-        terminal(first.updates).await;
-        assert_eq!(runtime.calls(), 2);
+        Ok(hashes.remove(0))
     }
 
-    #[tokio::test]
-    async fn validates_blocks_and_keys() {
-        let runtime = Arc::new(FakeRuntime::blocked());
-        let jobs = Arc::new(MiningCoordinator::new());
-        for blocks in [0, 10_001] {
-            assert!(matches!(
-                jobs.start(runtime.clone(), blocks, "valid-key".into())
-                    .await,
-                Err(MiningAdmissionError::InvalidBlocks)
-            ));
-        }
-        for key in [
-            "short".into(),
-            "x".repeat(129),
-            "space key".into(),
-            "nonasciié".into(),
-            "control\n".into(),
-        ] {
-            assert!(matches!(
-                jobs.start(runtime.clone(), 1, key).await,
-                Err(MiningAdmissionError::InvalidKey)
-            ));
-        }
-        assert!(jobs.latest().await.is_none());
+    async fn synchronize(&self, tip_hash: &str) -> anyhow::Result<()> {
+        let height = self
+            .0
+            .0
+            .rpc
+            .block(tip_hash)
+            .await?
+            .pointer("/height")
+            .and_then(Value::as_u64)
+            .context("Zakura mined block omitted its height")?;
+        self.0.synchronize_wallet(Some(height)).await
     }
 
-    #[tokio::test]
-    async fn capacity_keeps_old_replays_and_history_without_eviction() {
-        let runtime = Arc::new(FakeRuntime::blocked());
-        let jobs = Arc::new(MiningCoordinator::with_capacity(2));
-        let first = jobs
-            .start(runtime.clone(), 1, "first-key".into())
-            .await
-            .unwrap();
-        let first_id = first.job.id;
-        runtime.release(1);
-        terminal(first.updates).await;
-        runtime.sync_permits.add_permits(1);
-        let second = jobs
-            .start(runtime.clone(), 1, "second-key".into())
-            .await
-            .unwrap();
-        let second_id = second.job.id;
-        runtime.release(1);
-        terminal(second.updates).await;
-        assert!(matches!(
-            jobs.start(runtime.clone(), 1, "third-key".into()).await,
-            Err(MiningAdmissionError::Capacity)
-        ));
-        let replay = jobs
-            .start(runtime.clone(), 1, "first-key".into())
-            .await
-            .unwrap();
-        assert_eq!(replay.job.id, first_id);
-        assert_eq!(replay.updates.borrow().job.id, first_id);
-        assert!(replay.updates.borrow().hashes.is_none());
-        assert_eq!(jobs.latest().await.unwrap().id, second_id);
-        assert!(jobs.get(&first_id).await.is_some());
-        assert!(jobs.get("unknown").await.is_none());
-        assert_eq!(runtime.calls(), 2);
+    fn notify(&self, topic: &'static str) {
+        notify(&self.0, topic);
     }
+}
 
-    #[tokio::test]
-    async fn rpc_failure_preserves_acknowledged_count_without_retry() {
-        let runtime = Arc::new(FakeRuntime {
-            fail_call: 2,
-            ..FakeRuntime::blocked()
-        });
-        let jobs = Arc::new(MiningCoordinator::new());
-        let first = jobs
-            .start(runtime.clone(), 3, "failure-key".into())
-            .await
-            .unwrap();
-        let id = first.job.id;
-        runtime.release(3);
-        let failed = terminal(first.updates).await.job;
-        assert_eq!(failed.state, MiningState::Failed);
-        assert_eq!(failed.completed_blocks, 1);
-        assert!(failed.progress_uncertain);
-        assert!(failed.error.unwrap().contains("injected RPC failure"));
-        let replay = jobs
-            .start(runtime.clone(), 3, "failure-key".into())
-            .await
-            .unwrap();
-        assert_eq!(replay.job.id, id);
-        assert_eq!(replay.job.state, MiningState::Failed);
-        assert_eq!(runtime.calls(), 2);
-        assert_eq!(runtime.scans.load(Ordering::SeqCst), 0);
-        runtime.sync_permits.add_permits(1);
-        let next = jobs
-            .start(runtime.clone(), 1, "next-key".into())
-            .await
-            .unwrap();
-        terminal(next.updates).await;
-        assert_eq!(runtime.calls(), 3);
-    }
-
-    #[tokio::test]
-    async fn synchronization_failure_has_full_known_count() {
-        let runtime = Arc::new(FakeRuntime {
-            fail_sync: true,
-            ..FakeRuntime::blocked()
-        });
-        let jobs = Arc::new(MiningCoordinator::new());
-        let admission = jobs
-            .start(runtime.clone(), 2, "sync-failure".into())
-            .await
-            .unwrap();
-        runtime.release(2);
-        let failed = terminal(admission.updates).await.job;
-        assert_eq!(failed.state, MiningState::Failed);
-        assert_eq!(failed.completed_blocks, 2);
-        assert!(!failed.progress_uncertain);
-        assert!(failed.hashes.is_none());
-        assert!(
-            failed
-                .error
-                .unwrap()
-                .starts_with("Blocks mined, but wallet synchronization failed")
-        );
-        assert_eq!(runtime.calls(), 2);
-    }
-
-    #[tokio::test]
-    async fn syncing_keeps_admission_busy() {
-        let runtime = Arc::new(FakeRuntime {
-            sync_permits: Semaphore::new(0),
-            ..FakeRuntime::blocked()
-        });
-        let jobs = Arc::new(MiningCoordinator::new());
-        let mut admission = jobs
-            .start(runtime.clone(), 1, "syncing-key".into())
-            .await
-            .unwrap();
-        runtime.release(1);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while admission.updates.borrow_and_update().job.state != MiningState::Syncing {
-                admission.updates.changed().await.unwrap();
-            }
-        })
-        .await
-        .unwrap();
-        assert!(matches!(
-            jobs.start(runtime.clone(), 1, "other-key".into()).await,
-            Err(MiningAdmissionError::Busy)
-        ));
-        runtime.sync_permits.add_permits(1);
-        terminal(admission.updates).await;
-    }
-
-    #[tokio::test]
-    async fn worker_panic_publishes_failure_and_releases_admission() {
-        let runtime = Arc::new(FakeRuntime {
-            panic_call: 2,
-            ..FakeRuntime::blocked()
-        });
-        let jobs = Arc::new(MiningCoordinator::new());
-        let admission = jobs
-            .start(runtime.clone(), 3, "panic-key".into())
-            .await
-            .unwrap();
-        runtime.release(3);
-        let failed = terminal(admission.updates).await.job;
-        assert_eq!(failed.state, MiningState::Failed);
-        assert_eq!(failed.completed_blocks, 1);
-        assert!(failed.progress_uncertain);
-        assert!(failed.error.unwrap().contains("worker"));
-        let next = jobs
-            .start(runtime.clone(), 1, "after-panic".into())
-            .await
-            .unwrap();
-        assert_eq!(
-            terminal(next.updates).await.job.state,
-            MiningState::Completed
-        );
-        assert_eq!(runtime.calls(), 3);
+impl AppState {
+    pub(crate) async fn start_mining(
+        &self,
+        blocks: u32,
+        key: String,
+    ) -> Result<Admission, MiningAdmissionError> {
+        let runtime: Arc<dyn MiningRuntime> = Arc::new(ManualMiningAdapter(self.clone()));
+        #[cfg(test)]
+        let runtime = self.0.mining_runtime.clone().unwrap_or(runtime);
+        self.0.mining.start(runtime, blocks, key).await
     }
 }
