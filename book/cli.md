@@ -137,9 +137,14 @@ ths pull
 
 ### `ths status [--json]`
 
-Shows whether the named environment's app container is running and prints its
-endpoints; it is not `/health` or a wallet-settlement check. JSON contains
-`name`, `running`, and `endpoints`.
+Shows the named environment's service state and endpoints. Like `ths list`, it
+checks the app, Zakura, and lightwalletd containers and reports `running`,
+`paused`, `degraded`, `stopped`, `conflict`, or `unknown`; the one-shot `init`
+container does not decide the overall state. It exits nonzero unless the state
+is `running`. It is not `/health` or a wallet-settlement check; use `ths wait`
+when a script needs the node, index, and wallet settled at one tip. JSON keeps
+the existing `name`, `running`, and `endpoints` fields and adds `state` and
+`containers`.
 
 ```console
 ths status
@@ -698,7 +703,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths run [--timeout] -- <command>` | Run a child in a fresh settled instance, then clean up |
 | `ths build [--dev]` | Build runtime images from source |
 | `ths pull` | Pull the exact images for this launcher version |
-| `ths status [--json]` | Show app-container running state and endpoints |
+| `ths status [--json]` | Show environment service state and endpoints |
 | `ths open` | Open the running dashboard |
 | `ths endpoints [--json \| --env]` | Print endpoints, or `export` lines for the variables `ths run` passes to its child |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |

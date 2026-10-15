@@ -28,7 +28,15 @@ case "$1 $2" in
             case "$2" in
                 *HostPort*) printf '%s\n' "$THS_TEST_PORT" ;;
                 *Running*) printf 'true\n' ;;
-                    *Created*) printf '2026-10-12T00:00:00Z\n' ;;
+                *Created*)
+                    state=running
+                    case "$3" in *-init) state=exited ;; esac
+                    if [ -n "${THS_TEST_EXITED_SERVICE:-}" ] &&
+                        [ "$3" = "ths-$THS_TEST_NAME-$THS_TEST_EXITED_SERVICE" ]; then
+                        state=exited
+                    fi
+                    printf '%s 2026-10-12T00:00:00Z 2026-10-12T00:01:00Z\n' "$state"
+                    ;;
                 *) exit 1 ;;
             esac
         else
