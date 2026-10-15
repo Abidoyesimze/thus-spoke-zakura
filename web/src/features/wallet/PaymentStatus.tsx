@@ -35,6 +35,7 @@ export function PaymentStatus({
   onHiddenFocus,
   focusRequest,
   onView,
+  onFollowTransaction,
 }: {
   identity: PaymentIdentity;
   restored: boolean;
@@ -50,6 +51,7 @@ export function PaymentStatus({
   onHiddenFocus: () => void;
   focusRequest: object | null;
   onView: () => void;
+  onFollowTransaction: () => void;
 }) {
   const status = usePaymentStatus(identity.key, true);
   const activity = status.data;
@@ -303,6 +305,7 @@ export function PaymentStatus({
               className="text-accent-strong self-center underline underline-offset-2"
               aria-describedby={titleId}
               to={`/explorer/tx/${activity.txid}`}
+              onClick={onFollowTransaction}
             >
               View transaction
             </Link>
