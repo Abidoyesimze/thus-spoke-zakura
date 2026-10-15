@@ -131,6 +131,7 @@ fn environment(name: &str, states: [&str; 4]) -> EnvironmentStatus {
                 p2p: 18233,
             }),
             created_at: Some(1_000),
+            session: None,
         },
         state: environment_state(&containers),
         containers,
@@ -369,4 +370,86 @@ fn docker_timestamps_parse_to_unix_seconds() {
     // docker's zero time for a container that never started.
     assert_eq!(parse_docker_time("0001-01-01T00:00:00Z"), None);
     assert_eq!(parse_docker_time("not a time"), None);
+}
+
+#[test]
+fn start_refusal_names_what_holds_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let _held = runtime.claim_start(&alpha).unwrap();
+    let refusal = || match runtime.claim_start(&alpha) {
+        Ok(_) => panic!("a held start lock was claimed twice"),
+        Err(error) => error.to_string(),
+    };
+    let session = dir.path().join(".locks/alpha.session");
+    let stopping = dir.path().join(".locks/alpha.stopping");
+
+    assert_eq!(
+        refusal(),
+        "environment alpha is already in use by another command"
+    );
+    fs::write(&session, "session").unwrap();
+    assert!(refusal().contains("already running in another `ths start` or `ths run`"));
+    let request = dir.path().join(".locks/alpha.session.stop");
+    fs::write(&request, "").unwrap();
+    assert!(refusal().contains("being stopped or reset by another command"));
+    fs::remove_file(&request).unwrap();
+    fs::remove_file(&session).unwrap();
+    fs::write(&stopping, "").unwrap();
+    assert!(refusal().contains("being stopped or reset by another command"));
+}
+
+#[test]
+fn an_exiting_session_keeps_a_newer_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let (_sender, shutdown) = Shutdown::channel();
+    let session_file = dir.path().join(".locks/alpha.session");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+
+    let old = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    fs::write(&session_file, "newer-session").unwrap();
+    drop(old);
+    assert_eq!(fs::read_to_string(&session_file).unwrap(), "newer-session");
+
+    fs::remove_file(&session_file).unwrap();
+    let only = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    assert!(session_file.exists());
+    drop(only);
+    assert!(!session_file.exists());
+}
+
+#[test]
+fn listed_environments_do_not_expose_the_launcher_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+    fs::write(dir.path().join(".locks/alpha.session"), "secret-session").unwrap();
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    assert_eq!(
+        runtime.read_instance(&alpha).unwrap().session.as_deref(),
+        Some("secret-session")
+    );
+
+    let environments = runtime
+        .environments(&docker_holding(&[("app", Some("alpha"), "running")]))
+        .unwrap();
+    let listed = serde_json::to_string(&environments).unwrap();
+    assert!(!listed.contains("session"), "{listed}");
 }

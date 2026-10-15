@@ -2,6 +2,25 @@
 
 Run a complete, private Zcash development network on your computer.
 
+## Documentation
+
+**[Read the book →](https://amiabix.github.io/thus-spoke-zakura-book/)**
+
+It covers starting an instance, what each component owns, accounts and pools,
+funding and sending, mining and wallet synchronization, what an API response
+proves after a lost one, and connecting your own application. There is a
+[`ths` command reference](https://amiabix.github.io/thus-spoke-zakura-book/cli.html),
+a [guide to building from source](https://amiabix.github.io/thus-spoke-zakura-book/development.html),
+and a [troubleshooting appendix](https://amiabix.github.io/thus-spoke-zakura-book/troubleshooting.html).
+The sources live in [`book/`](book/README.md).
+
+Every page is also served as markdown for tools that read rather than browse:
+append `.md` instead of `.html` to any page,
+[`book.md`](https://amiabix.github.io/thus-spoke-zakura-book/book.md) is the
+whole book in one file, and
+[`llms.txt`](https://amiabix.github.io/thus-spoke-zakura-book/llms.txt) indexes
+both.
+
 Thus Spoke Zakura starts everything you need for local experiments:
 
 - a Zakura node on Regtest;
@@ -41,12 +60,20 @@ ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
 allocation identities. A per-name lock serializes startup, stop, and reset.
-`run` holds that lock until cleanup; ordinary foreground start releases it
-once ready so another command can stop the environment. Once ready,
-the foreground launcher watches the allocated app container and exits when
-another command deletes it, without deleting the environment again.
+`run` holds that lock until cleanup; foreground start releases it once ready.
+A second per-name lock is held by `start` or `run` until it exits, so another
+`start` or `run` with the same name is refused instead of replacing the
+running environment. While that launcher runs, `stop` and `reset --force` ask
+it to shut down, as Ctrl+C would, during startup, once ready, or while `run`'s
+command runs. They wait for its cleanup and then verify that nothing is left.
+Requests name the launcher's session, so a leftover request cannot stop a
+later launcher. A launcher stopped before it was ready exits with an error.
+Without a running launcher, `stop` and `reset --force` delete what is left
+themselves. The foreground launcher also watches the allocated app container
+and exits when it is deleted some other way, without deleting the environment
+again.
 
-![Wallet dashboard with five development accounts](docs/images/wallet.png)
+![Wallet dashboard with five development accounts](book/images/wallet.png)
 
 ## Get started
 
@@ -97,7 +124,7 @@ Open **Wallet**, select **Faucet**, choose an account and amount, and select
 **Add funds**. The faucet creates disposable Regtest ZEC and mines the block
 needed to confirm it.
 
-![Fund an account with the built-in faucet](docs/images/faucet.png)
+![Fund an account with the built-in faucet](book/images/faucet.png)
 
 Faucet requests are limited to 5 ZEC. These coins have no value and work only
 inside this local environment.
@@ -121,7 +148,13 @@ When the destination pool is Ironwood, you can add an optional memo of up to
 512 bytes. It is encrypted to the recipient and never shown in the explorer.
 Transparent outputs cannot carry a memo, so the field is disabled for them.
 
-![Send ZEC between development accounts](docs/images/send.png)
+![Send ZEC between development accounts](book/images/send.png)
+
+The Send dialog also accepts a Regtest address or a single-payment ZIP-321 URI.
+Apply an edited URI, or clear it, before sending. Wallet's **Request** button
+creates a copyable URI and QR code for a development account without moving
+funds. See the book's [payment request walkthrough](https://amiabix.github.io/thus-spoke-zakura-book/using-the-dashboard.html#payment-request)
+and [API reference](https://amiabix.github.io/thus-spoke-zakura-book/connect-an-app.html#the-rest-of-the-api-surface).
 
 The same transfer from a terminal:
 
@@ -252,7 +285,7 @@ job continues after that timeout or a client disconnection. Inspect the latest
 job before issuing another command. Each legacy request uses a fresh internal
 key, so repeating a command after completion starts another job.
 
-![Mine blocks on the local Regtest network](docs/images/mine.png)
+![Mine blocks on the local Regtest network](book/images/mine.png)
 
 ### Explore blocks and transactions
 
@@ -260,7 +293,7 @@ The **Explorer** lists recent blocks. Search by block height, block hash,
 transaction ID, or transparent address, then open an item to inspect its
 details.
 
-![Local Regtest block explorer](docs/images/explorer.png)
+![Local Regtest block explorer](book/images/explorer.png)
 
 ### Connect your own application
 
@@ -275,7 +308,7 @@ The default instance always binds loopback ports:
 
 If a port is already taken, `ths start` exits and names that port. It does not pick a random host port.
 
-![Network health and runtime endpoints](docs/images/network.png)
+![Network health and runtime endpoints](book/images/network.png)
 
 ```console
 ths endpoints
@@ -351,6 +384,7 @@ Running `ths` with no command starts the default environment.
 | --- | --- |
 | `ths` | Start a fresh environment and open the dashboard. Readiness is 120 seconds per phase, ordinary startup commands are 30 seconds, initialization is 120 seconds, and cleanup is a separate 120 seconds |
 | `ths start --no-open` | Start without opening a browser, with the same phase budgets as `ths` |
+| `ths --json start --no-open` | Print endpoints as JSON on stdout, with startup diagnostics on stderr |
 | `ths start --port-offset 10` | Start on loopback ports shifted by 10 for another instance |
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
@@ -363,6 +397,7 @@ Running `ths` with no command starts the default environment.
 | `ths wallet balances` | Print each development account's balances and addresses |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury; repeat the same command to check pending payments |
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo; repeat the same command to check a pending payment |
+| `ths wallet send --from 1 --to 2 --max` | Send the source pool's maximum spendable balance after the server-calculated fee |
 | `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address; repeat the same command to check a pending payment |
 | `ths wallet activity --limit 20` | Print recent wallet transfers and faucet activity |
 | `ths wallet shield --from 1 --to 2 --amount 0.5` | Spend transparent funds into the same or another account's Ironwood balance |
@@ -382,7 +417,7 @@ Running `ths` with no command starts the default environment.
 | `ths uninstall` | Remove the installed launcher executable |
 
 Everything under `ths wallet` acts on the development wallet held by the
-running `ths` server. See [docs/cli.md](docs/cli.md) for the full command
+running `ths` server. See [book/cli.md](book/cli.md) for the full command
 reference, including every `ths wallet` option, memo rules, and more examples.
 
 Every command accepts `--name` for isolated environments:
@@ -571,8 +606,10 @@ payment has a recorded error.
 A hidden sixth account acts as the mining and faucet
 treasury. Account 1 starts with 5 Ironwood ZEC, so you can experiment immediately.
 
-The local chain activates every network upgrade through NU6.3 at height 1, so it
-follows mainnet's current consensus rules. Shielded funds live in the Ironwood
+The local chain activates every network upgrade through NU7 at height 1.
+NU7 applies a 25-second block target, shielded action limits, and transaction
+fee recycling into the network sustainability mechanism (NSM). `ths mine`
+still generates blocks on demand. Shielded funds live in the Ironwood
 pool. The Orchard pool stopped accepting deposits at NU6.3, so the wallet API
 rejects `orchard` as a pool.
 

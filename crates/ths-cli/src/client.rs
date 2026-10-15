@@ -260,6 +260,49 @@ struct PaymentUri {
     memo: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SendQuote {
+    max_zatoshi: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransferAmount {
+    Exact(u64),
+    Max,
+}
+
+fn quote_max_amount(
+    client: &reqwest::blocking::Client,
+    dashboard: &str,
+    name: &InstanceName,
+    deadline: Instant,
+    from: u8,
+    source_pool: &str,
+    destination_pool: &str,
+) -> Result<u64> {
+    let timeout = remaining(deadline)
+        .ok_or_else(|| anyhow!("maximum transfer quote timed out"))
+        .with_context(|| format!("asking environment {name} for the maximum transfer amount"))?;
+    let quote: SendQuote = client
+        .post(format!("{dashboard}/api/v1/send/quote"))
+        .json(&serde_json::json!({
+            "from_account": from,
+            "source_pool": source_pool,
+            "destination_pool": destination_pool,
+        }))
+        .timeout(timeout)
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .with_context(|| format!("asking environment {name} for the maximum transfer amount"))?;
+    if quote.max_zatoshi == 0 {
+        bail!(
+            "account {from} has no spendable {source_pool} funds remaining after the network fee"
+        );
+    }
+    Ok(quote.max_zatoshi)
+}
+
 impl Runtime {
     fn instance_client(&self, name: &InstanceName) -> Result<(String, reqwest::blocking::Client)> {
         let app_container = format!("{}-app", prefix(name));
@@ -571,26 +614,60 @@ impl Runtime {
         to: u8,
         source_pool: &str,
         destination_pool: &str,
-        amount_zatoshi: u64,
+        amount: TransferAmount,
         memo: Option<&str>,
         json: bool,
     ) -> Result<()> {
         let (dashboard, client) = self.instance_client(name)?;
-        self.submit_send(
+        self.wallet_send_with(
             name,
             &dashboard,
             &client,
             std::io::stdout().lock(),
             Instant::now() + PAYMENT_WAIT,
             from,
+            to,
+            source_pool,
+            destination_pool,
+            amount,
+            memo,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn wallet_send_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        out: impl std::io::Write,
+        deadline: Instant,
+        from: u8,
+        to: u8,
+        source_pool: &str,
+        destination_pool: &str,
+        amount: TransferAmount,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        self.submit_transfer(
+            name,
+            dashboard,
+            client,
+            out,
+            deadline,
+            from,
+            amount,
             serde_json::json!({
                 "from_account": from,
                 "to_account": to,
                 "source_pool": source_pool,
                 "destination_pool": destination_pool,
-                "amount_zatoshi": amount_zatoshi,
                 "memo": memo,
             }),
+            source_pool,
+            destination_pool,
             memo,
             json,
         )
@@ -604,7 +681,7 @@ impl Runtime {
         from: u8,
         source_pool: &str,
         uri: &str,
-        amount_zatoshi: Option<u64>,
+        amount: Option<TransferAmount>,
         json: bool,
     ) -> Result<()> {
         let (dashboard, client) = self.instance_client(name)?;
@@ -615,7 +692,7 @@ impl Runtime {
             from,
             source_pool,
             uri,
-            amount_zatoshi,
+            amount,
             json,
         )
     }
@@ -629,7 +706,7 @@ impl Runtime {
         from: u8,
         source_pool: &str,
         uri: &str,
-        amount_zatoshi: Option<u64>,
+        amount: Option<TransferAmount>,
         json: bool,
     ) -> Result<()> {
         let response = client
@@ -638,27 +715,138 @@ impl Runtime {
             .send()
             .with_context(|| format!("asking environment {name} to read the payment URI"))?;
         let request: PaymentUri = decode_response(response)?;
-        let amount_zatoshi = match (request.amount_zatoshi, amount_zatoshi) {
-            (Some(amount), None) | (None, Some(amount)) => amount,
-            (Some(_), Some(_)) => bail!("the payment URI already sets an amount; omit --amount"),
-            (None, None) => bail!("the payment URI has no amount; pass --amount"),
+        let amount = match (request.amount_zatoshi, amount) {
+            (Some(amount), None) => TransferAmount::Exact(amount),
+            (None, Some(amount)) => amount,
+            (Some(_), Some(TransferAmount::Exact(_))) => {
+                bail!("the payment URI already sets an amount; omit --amount")
+            }
+            (Some(_), Some(TransferAmount::Max)) => {
+                bail!("the payment URI already sets an amount; omit --max")
+            }
+            (None, None) => bail!("the payment URI has no amount; pass --amount or --max"),
         };
-        self.submit_send(
+        self.submit_transfer(
             name,
             dashboard,
             client,
             std::io::stdout().lock(),
             Instant::now() + PAYMENT_WAIT,
             from,
+            amount,
             serde_json::json!({
                 "from_account": from,
                 "to_address": request.address,
                 "source_pool": source_pool,
                 "destination_pool": request.destination_pool,
-                "amount_zatoshi": amount_zatoshi,
                 "memo": request.memo,
             }),
+            source_pool,
+            &request.destination_pool,
             request.memo.as_deref(),
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_transfer(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        out: impl std::io::Write,
+        deadline: Instant,
+        from: u8,
+        amount: TransferAmount,
+        mut body: serde_json::Value,
+        source_pool: &str,
+        destination_pool: &str,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        match amount {
+            TransferAmount::Exact(amount) => {
+                body["amount_zatoshi"] = amount.into();
+                self.submit_send(
+                    name, dashboard, client, out, deadline, from, body, memo, json,
+                )
+            }
+            TransferAmount::Max => self.submit_max_send(
+                name,
+                dashboard,
+                client,
+                out,
+                deadline,
+                from,
+                body,
+                source_pool,
+                destination_pool,
+                memo,
+                json,
+            ),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_max_send(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        out: impl std::io::Write,
+        deadline: Instant,
+        from: u8,
+        mut body: serde_json::Value,
+        source_pool: &str,
+        destination_pool: &str,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        let journal = IntentJournal::open(&self.instance_dir(name), "send")?;
+        let entries = journal.read()?;
+        let saved = entries.keys().find_map(|fingerprint| {
+            let value: serde_json::Value = serde_json::from_str(fingerprint).ok()?;
+            (value.get("amount_mode")?.as_str()? == "max" && value.get("request")? == &body).then(
+                || {
+                    value
+                        .get("amount_zatoshi")?
+                        .as_u64()
+                        .map(|amount| (fingerprint.clone(), amount))
+                },
+            )?
+        });
+        let (fingerprint, amount_zatoshi) = match saved {
+            Some(saved) => saved,
+            None => {
+                let amount = quote_max_amount(
+                    client,
+                    dashboard,
+                    name,
+                    deadline,
+                    from,
+                    source_pool,
+                    destination_pool,
+                )?;
+                let fingerprint = serde_json::to_string(&serde_json::json!({
+                    "amount_mode": "max",
+                    "amount_zatoshi": amount,
+                    "request": body.clone(),
+                }))?;
+                (fingerprint, amount)
+            }
+        };
+        body["amount_zatoshi"] = amount_zatoshi.into();
+        self.submit_send_with_journal(
+            &journal,
+            &fingerprint,
+            name,
+            dashboard,
+            client,
+            out,
+            deadline,
+            from,
+            body,
+            memo,
             json,
         )
     }
@@ -671,10 +859,10 @@ impl Runtime {
         name: &InstanceName,
         dashboard: &str,
         client: &reqwest::blocking::Client,
-        mut out: impl std::io::Write,
+        out: impl std::io::Write,
         deadline: Instant,
         from: u8,
-        mut body: serde_json::Value,
+        body: serde_json::Value,
         memo: Option<&str>,
         json: bool,
     ) -> Result<()> {
@@ -683,8 +871,38 @@ impl Runtime {
         // exactly: every field distinguishes intents, and an absent memo (`null`) differs from an
         // empty one.
         let fingerprint = serde_json::to_string(&body)?;
-        let resumed = journal.read()?.contains_key(&fingerprint);
-        let idempotency_key = journal.key_for(&fingerprint)?;
+        self.submit_send_with_journal(
+            &journal,
+            &fingerprint,
+            name,
+            dashboard,
+            client,
+            out,
+            deadline,
+            from,
+            body,
+            memo,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn submit_send_with_journal(
+        &self,
+        journal: &IntentJournal,
+        fingerprint: &str,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        deadline: Instant,
+        from: u8,
+        mut body: serde_json::Value,
+        memo: Option<&str>,
+        json: bool,
+    ) -> Result<()> {
+        let resumed = journal.read()?.contains_key(fingerprint);
+        let idempotency_key = journal.key_for(fingerprint)?;
         if resumed && !json {
             eprintln!("Checking the saved payment with idempotency key {idempotency_key}.");
         }
@@ -742,7 +960,7 @@ impl Runtime {
                 return Err(error.context(format!("asking environment {name} to send")));
             }
         };
-        journal.clear(&[(&fingerprint, &idempotency_key)])?;
+        journal.clear(&[(fingerprint, &idempotency_key)])?;
         if json {
             writeln!(out, "{}", serde_json::to_string_pretty(&activity)?)?;
         }

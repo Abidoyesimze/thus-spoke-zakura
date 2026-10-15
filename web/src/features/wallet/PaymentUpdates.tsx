@@ -106,6 +106,12 @@ export function PaymentUpdates() {
     (identity.kind === 'send' ? savedSend : savedFaucet).dismissKey(identity.key);
     requestAnimationFrame(() => focusNext(identity));
   };
+  const forget = async (identity: PaymentIdentity) => {
+    const operation = identity.kind === 'send' ? send : faucet;
+    const saved = identity.kind === 'send' ? savedSend : savedFaucet;
+    if (!(await operation.forget(identity, () => saved.forgetKey(identity.key)))) return;
+    requestAnimationFrame(() => focusNext(identity));
+  };
   const startNew = (identity: PaymentIdentity) => {
     closePayments();
     // Use a connected opener so closing the next form returns focus to the
@@ -283,11 +289,12 @@ export function PaymentUpdates() {
             onView={() => viewPayment(identity.key)}
             identity={identity}
             restored={isRestored(identity.key)}
-            pendingKey={operation.pendingKey}
+            inFlight={operation.isSubmitting(identity)}
             busy={send.isPending || faucet.isPending}
             claimAnnouncement={operation.claimAnnouncement}
             onTerminal={operation.clear}
             onResume={(item) => operation.resume(item)}
+            onForget={() => forget(identity)}
             onDismiss={() => dismiss(identity)}
             onNew={() => startNew(identity)}
           />

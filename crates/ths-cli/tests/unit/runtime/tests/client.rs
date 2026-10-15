@@ -240,10 +240,10 @@ fn uri_sends_resolve_the_amount_before_submission() {
     let alpha = name("alpha");
     fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
     for (parsed, amount, valid) in [
-        (WITH_AMOUNT, Some(123), false),
+        (WITH_AMOUNT, Some(TransferAmount::Exact(123)), false),
         (NO_AMOUNT, None, false),
         (WITH_AMOUNT, None, true),
-        (NO_AMOUNT, Some(123), true),
+        (NO_AMOUNT, Some(TransferAmount::Exact(123)), true),
     ] {
         let mut responses = vec![("200 OK", parsed)];
         if valid {
@@ -301,6 +301,321 @@ fn uri_sends_resolve_the_amount_before_submission() {
         );
         assert_eq!(requests.try_iter().count(), 1);
     }
+}
+
+#[test]
+fn max_send_quotes_then_submits_the_quoted_amount() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let confirmed = r#"{"id":"max-send","kind":"send","from_account":1,"to_account":2,"to_address":null,"source_pool":"ironwood","destination_pool":"transparent","amount_zatoshi":490,"txid":"max-txid","block_hash":"block","status":"confirmed","last_error":null}"#;
+    let (url, requests) = serve(vec![
+        (
+            "200 OK",
+            r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#,
+        ),
+        ("200 OK", confirmed),
+    ]);
+    let mut out = Vec::new();
+
+    runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            2,
+            "ironwood",
+            "transparent",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap();
+
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].0.starts_with("POST /api/v1/send/quote "));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&requests[0].1).unwrap(),
+        serde_json::json!({
+            "from_account": 1,
+            "source_pool": "ironwood",
+            "destination_pool": "transparent",
+        })
+    );
+    assert!(requests[1].0.starts_with("POST /api/v1/send "));
+    let submitted: serde_json::Value = serde_json::from_str(&requests[1].1).unwrap();
+    assert_eq!(submitted["amount_zatoshi"], 490);
+    assert_eq!(json_stdout(&out)["amount_zatoshi"], 490);
+}
+
+#[test]
+fn pending_max_send_reuses_its_quote_and_idempotency_key() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let pending = r#"{"id":"max-send","kind":"send","from_account":1,"to_account":2,"to_address":null,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":490,"txid":"max-txid","block_hash":null,"status":"broadcast","last_error":null}"#;
+    let (url, requests) = serve(vec![
+        (
+            "200 OK",
+            r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#,
+        ),
+        ("200 OK", pending),
+    ]);
+    let mut out = Vec::new();
+
+    runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_millis(500),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+    let first: Vec<_> = requests.try_iter().collect();
+    assert_eq!(first.len(), 2);
+    let original_key = sent_key(&first[1]);
+
+    let confirmed = r#"{"id":"max-send","kind":"send","from_account":1,"to_account":2,"to_address":null,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":490,"txid":"max-txid","block_hash":"block","status":"confirmed","last_error":null}"#;
+    let (url, requests) = serve(vec![("200 OK", confirmed)]);
+    out.clear();
+    runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap();
+
+    let retried: Vec<_> = requests.try_iter().collect();
+    assert_eq!(retried.len(), 1, "a retry must not request a new quote");
+    assert!(retried[0].0.starts_with("POST /api/v1/send "));
+    assert_eq!(sent_key(&retried[0]), original_key);
+    let body: serde_json::Value = serde_json::from_str(&retried[0].1).unwrap();
+    assert_eq!(body["amount_zatoshi"], 490);
+}
+
+#[test]
+fn zero_max_does_not_submit_a_payment() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![(
+        "200 OK",
+        r#"{"available_zatoshi":10,"fee_zatoshi":10,"max_zatoshi":0}"#,
+    )]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "account 1 has no spendable ironwood funds remaining after the network fee"
+    );
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].0.starts_with("POST /api/v1/send/quote "));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn max_quote_errors_are_reported_without_submitting() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![("503 Service Unavailable", "wallet is syncing")]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains(
+            "asking environment alpha for the maximum transfer amount: rejected (503 Service Unavailable): wallet is syncing"
+        ),
+        "{error:#}"
+    );
+    assert_eq!(requests.try_iter().count(), 1);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn delayed_max_quote_respects_the_payment_deadline_without_saving_an_intent() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![
+        (
+            "delay",
+            r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#.to_owned(),
+        ),
+        ("200 OK", activity_json("confirmed", "txid", None)),
+    ]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_millis(50),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    let error = format!("{error:#}");
+    assert!(error.contains("maximum transfer amount"), "{error}");
+    assert!(error.contains("timed out"), "{error}");
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].0.starts_with("POST /api/v1/send/quote "));
+    let journal = IntentJournal::open(&runtime.instance_dir(&alpha), "send").unwrap();
+    assert!(journal.read().unwrap().is_empty());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn expired_max_deadline_does_not_quote_submit_or_save_an_intent() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![(
+        "200 OK",
+        r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#,
+    )]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() - Duration::from_millis(1),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    let error = format!("{error:#}");
+    assert!(error.contains("maximum transfer amount"), "{error}");
+    assert!(error.contains("quote timed out"), "{error}");
+    assert!(requests.try_recv().is_err());
+    let journal = IntentJournal::open(&runtime.instance_dir(&alpha), "send").unwrap();
+    assert!(journal.read().unwrap().is_empty());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn uri_max_uses_the_parsed_destination_pool_for_the_quote() {
+    const PARSED: &str = r#"{"address":"uregtest1external","destination_pool":"ironwood","amount_zatoshi":null,"memo":"hi"}"#;
+    const CONFIRMED: &str = r#"{"id":"uri-max","kind":"send","from_account":1,"to_account":null,"to_address":"uregtest1external","source_pool":"transparent","destination_pool":"ironwood","amount_zatoshi":123,"txid":"uri-txid","block_hash":"block","status":"confirmed","last_error":null}"#;
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![
+        ("200 OK", PARSED),
+        (
+            "200 OK",
+            r#"{"available_zatoshi":133,"fee_zatoshi":10,"max_zatoshi":123}"#,
+        ),
+        ("200 OK", CONFIRMED),
+    ]);
+
+    runtime
+        .wallet_send_uri_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            1,
+            "transparent",
+            "zcash:uregtest1external",
+            Some(TransferAmount::Max),
+            true,
+        )
+        .unwrap();
+
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[1].0.starts_with("POST /api/v1/send/quote "));
+    let quote: serde_json::Value = serde_json::from_str(&requests[1].1).unwrap();
+    assert_eq!(quote["source_pool"], "transparent");
+    assert_eq!(quote["destination_pool"], "ironwood");
+    let submitted: serde_json::Value = serde_json::from_str(&requests[2].1).unwrap();
+    assert_eq!(submitted["amount_zatoshi"], 123);
+}
+
+#[test]
+fn uri_amount_rejects_max_before_quoting_or_submitting() {
+    const PARSED: &str = r#"{"address":"uregtest1external","destination_pool":"ironwood","amount_zatoshi":123,"memo":null}"#;
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![("200 OK", PARSED)]);
+
+    let error = runtime
+        .wallet_send_uri_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            1,
+            "ironwood",
+            "zcash:uregtest1external?amount=0.00000123",
+            Some(TransferAmount::Max),
+            true,
+        )
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "the payment URI already sets an amount; omit --max"
+    );
+    assert_eq!(requests.try_iter().count(), 1);
 }
 
 fn json_stdout(out: &[u8]) -> serde_json::Value {
