@@ -69,9 +69,10 @@ fn embedded_installer_receives_exact_version_and_destination() {
         "test \"$THS_VERSION\" = 4.5.6 && test \"$THS_INSTALL_DIR\" = /tmp/ths\n",
         &version,
         Path::new("/tmp/ths"),
+        false,
     )
     .unwrap();
-    assert!(run_installer("exit 7\n", &version, Path::new("/tmp/ths")).is_err());
+    assert!(run_installer("exit 7\n", &version, Path::new("/tmp/ths"), false).is_err());
 }
 
 #[test]
