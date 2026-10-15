@@ -752,10 +752,11 @@ impl Runtime {
                     endpoint_lines(&allocated.endpoints)
                 );
             }
+            ownership.release_lifecycle();
             if !no_open
                 && let Err(error) = host.open_url(&allocated.endpoints.dashboard, shutdown, context)
+                && !shutdown.try_interrupted()
             {
-                shutdown.check()?;
                 eprintln!("Warning: could not open the dashboard automatically: {error:#}");
                 eprintln!(
                     "The {name} environment is still running at {}. Run `ths --name {name} open` to open it later.",
@@ -765,7 +766,6 @@ impl Runtime {
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
             }
-            ownership.release_lifecycle();
             host.wait_for_shutdown(&allocated.app_container, shutdown)
         })();
         cleanup.state = CleanupGuard::Explicit;

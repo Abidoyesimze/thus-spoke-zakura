@@ -127,17 +127,19 @@ impl Fixture {
     }
 
     fn start_with_browser_failure(&self) -> Child {
+        self.start_with_browser_opener(
+            "#!/bin/sh\nprintf '%s\\n' called > \"$THS_TEST_OPEN_MARKER\"\nexit 1\n",
+        )
+    }
+
+    fn start_with_browser_opener(&self, script: &str) -> Child {
         let opener = if cfg!(target_os = "macos") {
             "open"
         } else {
             "xdg-open"
         };
         let opener_path = self.directory.path().join(opener);
-        fs::write(
-            &opener_path,
-            "#!/bin/sh\nprintf '%s\\n' called > \"$THS_TEST_OPEN_MARKER\"\nexit 1\n",
-        )
-        .unwrap();
+        fs::write(&opener_path, script).unwrap();
         fs::set_permissions(opener_path, fs::Permissions::from_mode(0o755)).unwrap();
 
         self.command()
@@ -374,7 +376,19 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
         }
         output
     });
-    let stderr_thread = thread::spawn(move || std::io::read_to_string(stderr).unwrap());
+    let (warning_sender, warning_receiver) = mpsc::channel();
+    let stderr_thread = thread::spawn(move || {
+        let mut output = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            if line.contains("could not open the dashboard automatically") {
+                let _ = warning_sender.send(());
+            }
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output
+    });
 
     assert!(
         ready_receiver.recv_timeout(Duration::from_secs(20)).is_ok(),
@@ -389,6 +403,12 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
     assert!(
         instance_dir.join("instance.json").exists(),
         "instance metadata was not written to the configured directory"
+    );
+    assert!(
+        warning_receiver
+            .recv_timeout(Duration::from_secs(20))
+            .is_ok(),
+        "launcher did not report the browser failure"
     );
 
     let stop_deadline = Instant::now() + Duration::from_secs(20);
@@ -442,6 +462,36 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
     assert_eq!(commands.matches("rm -f").count(), 4, "{commands}");
     assert_eq!(commands.matches("volume rm").count(), 4, "{commands}");
     assert_eq!(commands.matches("network rm").count(), 1, "{commands}");
+}
+
+#[test]
+fn json_start_stops_cleanly_during_browser_open() {
+    let fixture = Fixture::new();
+    let mut child = fixture.start_with_browser_opener(
+        "#!/bin/sh\nprintf '%s\\n' called > \"$THS_TEST_OPEN_MARKER\"\nsleep 30\n",
+    );
+    let marker = fixture.directory.path().join("open-marker");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !marker.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(marker.exists(), "browser opener was not invoked");
+
+    let stopped = fixture
+        .command()
+        .args(["--name", &fixture.name, "stop"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "ths stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let status = finish(&mut child);
+    let stdout = std::io::read_to_string(child.stdout.take().unwrap()).unwrap();
+    let stderr = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
+    assert!(status.success(), "launcher exited {status}: {stderr}");
+    serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
 }
 
 #[test]
