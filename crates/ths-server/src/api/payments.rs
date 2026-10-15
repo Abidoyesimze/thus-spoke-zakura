@@ -235,6 +235,7 @@ pub(crate) async fn faucet(
         return Err(ApiError::bad_request("amount must be greater than zero"));
     }
     require_pool(&req.pool, "pool")?;
+    require_non_dust_amount(req.amount_zatoshi, req.pool == "transparent")?;
     let pending = state.0.store.claim_faucet(
         req.account_id,
         &req.pool,
@@ -391,12 +392,22 @@ pub(crate) async fn faucet_address(
 ) -> ApiResult<PaymentResponse<FaucetAddressResponse>> {
     require_started(&state)?;
     require_key(&req.idempotency_key)?;
-    require_faucet_address(&req.address)?;
+    let address = require_faucet_address(&req.address)?;
     if req.amount_zatoshi == 0 || req.amount_zatoshi > 5 * ZATOSHIS_PER_ZEC {
         return Err(ApiError::bad_request(
             "amount must be greater than zero and no more than 5 ZEC",
         ));
     }
+    // The SDK falls back to a unified address's transparent receiver when it
+    // has neither a supported Orchard (Ironwood) nor Sapling receiver.
+    let transparent = match address {
+        Address::Transparent(_) => true,
+        Address::Unified(address) => {
+            address.has_transparent() && !address.has_orchard() && !address.has_sapling()
+        }
+        _ => false,
+    };
+    require_non_dust_amount(req.amount_zatoshi, transparent)?;
     // An existing external claim keeps its store even if the address later
     // becomes a development-account address.
     let destination = if state
@@ -435,6 +446,16 @@ pub(crate) async fn faucet_address(
 
 pub(crate) fn require_key(key: &str) -> ApiResult<()> {
     validate_idempotency_key(key).map_err(ApiError::bad_request)
+}
+
+fn require_non_dust_amount(amount_zatoshi: u64, transparent: bool) -> ApiResult<()> {
+    // Zakura's standard P2PKH and P2SH outputs both have a 54-zatoshi dust threshold.
+    if transparent && amount_zatoshi < 54 {
+        return Err(ApiError::bad_request(
+            "transparent outputs must be at least 54 zatoshi",
+        ));
+    }
+    Ok(())
 }
 
 fn require_pool(pool: &str, field: &str) -> ApiResult<()> {
@@ -487,6 +508,7 @@ fn validate_send(req: &SendRequest) -> ApiResult<(Recipient<'_>, Option<MemoByte
             "amount_zatoshi must be between 1 and {MAX_MONEY}"
         )));
     }
+    require_non_dust_amount(req.amount_zatoshi, req.destination_pool == "transparent")?;
     let memo = parse_memo(req.memo.as_deref(), &req.destination_pool)?;
     Ok((recipient, memo))
 }
@@ -520,9 +542,9 @@ fn require_user_account(id: u8) -> ApiResult<()> {
     }
 }
 
-fn require_faucet_address(value: &str) -> ApiResult<()> {
+fn require_faucet_address(value: &str) -> ApiResult<Address> {
     match Address::decode(&regtest_network(), value) {
-        Some(Address::Unified(_) | Address::Transparent(_)) => Ok(()),
+        Some(address @ (Address::Unified(_) | Address::Transparent(_))) => Ok(address),
         Some(_) => Err(ApiError::bad_request(
             "destination must be a unified or transparent Regtest address",
         )),
