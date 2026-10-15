@@ -285,11 +285,11 @@ impl ActivityEntry {
         self.from_account = journal.from_account;
         self.to_account = journal.to_account;
         self.to_address = journal.to_address.clone().or(self.to_address);
-        if let Some(address) = journal.to_address.as_ref() {
-            if !self.recipient_addresses.contains(address) {
-                self.recipient_addresses.push(address.clone());
-                self.recipient_addresses.sort();
-            }
+        if let Some(address) = journal.to_address.as_ref()
+            && !self.recipient_addresses.contains(address)
+        {
+            self.recipient_addresses.push(address.clone());
+            self.recipient_addresses.sort();
         }
         self.source_pool = Some(journal.source_pool.clone());
         self.destination_pool = Some(journal.destination_pool.clone());
