@@ -80,6 +80,10 @@ async fn require_loopback_host(request: Request, next: Next) -> Response {
     if is_loopback {
         next.run(request).await
     } else {
-        (StatusCode::FORBIDDEN, "Host must be a loopback address").into_response()
+        error::ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "Host must be a loopback address".into(),
+        }
+        .into_response()
     }
 }

@@ -46,6 +46,20 @@ async fn non_loopback_host_cannot_access_the_seed_endpoint() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        error,
+        serde_json::json!({
+            "error": {
+                "message": "Host must be a loopback address",
+                "status": 403
+            }
+        })
+    );
 }
 
 use super::*;
