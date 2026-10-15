@@ -381,6 +381,8 @@ Running `ths` with no command starts the default environment.
 | `ths status` | Show health and endpoint information |
 | `ths open` | Open the running dashboard |
 | `ths endpoints --json` | Print endpoints for scripts and developer tools |
+| `ths tx <TXID> [--json]` | Show explorer transaction data |
+| `ths block [ID] [--json]` | Show a block by height or hash, or the chain tip when omitted |
 | `ths run -- npm test` | Run a command in a fresh, settled environment and delete it afterward |
 | `ths --name protocol wait` | Wait for an existing environment to settle |
 | `ths mine 10` | Mine blocks on the running environment and synchronize its wallet |
