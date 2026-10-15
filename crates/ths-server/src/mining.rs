@@ -452,25 +452,53 @@ impl AppState {
     /// Mines one block outside the manual coordinator and synchronizes the
     /// wallet. Used by the interval and mempool background loops, so it never
     /// counts toward a manual mining job.
-    pub(crate) async fn mine_and_sync_background(&self) -> anyhow::Result<()> {
-        let mut hashes = self.0.rpc.generate(1).await?;
-        anyhow::ensure!(
-            hashes.len() == 1 && !hashes[0].is_empty(),
-            "Zakura must return exactly one nonempty mined block hash"
-        );
+    ///
+    /// Returns `Err(BackgroundMineError::Generation(_))` when no block was
+    /// produced (safe to retry with the same transaction set) and
+    /// `Err(BackgroundMineError::Sync(_))` when a block was produced but a
+    /// subsequent step failed (do not retry generation with the same set).
+    pub(crate) async fn mine_and_sync_background(&self) -> Result<(), BackgroundMineError> {
+        let mut hashes = self
+            .0
+            .rpc
+            .generate(1)
+            .await
+            .map_err(BackgroundMineError::Generation)?;
+        if hashes.len() != 1 || hashes[0].is_empty() {
+            return Err(BackgroundMineError::Generation(anyhow::anyhow!(
+                "Zakura must return exactly one nonempty mined block hash"
+            )));
+        }
         let tip_hash = hashes.remove(0);
         let height = self
             .0
             .rpc
             .block(&tip_hash)
-            .await?
-            .get("height")
-            .and_then(Value::as_u64)
-            .context("Zakura mined block omitted its height")?;
-        self.synchronize_wallet(Some(height)).await?;
+            .await
+            .and_then(|b| {
+                b.get("height")
+                    .and_then(Value::as_u64)
+                    .context("Zakura mined block omitted its height")
+            })
+            .map_err(BackgroundMineError::Sync)?;
+        self.synchronize_wallet(Some(height))
+            .await
+            .map_err(BackgroundMineError::Sync)?;
         notify(self, "chain");
         Ok(())
     }
+}
+
+/// Error from a background mine attempt, distinguishing whether a block was
+/// produced. Used by the interval and mempool loops to decide whether the
+/// same transaction set may be retried.
+#[derive(Debug)]
+pub(crate) enum BackgroundMineError {
+    /// `generate` failed; no block was produced. Safe to retry with the same set.
+    Generation(anyhow::Error),
+    /// A block was produced but a subsequent step (block-metadata fetch or
+    /// wallet sync) failed. Do not retry generation with the same transaction set.
+    Sync(anyhow::Error),
 }
 
 /// Mines an empty block every `block_time` once startup has finished. Interval
@@ -483,11 +511,20 @@ pub(crate) async fn interval_mining_loop(state: AppState, block_time: Duration) 
         if !state.started() || state.0.mining.is_active().await {
             continue;
         }
-        if let Err(error) = state.mine_and_sync_background().await {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                "background interval mining failed"
-            );
+        match state.mine_and_sync_background().await {
+            Ok(()) => {}
+            Err(BackgroundMineError::Generation(error)) => {
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background interval mining failed to generate a block"
+                );
+            }
+            Err(BackgroundMineError::Sync(error)) => {
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background interval mining produced a block but wallet sync failed"
+                );
+            }
         }
     }
 }
@@ -539,14 +576,29 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
         if state.0.mining.is_active().await {
             continue;
         }
-        // Record the set before mining: if the node includes it, the next read
-        // is empty; if not, the identical set is skipped until it changes.
-        attempted = Some(set);
-        if let Err(error) = state.mine_and_sync_background().await {
-            tracing::warn!(
-                error = %format_args!("{error:#}"),
-                "background mempool mining failed"
-            );
+        match state.mine_and_sync_background().await {
+            Ok(()) => {
+                // Block produced and synced; record the set so an unchanged
+                // mempool is skipped until a new transaction arrives.
+                attempted = Some(set);
+            }
+            Err(BackgroundMineError::Generation(error)) => {
+                // No block was produced; do not record the set so the same
+                // transactions are retried on the next poll.
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background mempool mining failed to generate a block"
+                );
+            }
+            Err(BackgroundMineError::Sync(error)) => {
+                // A block was produced; record the set to avoid re-mining the
+                // same transactions while sync is retried separately.
+                attempted = Some(set);
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background mempool mining produced a block but wallet sync failed"
+                );
+            }
         }
     }
 }

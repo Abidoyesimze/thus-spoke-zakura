@@ -448,8 +448,13 @@ The mutating subcommands attempt to mine a confirming block and
 print the resulting transaction ID. If auto-mining fails, activity may remain
 in `broadcast` state; `send`, `shield`, and `unshield` print a confirming block
 hash when one is available. In `interval`, `mempool`, and `manual` modes the
-command does not mine at all: it submits the payment and returns, and the
-payment is confirmed once the background task (or `ths mine`) produces a block.
+command submits the payment, then waits up to 30 seconds for a confirming
+block. In `interval` and `mempool` modes the background task usually produces
+that block within the wait; in `manual` mode no block is produced automatically,
+so the wait expires and the command exits with status 1 and a pending-payment
+message that includes the idempotency key. Running the same command again with
+the same arguments resumes the retained payment identity and waits for another
+30 seconds; `ths mine` in a separate terminal produces the confirming block.
 Pass `--json` for machine-readable output.
 
 ### `ths wallet balances`
