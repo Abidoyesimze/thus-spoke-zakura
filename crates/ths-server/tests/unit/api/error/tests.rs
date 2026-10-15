@@ -172,6 +172,21 @@ async fn request_parsing_errors_use_the_json_error_envelope() {
             "limit must be a whole number",
         ),
         (
+            post_json("/api/v1/mine", r#"{"blocks":"Content-Type"}"#),
+            "blocks must be between 1 and 10,000",
+        ),
+        (
+            post_json("/api/v1/mine", r#"{"blocks":"valid UTF-8"}"#),
+            "blocks must be between 1 and 10,000",
+        ),
+        (
+            Request::builder()
+                .uri("/api/v1/blocks/%FF")
+                .body(Body::empty())
+                .unwrap(),
+            "path must be valid text",
+        ),
+        (
             post_json(
                 "/api/v1/send",
                 r#"{"from_account":7,"to_account":2,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":1000,"idempotency_key":"envelope-check-2"}"#,
@@ -202,6 +217,48 @@ async fn request_parsing_errors_use_the_json_error_envelope() {
         assert_eq!(body["error"]["status"], 400, "{body}");
         assert_eq!(body["error"]["message"], message, "{body}");
     }
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/mine")
+                .body(Body::from(r#"{"blocks":1}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    let body = json_error_body(response).await;
+    assert_eq!(body["error"]["status"], 415, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Content-Type must be application/json",
+        "{body}"
+    );
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/mine")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allow = response
+        .headers()
+        .get(header::ALLOW)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        allow.split(',').any(|method| method.trim() == "POST"),
+        "{allow}"
+    );
+    let body = json_error_body(response).await;
+    assert_eq!(body["error"]["status"], 405, "{body}");
+    assert_eq!(body["error"]["message"], "method is not allowed", "{body}");
 }
 
 #[test]
@@ -264,8 +321,12 @@ fn parse_errors_use_the_same_language_as_handler_checks() {
             "request body must be valid JSON",
         ),
         (
-            "Expected request with `Content-Type: application/json`",
-            "Content-Type must be application/json",
+            "Failed to deserialize the JSON body into the target type: blocks: invalid type: string \"Content-Type\", expected u32 at line 1 column 28",
+            "blocks must be between 1 and 10,000",
+        ),
+        (
+            "Failed to deserialize the JSON body into the target type: blocks: invalid type: string \"valid UTF-8\", expected u32 at line 1 column 26",
+            "blocks must be between 1 and 10,000",
         ),
         (
             "Failed to deserialize query string: limit: invalid digit found in string",
@@ -346,6 +407,25 @@ fn parse_errors_use_the_same_language_as_handler_checks() {
         ),
         "amount_zatoshi must be greater than zero and no more than 5 ZEC"
     );
+}
+
+async fn json_error_body(response: axum::response::Response) -> Value {
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        panic!(
+            "expected a JSON error envelope, got {}",
+            String::from_utf8_lossy(&bytes)
+        )
+    })
 }
 
 fn post_json(uri: &str, body: &str) -> Request<Body> {

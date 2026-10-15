@@ -5,7 +5,8 @@ use axum::{
     Json,
     extract::{
         FromRequest, FromRequestParts, Request,
-        rejection::{JsonRejection, QueryRejection},
+        path::ErrorKind,
+        rejection::{JsonRejection, PathRejection, QueryRejection},
     },
     http::{StatusCode, request::Parts},
     response::{IntoResponse, Response},
@@ -102,7 +103,28 @@ where
         let path = req.uri().path().to_owned();
         match Json::<T>::from_request(req, state).await {
             Ok(Json(value)) => Ok(Self(value)),
-            Err(rejection) => Err(parsing_rejection(rejection, &path)),
+            Err(rejection) => Err(json_api_error(rejection, &path)),
+        }
+    }
+}
+
+/// Path extractor whose failures use the API error envelope.
+///
+/// A path such as `/api/v1/blocks/%FF` is invalid UTF-8 after decoding. Axum's
+/// `Path` extractor reports that as plain text, so the dashboard cannot read it.
+pub(crate) struct ApiPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ApiPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(value)) => Ok(Self(value)),
+            Err(rejection) => Err(path_api_error(rejection)),
         }
     }
 }
@@ -121,39 +143,67 @@ where
         let path = parts.uri.path().to_owned();
         match axum::extract::Query::<T>::from_request_parts(parts, state).await {
             Ok(axum::extract::Query(value)) => Ok(Self(value)),
-            Err(rejection) => Err(parsing_rejection(rejection, &path)),
+            Err(rejection) => Err(query_api_error(rejection, &path)),
         }
     }
 }
 
 /// JSON type mismatches arrive as 422. A body or query that does not match the
 /// handler's type is a malformed request, so the envelope reports 400.
-fn parsing_rejection(rejection: impl ParsingRejection, path: &str) -> ApiError {
-    let status = rejection.rejection_status();
+///
+/// The rejection variant decides the kind of failure. The diagnostic text is
+/// read only for a data error, because that text repeats the submitted value
+/// and a value such as `Content-Type` must not choose the message.
+fn json_api_error(rejection: JsonRejection, path: &str) -> ApiError {
+    let message = match &rejection {
+        JsonRejection::MissingJsonContentType(_) => {
+            "Content-Type must be application/json".to_owned()
+        }
+        JsonRejection::JsonSyntaxError(_) => "request body must be valid JSON".to_owned(),
+        JsonRejection::BytesRejection(_) => "request body could not be read".to_owned(),
+        JsonRejection::JsonDataError(_) => friendly_parse_message(&rejection.body_text(), path),
+        _ => friendly_parse_message(&rejection.body_text(), path),
+    };
     ApiError {
-        status: if status == StatusCode::UNPROCESSABLE_ENTITY {
-            StatusCode::BAD_REQUEST
-        } else {
-            status
+        status: client_status(rejection.status()),
+        message,
+    }
+}
+
+fn query_api_error(rejection: QueryRejection, path: &str) -> ApiError {
+    ApiError {
+        status: client_status(rejection.status()),
+        message: friendly_parse_message(&rejection.body_text(), path),
+    }
+}
+
+fn path_api_error(rejection: PathRejection) -> ApiError {
+    let message = match &rejection {
+        PathRejection::FailedToDeserializePathParams(error) => match error.kind() {
+            ErrorKind::InvalidUtf8InPathParam { .. } => "path must be valid text".to_owned(),
+            _ => "path is not valid".to_owned(),
         },
-        message: friendly_parse_message(&rejection.rejection_message(), path),
+        _ => "path is not valid".to_owned(),
+    };
+    ApiError {
+        status: rejection.status(),
+        message,
+    }
+}
+
+fn client_status(status: StatusCode) -> StatusCode {
+    if status == StatusCode::UNPROCESSABLE_ENTITY {
+        StatusCode::BAD_REQUEST
+    } else {
+        status
     }
 }
 
 /// Axum's rejection text names Rust types and a byte position in the body.
 /// Callers see the same kind of sentence a handler writes: which field, and
-/// what it must be.
+/// what it must be. This reads a data or query error only; content type, body
+/// buffering, and syntax errors are chosen from the rejection variant.
 fn friendly_parse_message(raw: &str, path: &str) -> String {
-    if raw.contains("Content-Type") {
-        return "Content-Type must be application/json".into();
-    }
-    if raw.starts_with("Failed to buffer the request body") {
-        return "request body could not be read".into();
-    }
-    if raw.contains("valid UTF-8") {
-        return "request body must be valid text".into();
-    }
-
     let detail = without_source_location(strip_parser_prefix(raw));
     if let Some(field) = missing_field(detail) {
         return format!("{field} is required");
@@ -261,31 +311,6 @@ fn generic_requirement(problem: &str) -> &'static str {
             "a whole number"
         }
         _ => "valid",
-    }
-}
-
-trait ParsingRejection {
-    fn rejection_status(&self) -> StatusCode;
-    fn rejection_message(&self) -> String;
-}
-
-impl ParsingRejection for JsonRejection {
-    fn rejection_status(&self) -> StatusCode {
-        JsonRejection::status(self)
-    }
-
-    fn rejection_message(&self) -> String {
-        JsonRejection::body_text(self)
-    }
-}
-
-impl ParsingRejection for QueryRejection {
-    fn rejection_status(&self) -> StatusCode {
-        QueryRejection::status(self)
-    }
-
-    fn rejection_message(&self) -> String {
-        QueryRejection::body_text(self)
     }
 }
 

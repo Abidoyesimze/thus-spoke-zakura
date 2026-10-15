@@ -1,17 +1,13 @@
-use super::error::{ApiError, ApiQuery, ApiResult, not_found};
+use super::error::{ApiError, ApiPath, ApiQuery, ApiResult, not_found};
 use crate::network::regtest_network;
 use crate::state::AppState;
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::StatusCode,
-};
+use axum::{Json, extract::State, http::StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zcash_keys::address::Address;
 pub(crate) async fn block(
     State(state): State<AppState>,
-    Path(id): Path<String>,
+    ApiPath(id): ApiPath<String>,
 ) -> ApiResult<Json<Value>> {
     let mut block = state
         .0
@@ -128,7 +124,7 @@ fn attach_transparent_prevouts(
 
 pub(crate) async fn transaction(
     State(state): State<AppState>,
-    Path(txid): Path<String>,
+    ApiPath(txid): ApiPath<String>,
 ) -> ApiResult<Json<Value>> {
     let mut tx = state
         .0
@@ -150,7 +146,7 @@ pub(crate) async fn mempool(State(state): State<AppState>) -> ApiResult<Json<Val
 }
 pub(crate) async fn address(
     State(state): State<AppState>,
-    Path(address): Path<String>,
+    ApiPath(address): ApiPath<String>,
 ) -> ApiResult<Json<Value>> {
     require_transparent_address(&address)?;
     let balance: Value = state
@@ -169,7 +165,7 @@ pub(crate) async fn search(
     ApiQuery(query): ApiQuery<SearchQuery>,
 ) -> ApiResult<Json<Value>> {
     if query.q.starts_with('t') {
-        return address(State(state), Path(query.q)).await;
+        return address(State(state), ApiPath(query.q)).await;
     }
     // Only a 64-character hash can also be a txid; anything else is answered by the block lookup.
     // Other node failures must surface rather than fall through to the transaction lookup.
