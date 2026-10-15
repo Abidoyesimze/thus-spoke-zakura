@@ -18,7 +18,7 @@ use super::recovery::{
 };
 use super::*;
 use crate::{
-    lifecycle::Cancellation,
+    lifecycle::{Cancellation, ChildOps},
     test_support::{HttpFixture, HttpMode, short_policy},
 };
 
@@ -332,6 +332,7 @@ fn script_docker<'a>(
         program: "/bin/sh".into(),
         prefix_args: vec![script.path().join("docker").to_string_lossy().into_owned()],
         env: Vec::new(),
+        child_ops: None,
     }
 }
 
