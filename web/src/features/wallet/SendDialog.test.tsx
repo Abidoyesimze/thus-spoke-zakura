@@ -1353,6 +1353,77 @@ describe('SendDialog', () => {
     expect(body(fetchMock)).not.toHaveProperty('to_account');
   });
 
+  it('does not send a stale draft after the fee quote resolves', async () => {
+    let finishQuote!: (response: Response) => void;
+    const quoting = new Promise<Response>((resolve) => {
+      finishQuote = resolve;
+    });
+    fetchMock.mockImplementation((input, init) =>
+      requestUrl(input).endsWith('/send/quote') ? quoting : sendImpl(QUOTE)(input, init),
+    );
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Checking fee…' })).toBeDisabled(),
+    );
+    fireEvent.change(screen.getByLabelText('Amount (ZEC)'), { target: { value: '2' } });
+
+    await act(async () => {
+      finishQuote(
+        new Response(JSON.stringify(QUOTE), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      await quoting;
+    });
+
+    expect(sendCalls(fetchMock)).toHaveLength(0);
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('2');
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'The send details changed while checking the fee.',
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock).amount_zatoshi).toBe(200_000_000);
+  });
+
+  it('allows only one send submission while the initial fee quote is pending', async () => {
+    let finishQuote!: (response: Response) => void;
+    const quoting = new Promise<Response>((resolve) => {
+      finishQuote = resolve;
+    });
+    fetchMock.mockImplementation((input, init) =>
+      requestUrl(input).endsWith('/send/quote') ? quoting : sendImpl(QUOTE)(input, init),
+    );
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    const form = screen.getByRole('button', { name: /Send ZEC/i }).closest('form');
+    expect(form).not.toBeNull();
+
+    act(() => {
+      fireEvent.submit(form!);
+      fireEvent.submit(form!);
+    });
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: 'Checking fee…' })).toBeDisabled(),
+    );
+
+    await act(async () => {
+      finishQuote(
+        new Response(JSON.stringify(QUOTE), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      await quoting;
+    });
+
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock).amount_zatoshi).toBe(100_000_000);
+  });
+
   it.each([false, true])(
     'cancels a waiting send when URI parsing starts (parsing finished: %s)',
     async (parsingFinished) => {
