@@ -1,16 +1,21 @@
 import { zodResolver } from '@hookform/resolvers/zod';
-import { useEffect } from 'react';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { ArrowRight } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
 import { useToast } from '@/components/ui/toast-context';
-import { errorMessage, type Account } from '@/lib/api';
+import { errorMessage, type Account, type PaymentUri } from '@/lib/api';
+import { shortHash } from '@/lib/format';
 import { formatZec, formatZecAmount } from '@/lib/money';
-import { useSend } from '@/hooks/mutations';
+import { useParsePaymentUri, type PaymentResult, type SendVariables } from '@/hooks/mutations';
+import { paymentName, type PaymentIdentity } from '@/hooks/payment-identity';
+import { isTerminalPayment, usePaymentStatus } from '@/hooks/queries';
+import { useWalletPayments } from './payment-context';
 import { useSendQuote } from '@/hooks/queries';
 import {
+  ADDRESS_DESTINATION,
   MEMO_MAX_BYTES,
   memoByteLength,
   sendSchema,
@@ -21,35 +26,143 @@ import { controlStyles } from '@/components/ui/control-styles';
 import { cn } from '@/lib/cn';
 import { SelectField } from './fields';
 import { POOL_OPTIONS, accountOptions } from './field-options';
+import { PaymentWarning } from './PaymentStatus';
 
 export function SendDialog({
   open,
   onOpenChange,
   accounts,
   defaultAccountId,
+  draft,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   accounts: Account[];
   defaultAccountId?: number;
+  draft?: PaymentIdentity | undefined;
 }) {
   const toast = useToast();
-  const send = useSend();
-  const fromAccountId = defaultAccountId ?? 1;
+  const parseUri = useParsePaymentUri();
+  const [paymentUri, setPaymentUri] = useState('');
+  const paymentUriRevision = useRef(0);
+  const [paymentUriNeedsApply, setPaymentUriNeedsApply] = useState(false);
+  const {
+    send,
+    savedSend: payments,
+    send: sendOperation,
+    faucet: faucetOperation,
+    viewPayment,
+  } = useWalletPayments();
+  const busy = sendOperation.isPending || faucetOperation.isPending;
+  const mounted = useRef(true);
+  const [submittedHere, setSubmittedHere] = useState(false);
+  const [receipt, setReceipt] = useState<{
+    text: string;
+    kind: 'accepted' | 'error';
+    key?: string | undefined;
+  } | null>(null);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const previous = draft?.kind === 'send' ? draft.variables : undefined;
+  const fromAccountId = previous?.from_account ?? defaultAccountId ?? 1;
 
   const form = useForm<SendInput, unknown, SendValues>({
     resolver: zodResolver(sendSchema),
     defaultValues: {
       from_account: String(fromAccountId),
-      to_account: String(accounts.find((account) => account.id !== fromAccountId)?.id ?? 1),
-      source_pool: 'ironwood',
-      destination_pool: 'ironwood',
-      amount: '1',
-      memo: '',
+      to_account: previous?.to_address
+        ? ADDRESS_DESTINATION
+        : String(
+            previous?.to_account ??
+              accounts.find((account) => account.id !== fromAccountId)?.id ??
+              1,
+          ),
+      to_address: previous?.to_address ?? '',
+      source_pool: previous?.source_pool ?? 'ironwood',
+      destination_pool: previous?.destination_pool ?? 'ironwood',
+      amount: previous ? formatZec(previous.amount_zatoshi, { grouping: false }) : '1',
+      memo: previous?.memo ?? '',
+    },
+  });
+
+  const current = sendSchema.safeParse(useWatch({ control: form.control }));
+  const variablesFor = (values: SendValues) => ({
+    from_account: values.from_account,
+    ...(values.to_account === ADDRESS_DESTINATION
+      ? { to_address: values.to_address }
+      : { to_account: values.to_account }),
+    source_pool: values.source_pool,
+    destination_pool: values.destination_pool,
+    amount_zatoshi: values.amount,
+    ...(values.memo === '' ? {} : { memo: values.memo }),
+  });
+  // A blank field represents both absent and explicit empty saved memos.
+  // Compare their form values here; Resume still sends the original identity.
+  const formName = (variables: SendVariables) =>
+    paymentName('send', { ...variables, memo: variables.memo ?? '' });
+  const retainedFor = (variables: SendVariables) =>
+    payments.retained.find(
+      (item) => item.kind === 'send' && formName(item.variables) === formName(variables),
+    );
+  const match = current.success ? retainedFor(variablesFor(current.data)) : undefined;
+  const matchStatus = usePaymentStatus(match?.key ?? '', Boolean(match));
+  const matchTerminal = isTerminalPayment(matchStatus.data);
+  const retryLabel = match && !matchTerminal ? `Resume payment` : null;
+  const announce = ({ activity, key }: PaymentResult) => {
+    if (!send.claimAnnouncement(key)) return;
+    toast.success(
+      activity.to_account === null
+        ? `Sent to ${shortHash(activity.to_address ?? '', 14, 6)}`
+        : `Sent to Account ${activity.to_account}`,
+      `${formatZecAmount(activity.amount_zatoshi)} confirmed.`,
+    );
+  };
+  const failed = (error: Error, _variables: SendVariables, key: string | undefined) => {
+    if (!mounted.current) return;
+    setReceipt({ text: errorMessage(error), kind: 'error', key });
+  };
+  // A direct confirmation finishes only the submitted draft. Inputs remain
+  // editable during the POST, and a later confirmation must preserve edits.
+  const submitted = (uriRevision: number) => ({
+    onError: failed,
+    onSuccess: (result: PaymentResult, variables: SendVariables) => {
+      if (!mounted.current) return;
+      if (result.activity.status === 'confirmed') announce(result);
+      if (result.activity.status === 'failed') {
+        setReceipt({
+          text: `Payment failed: ${result.activity.last_error ?? 'The server rejected this payment.'}`,
+          kind: 'error',
+          key: result.key,
+        });
+        return;
+      }
+      if (result.cleanupError) return;
+      const draft = sendSchema.safeParse(form.getValues());
+      if (
+        uriRevision !== paymentUriRevision.current ||
+        !draft.success ||
+        formName(variablesFor(draft.data)) !== formName(variables)
+      ) {
+        setReceipt({
+          text: `Payment ${result.activity.status === 'confirmed' ? 'confirmed' : 'accepted'}. Your draft is unchanged. View status in Payments.`,
+          kind: 'accepted',
+        });
+        return;
+      }
+      onOpenChange(false);
+      form.reset();
+      setPaymentUri('');
+      setPaymentUriNeedsApply(false);
+      parseUri.reset();
     },
   });
 
   const fromAccount = useWatch({ control: form.control, name: 'from_account' });
+  const toAccount = useWatch({ control: form.control, name: 'to_account' });
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
   const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
   const memo = useWatch({ control: form.control, name: 'memo' }) ?? '';
@@ -79,45 +192,82 @@ export function SendDialog({
     destination_pool: destinationPool,
   });
 
-  const submit = form.handleSubmit(async (values) => {
-    if (values.amount > available) {
-      form.setError('amount', {
-        message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
-      });
-      return;
-    }
-    const quoted = quote.data ?? (await quote.refetch()).data;
-    if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
-      form.setError('amount', {
-        message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
-      });
-      return;
-    }
-
-    send.mutate(
-      {
-        from_account: values.from_account,
-        to_account: values.to_account,
-        source_pool: values.source_pool,
-        destination_pool: values.destination_pool,
-        amount_zatoshi: values.amount,
-        ...(values.memo === '' ? {} : { memo: values.memo }),
-      },
-      {
-        onSuccess: (activity) => {
-          toast.success(
-            `Sent to Account ${activity.to_account}`,
-            'The transaction was mined into a new block.',
-          );
-          onOpenChange(false);
-          form.reset();
-        },
-        onError: (error) => toast.error('Transfer failed', errorMessage(error)),
-      },
+  const applyPaymentUri = (parsed: PaymentUri) => {
+    const options = { shouldValidate: form.formState.isSubmitted };
+    form.setValue(
+      'to_account',
+      parsed.to_account === null ? ADDRESS_DESTINATION : String(parsed.to_account),
+      options,
     );
-  });
+    form.setValue('to_address', parsed.address, options);
+    form.setValue('destination_pool', parsed.destination_pool, options);
+    // A URI without an amount must not inherit the form's default: the sender
+    // has to choose one rather than unknowingly send it.
+    form.setValue(
+      'amount',
+      parsed.amount_zatoshi === null ? '' : formatZec(parsed.amount_zatoshi).replaceAll(',', ''),
+      options,
+    );
+    form.setValue('memo', parsed.memo ?? '', options);
+  };
+
+  const submitPaymentUri = () => {
+    if (paymentUri.trim() === '') return;
+    paymentUriRevision.current += 1;
+    const uriRevision = paymentUriRevision.current;
+    setPaymentUriNeedsApply(true);
+    parseUri.mutate(paymentUri, {
+      onSuccess: (parsed) => {
+        if (uriRevision === paymentUriRevision.current) {
+          applyPaymentUri(parsed);
+          setPaymentUriNeedsApply(false);
+        }
+      },
+    });
+  };
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    const uriRevision = paymentUriRevision.current;
+    return form.handleSubmit(async (values) => {
+      // Replaying retained work must not depend on the account's current balance
+      // or a new proposal; it may already have spent those funds.
+      if (
+        busy ||
+        matchTerminal ||
+        parseUri.isPending ||
+        paymentUriNeedsApply ||
+        uriRevision !== paymentUriRevision.current
+      )
+        return;
+      setSubmittedHere(true);
+      setReceipt(null);
+      const variables = variablesFor(values);
+      const retained = retainedFor(variables);
+      if (retained) {
+        send.resume(retained, submitted(uriRevision));
+        return;
+      }
+      if (values.amount > available) {
+        form.setError('amount', {
+          message: `Account ${values.from_account} holds ${formatZecAmount(available)} in the ${values.source_pool} pool.`,
+        });
+        return;
+      }
+      const quoted = quote.data ?? (await quote.refetch()).data;
+      if (uriRevision !== paymentUriRevision.current) return;
+      if (quoted !== undefined && values.amount > quoted.max_zatoshi) {
+        form.setError('amount', {
+          message: `The ${formatZecAmount(quoted.fee_zatoshi)} network fee leaves at most ${formatZecAmount(quoted.max_zatoshi)} spendable — Account ${values.from_account} holds ${formatZecAmount(quoted.available_zatoshi)} in the ${values.source_pool} pool.`,
+        });
+        return;
+      }
+
+      send.mutate(variables, submitted(uriRevision));
+    })(event);
+  };
 
   const options = accountOptions(accounts);
+  const destinationOptions = [...options, { value: ADDRESS_DESTINATION, label: 'Other address' }];
 
   return (
     <Dialog
@@ -125,8 +275,79 @@ export function SendDialog({
       onOpenChange={onOpenChange}
       eyebrow="NEW TRANSACTION"
       title="Send ZEC"
-      description="Moves existing funds between development accounts or pools. One block is mined to confirm."
+      description="Moves existing funds to another account, pool, or Regtest address."
     >
+      <Field
+        label="Payment request (optional)"
+        hint={
+          paymentUriNeedsApply
+            ? 'Apply this payment request or clear it before sending.'
+            : 'Paste a zcash: URI to fill in the destination, amount, and memo.'
+        }
+        error={parseUri.isError ? errorMessage(parseUri.error) : undefined}
+      >
+        {(aria) => (
+          <div className="flex gap-2">
+            <input
+              {...aria}
+              value={paymentUri}
+              onChange={(event) => {
+                paymentUriRevision.current += 1;
+                setPaymentUri(event.target.value);
+                setPaymentUriNeedsApply(event.target.value.trim() !== '');
+                parseUri.reset();
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  submitPaymentUri();
+                }
+              }}
+              placeholder="zcash:uregtest1…?amount=1"
+              autoComplete="off"
+              spellCheck={false}
+              className={controlStyles}
+            />
+            <Button
+              type="button"
+              onClick={submitPaymentUri}
+              loading={parseUri.isPending}
+              disabled={paymentUri.trim() === ''}
+            >
+              Apply
+            </Button>
+          </div>
+        )}
+      </Field>
+
+      {payments.error && (
+        <PaymentWarning role="alert" className="mb-3">
+          <p>Could not load saved payments: {errorMessage(payments.error)}</p>
+          <p>Allow site storage and reload before submitting.</p>
+        </PaymentWarning>
+      )}
+      {receipt &&
+        (receipt.kind === 'accepted' ? (
+          <p role="status" className="text-ink-muted mb-3 text-[12px]">
+            {receipt.text}
+          </p>
+        ) : (
+          <PaymentWarning role="alert" className="mb-3">
+            <p>{receipt.text}</p>
+            {receipt.key && (
+              <Button size="sm" className="mt-2" onClick={() => viewPayment(receipt.key)}>
+                View payment
+              </Button>
+            )}
+          </PaymentWarning>
+        ))}
+      {match && (
+        <p className="text-ink-muted mb-3 text-[12px]" role="status">
+          {matchTerminal
+            ? 'Previous payment finished. Clear its saved request in Payments before sending these details again.'
+            : `A saved payment has these details (${matchStatus.data?.status ?? 'status unknown'}). Resume it, or change the details for a new payment.`}
+        </p>
+      )}
       <form onSubmit={(event) => void submit(event)} noValidate>
         <div className="grid gap-x-3 sm:grid-cols-2">
           <SelectField
@@ -146,8 +367,8 @@ export function SendDialog({
           <SelectField
             control={form.control}
             name="to_account"
-            label="Destination account"
-            options={options}
+            label="Destination"
+            options={destinationOptions}
             error={form.formState.errors.to_account?.message}
           />
           <SelectField
@@ -158,6 +379,24 @@ export function SendDialog({
             error={form.formState.errors.destination_pool?.message}
           />
         </div>
+
+        {toAccount === ADDRESS_DESTINATION && (
+          <Field
+            label="Destination address"
+            hint="A unified (Ironwood) or transparent Regtest address."
+            error={form.formState.errors.to_address?.message}
+          >
+            {(aria) => (
+              <input
+                {...aria}
+                {...form.register('to_address')}
+                autoComplete="off"
+                spellCheck={false}
+                className={controlStyles}
+              />
+            )}
+          </Field>
+        )}
 
         <Field
           label="Amount (ZEC)"
@@ -202,7 +441,7 @@ export function SendDialog({
           label="Memo (optional)"
           hint={
             memoEnabled
-              ? `${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes, encrypted to the recipient.`
+              ? `${memoByteLength(memo)}/${MEMO_MAX_BYTES} bytes.`
               : 'Memos are only available for ironwood destinations.'
           }
           error={form.formState.errors.memo?.message}
@@ -220,8 +459,24 @@ export function SendDialog({
           )}
         </Field>
 
-        <Button type="submit" variant="primary" size="block" loading={send.isPending}>
-          {send.isPending ? 'Sending…' : 'Send ZEC'}
+        <Button
+          type="submit"
+          variant="primary"
+          size="block"
+          loading={busy}
+          disabled={
+            busy ||
+            matchTerminal ||
+            Boolean(payments.error) ||
+            parseUri.isPending ||
+            paymentUriNeedsApply
+          }
+        >
+          {busy
+            ? send.isPending && submittedHere
+              ? 'Submitting payment…'
+              : 'Another payment is submitting…'
+            : (retryLabel ?? 'Send ZEC')}
           {!send.isPending && <ArrowRight />}
         </Button>
       </form>

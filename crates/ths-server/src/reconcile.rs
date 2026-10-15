@@ -1,6 +1,6 @@
 use std::{future::Future, time::Duration};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::TryStreamExt;
 use tokio::time::{Instant, timeout_at};
 use zcash_client_backend::{
@@ -25,6 +25,10 @@ use crate::wallet::{
     TransparentQuery, WALLET_BIRTHDAY_HEIGHT,
 };
 
+#[derive(Debug, thiserror::Error)]
+#[error("wallet reconciliation deadline exceeded")]
+pub(crate) struct ReconciliationDeadline;
+
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_BATCH_SIZE: u32 = 100;
 
@@ -41,10 +45,9 @@ where
     let Some(scanned) = wallet.max_scanned_checkpoint().await? else {
         return Ok(None);
     };
-    anyhow::ensure!(
-        target.height >= u64::from(WALLET_BIRTHDAY_HEIGHT - 1),
-        "chain is below the wallet birthday floor; waiting for canonical block 1"
-    );
+    if target.height < u64::from(WALLET_BIRTHDAY_HEIGHT - 1) {
+        return Err(crate::bootstrap::ReadinessError::BelowBirthday.into());
+    }
     let mut height = u32::try_from(scanned.height.min(target.height))?;
     loop {
         check_deadline(deadline)?;
@@ -90,10 +93,9 @@ pub async fn sync_wallet(
         };
         if canonical.as_deref() != Some(cursor.block_hash.as_str()) {
             let floor = WALLET_BIRTHDAY_HEIGHT - 1;
-            anyhow::ensure!(
-                target.height >= u64::from(floor),
-                "chain is below the wallet birthday floor"
-            );
+            if target.height < u64::from(floor) {
+                return Err(crate::bootstrap::ReadinessError::BelowBirthday.into());
+            }
             rewind = Some(ChainCheckpoint {
                 height: u64::from(floor),
                 hash: within_deadline(
@@ -127,11 +129,11 @@ async fn rewind_wallet(
 ) -> Result<()> {
     let height = u32::try_from(checkpoint.height)?;
     let chain_state = download_chain_state(client, height.into(), deadline).await?;
-    anyhow::ensure!(
-        chain_state.block_height() == height.into()
-            && chain_state.block_hash().to_string() == checkpoint.hash,
-        "lightwalletd has not indexed the canonical rewind checkpoint"
-    );
+    if chain_state.block_height() != height.into()
+        || chain_state.block_hash().to_string() != checkpoint.hash
+    {
+        return Err(crate::bootstrap::ReadinessError::RewindCheckpoint.into());
+    }
     check_deadline(deadline)?;
     wallet.rewind_to_height(chain_state).await?;
     check_deadline(deadline)
@@ -379,10 +381,9 @@ fn split_range(range: ScanRange) -> impl Iterator<Item = ScanRange> {
 }
 
 pub(crate) fn check_deadline(deadline: Instant) -> Result<()> {
-    anyhow::ensure!(
-        Instant::now() < deadline,
-        "wallet reconciliation deadline exceeded"
-    );
+    if Instant::now() >= deadline {
+        return Err(ReconciliationDeadline.into());
+    }
     Ok(())
 }
 
@@ -397,205 +398,11 @@ where
     check_deadline(deadline)?;
     match timeout_at(deadline.min(Instant::now() + NETWORK_TIMEOUT), future).await {
         Ok(result) => result.map_err(Into::into).with_context(|| label.to_owned()),
-        Err(_) => bail!("{label} exceeded the network or reconciliation deadline"),
+        Err(error) => Err(error)
+            .with_context(|| format!("{label} exceeded the network or reconciliation deadline")),
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::db::Store;
-    use zcash_primitives::block::BlockHash;
-
-    #[tokio::test]
-    async fn same_height_and_lower_tip_reorgs_find_the_last_common_block() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("server.db")).unwrap();
-        store.initialize().unwrap();
-        let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
-        assert_eq!(
-            find_rewind(
-                &wallet,
-                &ChainCheckpoint {
-                    height: 0,
-                    hash: "00".repeat(32)
-                },
-                Instant::now() + Duration::from_secs(1),
-                |_| async { Ok("00".repeat(32)) },
-            )
-            .await
-            .unwrap(),
-            None
-        );
-        wallet.update_chain_tip(4).await.unwrap();
-        let blocks = (2..=4)
-            .map(|height| CompactBlock {
-                height,
-                hash: vec![height as u8; 32],
-                prev_hash: vec![(height - 1) as u8; 32],
-                chain_metadata: Some(Default::default()),
-                ..Default::default()
-            })
-            .collect();
-        wallet
-            .scan_batch(
-                ScanRange::from_parts(2.into()..5.into(), ScanPriority::Historic),
-                blocks,
-                ChainState::empty(1.into(), BlockHash([1; 32])),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            wallet.scanned_checkpoint().await.unwrap().unwrap().height,
-            4
-        );
-
-        for tip in [4, 3] {
-            let rewind = find_rewind(
-                &wallet,
-                &ChainCheckpoint {
-                    height: tip,
-                    hash: "ff".repeat(32),
-                },
-                Instant::now() + Duration::from_secs(1),
-                |height| async move {
-                    Ok(if height <= 2 {
-                        BlockHash([height as u8; 32]).to_string()
-                    } else {
-                        "ff".repeat(32)
-                    })
-                },
-            )
-            .await
-            .unwrap();
-            assert_eq!(
-                rewind,
-                Some(ChainCheckpoint {
-                    height: 2,
-                    hash: "02".repeat(32)
-                })
-            );
-        }
-
-        assert!(
-            find_rewind(
-                &wallet,
-                &ChainCheckpoint {
-                    height: 0,
-                    hash: "00".repeat(32)
-                },
-                Instant::now() + Duration::from_secs(1),
-                |_| async { Ok("00".repeat(32)) },
-            )
-            .await
-            .is_err()
-        );
-        assert_eq!(
-            wallet.scanned_checkpoint().await.unwrap().unwrap().height,
-            4
-        );
-        assert_eq!(
-            find_rewind(
-                &wallet,
-                &ChainCheckpoint {
-                    height: 1,
-                    hash: "01".repeat(32)
-                },
-                Instant::now() + Duration::from_secs(1),
-                |_| async { Ok("01".repeat(32)) },
-            )
-            .await
-            .unwrap(),
-            Some(ChainCheckpoint {
-                height: 1,
-                hash: "01".repeat(32)
-            })
-        );
-
-        wallet
-            .rewind_to_height(ChainState::empty(2.into(), BlockHash([2; 32])))
-            .await
-            .unwrap();
-        assert_eq!(
-            wallet.scanned_checkpoint().await.unwrap().unwrap().height,
-            2
-        );
-        wallet.update_chain_tip(3).await.unwrap();
-        wallet
-            .scan_batch(
-                ScanRange::from_parts(3.into()..4.into(), ScanPriority::Historic),
-                vec![CompactBlock {
-                    height: 3,
-                    hash: vec![255; 32],
-                    prev_hash: vec![2; 32],
-                    chain_metadata: Some(Default::default()),
-                    ..Default::default()
-                }],
-                ChainState::empty(2.into(), BlockHash([2; 32])),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            wallet.scanned_checkpoint().await.unwrap(),
-            Some(ChainCheckpoint {
-                height: 3,
-                hash: "ff".repeat(32),
-            })
-        );
-
-        wallet
-            .rewind_to_height(ChainState::empty(1.into(), BlockHash([1; 32])))
-            .await
-            .unwrap();
-        assert_eq!(wallet.scanned_checkpoint().await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    async fn one_attempt_deadline_is_shared_across_network_calls() {
-        let deadline = Instant::now() + Duration::from_millis(100);
-        within_deadline(deadline, "first call", async {
-            Ok::<_, std::io::Error>(())
-        })
-        .await
-        .unwrap();
-        let operation = async {
-            tokio::time::sleep_until(deadline + Duration::from_millis(50)).await;
-            Ok::<_, std::io::Error>(())
-        };
-        assert!(
-            within_deadline(deadline, "second call", operation)
-                .await
-                .is_err()
-        );
-        let polled = std::cell::Cell::new(false);
-        assert!(
-            within_deadline(deadline, "expired call", async {
-                polled.set(true);
-                Ok::<_, std::io::Error>(())
-            })
-            .await
-            .is_err()
-        );
-        assert!(
-            !polled.get(),
-            "expired attempts must not start another call"
-        );
-    }
-
-    #[test]
-    fn scan_ranges_are_split_without_gaps() {
-        let range = ScanRange::from_parts(
-            BlockHeight::from_u32(5)..BlockHeight::from_u32(256),
-            ScanPriority::Historic,
-        );
-        let ranges = split_range(range)
-            .map(|range| {
-                (
-                    u32::from(range.block_range().start),
-                    u32::from(range.block_range().end),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(ranges, [(5, 105), (105, 205), (205, 256)]);
-    }
-}
+#[path = "../tests/unit/reconcile/tests.rs"]
+mod tests;

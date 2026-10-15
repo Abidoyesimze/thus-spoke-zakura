@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 912 420" width="912" height="420" role="img" aria-label="After a lost payment response, direct API callers reuse their saved key, dashboard callers resume retained payments, and CLI callers rerun the same command and instance. A new key requests a new payment. Activity omits keys and external faucet records; inspect txids and wallet snapshots separately.">
+<style>
+svg {
+  --bg: #fdfaf8;
+  --ink: #2c2430;
+  --muted: #7a6a7a;
+  --rule: #e0d3da;
+  --surface: #ffffff;
+  --zone: #f7f0f3;
+  --accent: #b24a6e;
+  --accent-soft: #fceef3;
+}
+@media (prefers-color-scheme: dark) {
+  svg {
+    --bg: #1b171f;
+    --ink: #efe8f0;
+    --muted: #a695a6;
+    --rule: #3d3442;
+    --surface: #252030;
+    --zone: #201b27;
+    --accent: #e79ab7;
+    --accent-soft: #3a2331;
+  }
+}
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+       "Helvetica Neue", Arial, sans-serif; fill: var(--ink); }
+.t { font-size: 16px; font-weight: 600; }
+.k { font-size: 11px; font-weight: 600; letter-spacing: .1em; fill: var(--muted); }
+.l { font-size: 14px; }
+.s { font-size: 12px; fill: var(--muted); }
+.a { font-size: 13px; font-weight: 600; fill: var(--accent); }
+.card { fill: var(--surface); stroke: var(--rule); stroke-width: 1; }
+.card-a { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.zone { fill: var(--zone); stroke: none; }
+.note { fill: none; stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3; }
+.flow { stroke: var(--accent); stroke-width: 2; fill: none; }
+.thin { stroke: var(--rule); stroke-width: 1.5; fill: none; }
+.lead { stroke: var(--rule); stroke-width: 1; fill: none; stroke-dasharray: 2 4; }
+</style>
+<defs><marker id="ar-a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--accent)"/></marker><marker id="ar-n" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--rule)"/></marker></defs>
+<text class="t" x="48" y="46">Retain the caller's payment identity</text>
+<rect class="card-a" x="290" y="76" width="420" height="54" rx="8"/>
+<text class="l" x="500.0" y="100.0" text-anchor="middle">A payment response is uncertain</text>
+<text class="s" x="500.0" y="118.0" text-anchor="middle">which caller and result?</text>
+<rect class="card" x="48.0" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="189.33333333333334" y="213.0" text-anchor="middle">API: saved key</text>
+<text class="s" x="189.33333333333334" y="231.0" text-anchor="middle">same request details</text>
+<path class="flow" d="M500 130 L500 154 L189.33333333333334 154 L189.33333333333334 176" marker-end="url(#ar-a)"/>
+<rect class="card" x="358.6666666666667" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="500.0" y="213.0" text-anchor="middle">Dashboard: Resume</text>
+<text class="s" x="500.0" y="231.0" text-anchor="middle">saved payment across reloads</text>
+<path class="flow" d="M500 130 L500 154 L500.0 154 L500.0 176" marker-end="url(#ar-a)"/>
+<rect class="card" x="669.3333333333334" y="184" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="810.6666666666667" y="213.0" text-anchor="middle">CLI: same command</text>
+<text class="s" x="810.6666666666667" y="231.0" text-anchor="middle">same arguments and instance</text>
+<path class="flow" d="M500 130 L500 154 L810.6666666666667 154 L810.6666666666667 176" marker-end="url(#ar-a)"/>
+<rect class="card-a" x="48.0" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="189.33333333333334" y="317.0" text-anchor="middle">Resume same intent</text>
+<text class="s" x="189.33333333333334" y="335.0" text-anchor="middle">same key + same details</text>
+<path class="flow" d="M189.33333333333334 248 L189.33333333333334 280" marker-end="url(#ar-a)"/>
+<rect class="note" x="358.6666666666667" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="500.0" y="317.0" text-anchor="middle">Keep pending payment</text>
+<text class="s" x="500.0" y="335.0" text-anchor="middle">broadcast is not terminal</text>
+<path class="flow" d="M500.0 248 L500.0 280" marker-end="url(#ar-a)"/>
+<rect class="note" x="669.3333333333334" y="288" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="810.6666666666667" y="317.0" text-anchor="middle">Resume saved intent</text>
+<text class="s" x="810.6666666666667" y="335.0" text-anchor="middle">terminal observation clears key</text>
+<path class="flow" d="M810.6666666666667 248 L810.6666666666667 280" marker-end="url(#ar-a)"/>
+<text class="s" x="500" y="380" text-anchor="middle">activity omits keys and external faucets; no row is not proof nothing happened</text>
+<text class="s" x="500" y="400" text-anchor="middle">observe chain inclusion and wallet balances separately</text>
+</svg>

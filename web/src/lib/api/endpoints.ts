@@ -8,6 +8,8 @@ import {
   blockSchema,
   miningJobSchema,
   miningJobResponseSchema,
+  paymentRequestSchema,
+  paymentUriSchema,
   sendQuoteSchema,
   statusSchema,
   transactionSchema,
@@ -21,6 +23,14 @@ export const api = {
   accounts: () => request('/accounts', z.array(accountSchema)),
 
   activity: (limit = 30) => request(`/activity?limit=${limit}`, z.array(activitySchema)),
+
+  payment: async (key: string) => {
+    const rows = await request(
+      `/activity?idempotency_key=${encodeURIComponent(key)}`,
+      z.array(activitySchema).max(1),
+    );
+    return rows[0] ?? null;
+  },
 
   blocks: (options?: { limit?: number; before?: number }) => {
     const params = new URLSearchParams();
@@ -42,14 +52,16 @@ export const api = {
       z.looseObject({ type: z.enum(['block', 'transaction']) }),
     ),
 
+  /** Exactly one of `to_account` or `to_address` is set. */
   send: (input: {
     from_account: number;
-    to_account: number;
+    to_account?: number;
+    to_address?: string;
     source_pool: Pool;
     destination_pool: Pool;
     amount_zatoshi: bigint;
-    idempotency_key: string;
     memo?: string;
+    idempotency_key: string;
   }) =>
     post('/send', activitySchema, {
       ...input,
@@ -58,6 +70,16 @@ export const api = {
 
   /** Dry-run proposal: exact fee and max spendable; nothing is broadcast. */
   sendQuote: (input: SendQuoteInput) => post('/send/quote', sendQuoteSchema, input),
+
+  parsePaymentUri: (uri: string) => post('/zip321/parse', paymentUriSchema, { uri }),
+
+  paymentRequest: (input: { account_id: number; amount_zatoshi?: bigint; memo?: string }) =>
+    post('/zip321/request', paymentRequestSchema, {
+      ...input,
+      ...(input.amount_zatoshi === undefined
+        ? {}
+        : { amount_zatoshi: Number(input.amount_zatoshi) }),
+    }),
 
   faucet: (input: {
     account_id: number;

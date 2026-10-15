@@ -93,6 +93,7 @@ impl Cancellation<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputMode {
     Inherit,
+    InheritStderr,
     Capture,
     /// Discard both streams. Used by the startup browser launcher, which must not
     /// inherit the launcher's terminal or retain browser-helper output.
@@ -282,6 +283,11 @@ pub(crate) fn run_observed(
     match mode {
         OutputMode::Inherit => {
             command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        }
+        OutputMode::InheritStderr => {
+            command
+                .stdout(Stdio::from(io::stderr()))
+                .stderr(Stdio::inherit());
         }
         OutputMode::Capture => {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -807,5 +813,5 @@ fn command_label(command: &Command) -> String {
 }
 
 #[cfg(test)]
-#[path = "../tests/unit/lifecycle.rs"]
+#[path = "../tests/unit/lifecycle/tests.rs"]
 mod tests;
