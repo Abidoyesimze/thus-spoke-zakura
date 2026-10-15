@@ -828,6 +828,9 @@ pub(crate) fn explorer_data(
             &tip
         }
     };
+    if matches!(id, "." | "..") {
+        bail!("invalid explorer identifier: {id:?}");
+    }
     let mut url = reqwest::Url::parse(&format!("{dashboard}/api/v1/{resource}"))?;
     url.path_segments_mut()
         .map_err(|_| anyhow!("invalid dashboard URL"))?

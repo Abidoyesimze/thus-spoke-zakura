@@ -138,6 +138,22 @@ fn explorer_tip_lookup_fails_without_fetching_another_block() {
 }
 
 #[test]
+fn explorer_rejects_dot_only_ids_without_a_request() {
+    for resource in ["blocks", "transactions"] {
+        for id in [".", ".."] {
+            let (url, requests) = serve(vec![("200 OK", r#"{"blocks":[],"next_before":null}"#)]);
+            let error = explorer_data(&url, &reqwest::blocking::Client::new(), resource, Some(id))
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("invalid explorer identifier: {id:?}")
+            );
+            assert!(requests.try_recv().is_err());
+        }
+    }
+}
+
+#[test]
 fn explorer_encodes_ids_as_a_single_path_segment() {
     let (url, requests) = serve(vec![("404 Not Found", "missing")]);
     assert!(
