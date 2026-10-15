@@ -42,9 +42,6 @@ export function WalletActionsProvider({ children }: { children: ReactNode }) {
       liveKeys.current.add(identity.key);
       (identity.kind === 'send' ? savedSend : savedFaucet).show(identity);
     },
-    onRejected: (identity: PaymentIdentity) => {
-      (identity.kind === 'send' ? savedSend : savedFaucet).dismissKey(identity.key);
-    },
     onError: (error: Error, variables: PaymentIdentity['variables'], key: string | undefined) => {
       toast.error(
         isPaymentRejection(error) ? 'Payment rejected' : 'Payment not confirmed',
