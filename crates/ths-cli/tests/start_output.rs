@@ -15,7 +15,45 @@ use std::{
     time::{Duration, Instant},
 };
 
-static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(0);
+static NEXT_PORT_OFFSET: AtomicU16 = AtomicU16::new(20_000);
+
+fn next_port_offset(offsets: &AtomicU16) -> u16 {
+    loop {
+        let offset = offsets.fetch_add(10, Ordering::Relaxed);
+        assert!(offset <= 32_730, "no free port set for the startup fixture");
+        // Startup checks all four ports before the fake readiness servers bind.
+        let listeners: std::io::Result<Vec<_>> = [32_805, 18_232, 18_233, 9_067]
+            .into_iter()
+            .map(|port| TcpListener::bind(("127.0.0.1", port + offset)))
+            .collect();
+        match listeners {
+            Ok(_) => return offset,
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(error) => panic!("checking startup fixture ports at offset {offset}: {error}"),
+        }
+    }
+}
+
+#[test]
+fn fixture_skips_each_occupied_published_port() {
+    let offsets = AtomicU16::new(30_000);
+    for port in [32_805, 18_232, 18_233, 9_067] {
+        let (offset, listener) = loop {
+            let offset = next_port_offset(&offsets);
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port + offset)) {
+                break (offset, listener);
+            }
+        };
+        offsets.store(offset, Ordering::Relaxed);
+        let selected = next_port_offset(&offsets);
+        assert_ne!(
+            selected,
+            offset,
+            "fixture selected occupied port {}",
+            listener.local_addr().unwrap()
+        );
+    }
+}
 
 struct Fixture {
     directory: tempfile::TempDir,
@@ -28,7 +66,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let port_offset = 20_000 + NEXT_PORT_OFFSET.fetch_add(10, Ordering::Relaxed);
+        let port_offset = next_port_offset(&NEXT_PORT_OFFSET);
         let commands_path = directory.path().join("commands");
         let stop_server = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let server_stop = Arc::clone(&stop_server);
@@ -253,17 +291,25 @@ fn output_after_shutdown(
         }
     }
     let success = finish(&mut child).success();
+    let stdout = stdout_thread.join().unwrap();
+    let stderr = stderr_thread.join().unwrap();
     for kind in ["container", "volume", "network"] {
         let resources = fixture.directory.path().join("state").join(kind);
         assert!(
-            fs::read_dir(resources).unwrap().next().is_none(),
-            "fake {kind} resources were not removed"
+            fs::read_dir(&resources)
+                .unwrap_or_else(|error| panic!(
+                    "reading {}: {error}; launcher stderr: {stderr}",
+                    resources.display()
+                ))
+                .next()
+                .is_none(),
+            "fake {kind} resources were not removed; launcher stderr: {stderr}"
         );
     }
     (
         success,
-        stdout_thread.join().unwrap(),
-        stderr_thread.join().unwrap(),
+        stdout,
+        stderr,
         fs::read_to_string(fixture.directory.path().join("commands")).unwrap(),
         fixture.port_offset,
     )
@@ -431,10 +477,10 @@ fn json_start_browser_open_failure_keeps_stdout_parseable_through_stop() {
         "ths stop failed: {}",
         String::from_utf8_lossy(&stopped.stderr)
     );
-    assert!(finish(&mut child).success());
-
+    let status = finish(&mut child);
     let stdout = stdout_thread.join().unwrap();
     let stderr = stderr_thread.join().unwrap();
+    assert!(status.success(), "launcher exited {status}: {stderr}");
     let endpoints: serde_json::Value = serde_json::from_str(&stdout).unwrap();
     let dashboard = endpoints["dashboard"].as_str().unwrap();
     assert!(
