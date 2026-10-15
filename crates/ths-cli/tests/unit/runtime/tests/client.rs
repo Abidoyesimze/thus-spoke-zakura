@@ -481,6 +481,81 @@ fn max_quote_errors_are_reported_without_submitting() {
 }
 
 #[test]
+fn delayed_max_quote_respects_the_payment_deadline_without_saving_an_intent() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![
+        (
+            "delay",
+            r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#.to_owned(),
+        ),
+        ("200 OK", activity_json("confirmed", "txid", None)),
+    ]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() + Duration::from_millis(50),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    let error = format!("{error:#}");
+    assert!(error.contains("maximum transfer amount"), "{error}");
+    assert!(error.contains("timed out"), "{error}");
+    let requests: Vec<_> = requests.try_iter().collect();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].0.starts_with("POST /api/v1/send/quote "));
+    let journal = IntentJournal::open(&runtime.instance_dir(&alpha), "send").unwrap();
+    assert!(journal.read().unwrap().is_empty());
+    assert!(out.is_empty());
+}
+
+#[test]
+fn expired_max_deadline_does_not_quote_submit_or_save_an_intent() {
+    let (_dir, runtime, alpha) = payment_runtime();
+    let (url, requests) = serve(vec![(
+        "200 OK",
+        r#"{"available_zatoshi":500,"fee_zatoshi":10,"max_zatoshi":490}"#,
+    )]);
+    let mut out = Vec::new();
+
+    let error = runtime
+        .wallet_send_with(
+            &alpha,
+            &url,
+            &reqwest::blocking::Client::new(),
+            &mut out,
+            Instant::now() - Duration::from_millis(1),
+            1,
+            2,
+            "ironwood",
+            "ironwood",
+            TransferAmount::Max,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+    let error = format!("{error:#}");
+    assert!(error.contains("maximum transfer amount"), "{error}");
+    assert!(error.contains("quote timed out"), "{error}");
+    assert!(requests.try_recv().is_err());
+    let journal = IntentJournal::open(&runtime.instance_dir(&alpha), "send").unwrap();
+    assert!(journal.read().unwrap().is_empty());
+    assert!(out.is_empty());
+}
+
+#[test]
 fn uri_max_uses_the_parsed_destination_pool_for_the_quote() {
     const PARSED: &str = r#"{"address":"uregtest1external","destination_pool":"ironwood","amount_zatoshi":null,"memo":"hi"}"#;
     const CONFIRMED: &str = r#"{"id":"uri-max","kind":"send","from_account":1,"to_account":null,"to_address":"uregtest1external","source_pool":"transparent","destination_pool":"ironwood","amount_zatoshi":123,"txid":"uri-txid","block_hash":"block","status":"confirmed","last_error":null}"#;

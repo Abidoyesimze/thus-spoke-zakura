@@ -382,7 +382,7 @@ fn faucet_journal_lock_probe() {
 
 /// answers loopback requests in turn with canned statuses and bodies, passing on each
 /// request line and body. `drop` closes the connection without a response, as a lost
-/// response would; `hang` holds it open without answering.
+/// response would; `hang` holds it open without answering; `delay` waits 200 ms before a 200.
 fn serve<B: Into<String> + Send + 'static>(
     responses: Vec<(&'static str, B)>,
 ) -> (String, mpsc::Receiver<(String, String)>) {
@@ -423,20 +423,26 @@ fn serve<B: Into<String> + Send + 'static>(
                     String::from_utf8(request).unwrap(),
                 ))
                 .unwrap();
-            match status {
+            let (status, tolerate_write_error) = match status {
                 "drop" => continue,
                 "hang" => {
                     std::thread::sleep(Duration::from_secs(60));
                     continue;
                 }
-                _ => {}
-            }
-            write!(
+                "delay" => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    ("200 OK", true)
+                }
+                status => (status, false),
+            };
+            let response = write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            )
-            .unwrap();
+            );
+            if !tolerate_write_error {
+                response.unwrap();
+            }
         }
     });
     (url, received)

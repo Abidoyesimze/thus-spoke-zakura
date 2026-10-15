@@ -275,10 +275,14 @@ fn quote_max_amount(
     client: &reqwest::blocking::Client,
     dashboard: &str,
     name: &InstanceName,
+    deadline: Instant,
     from: u8,
     source_pool: &str,
     destination_pool: &str,
 ) -> Result<u64> {
+    let timeout = remaining(deadline)
+        .ok_or_else(|| anyhow!("maximum transfer quote timed out"))
+        .with_context(|| format!("asking environment {name} for the maximum transfer amount"))?;
     let quote: SendQuote = client
         .post(format!("{dashboard}/api/v1/send/quote"))
         .json(&serde_json::json!({
@@ -286,6 +290,7 @@ fn quote_max_amount(
             "source_pool": source_pool,
             "destination_pool": destination_pool,
         }))
+        .timeout(timeout)
         .send()
         .map_err(anyhow::Error::from)
         .and_then(decode_response)
@@ -813,8 +818,15 @@ impl Runtime {
         let (fingerprint, amount_zatoshi) = match saved {
             Some(saved) => saved,
             None => {
-                let amount =
-                    quote_max_amount(client, dashboard, name, from, source_pool, destination_pool)?;
+                let amount = quote_max_amount(
+                    client,
+                    dashboard,
+                    name,
+                    deadline,
+                    from,
+                    source_pool,
+                    destination_pool,
+                )?;
                 let fingerprint = serde_json::to_string(&serde_json::json!({
                     "amount_mode": "max",
                     "amount_zatoshi": amount,
