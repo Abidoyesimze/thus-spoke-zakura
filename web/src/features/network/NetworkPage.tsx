@@ -123,7 +123,9 @@ export function NetworkPage() {
             Node health
           </span>
           <strong className="my-1.5 block text-xl font-bold tracking-[-0.02em]">{headline}</strong>
-          <small className="text-ink-muted block text-[12px]">{miningDescription(status.data)}</small>
+          <small className="text-ink-muted block text-[12px]">
+            {miningDescription(status.data)}
+          </small>
         </div>
         <SakuraMark className="text-petal animate-bloom pointer-events-none absolute -right-8 -bottom-10 z-0 size-28 opacity-70" />
       </section>

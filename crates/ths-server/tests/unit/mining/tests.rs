@@ -578,3 +578,155 @@ fn mempool_mining_ignores_an_empty_set() {
     let previous = vec!["a".to_owned()];
     assert!(new_mempool_set(Some(previous.as_slice()), &mut empty).is_none());
 }
+
+// A 64-character hex string used as a stand-in block hash in mock RPCs below.
+const FAKE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+async fn rpc_server(handler: impl Fn(Value) -> Value + Send + Sync + Clone + 'static) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(move |Json(req): Json<Value>| {
+                    let handler = handler.clone();
+                    async move { Json(handler(req)) }
+                }),
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    url
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_generation_error_on_rpc_failure() {
+    let url = rpc_server(
+        |req| json!({"result":null,"error":{"code":-1,"message":"no peers"},"id":req["id"]}),
+    )
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(matches!(
+        state.mine_and_sync_background().await,
+        Err(BackgroundMineError::Generation(_))
+    ));
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_sync_error_when_block_fetch_fails() {
+    // generate succeeds; getblock fails — a block was produced even though we
+    // cannot read its height, so the error must be Sync, not Generation.
+    let url = rpc_server(|req| match req["method"].as_str() {
+        Some("generate") => {
+            json!({"result":[FAKE_HASH],"error":null,"id":req["id"]})
+        }
+        _ => json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]}),
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(matches!(
+        state.mine_and_sync_background().await,
+        Err(BackgroundMineError::Sync(_))
+    ));
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_sync_error_when_wallet_sync_fails() {
+    // generate and getblock both succeed; synchronize_wallet fails because
+    // there is no running lightwalletd — the error must still be Sync.
+    let url = rpc_server(|req| match req["method"].as_str() {
+        Some("generate") => json!({"result":[FAKE_HASH],"error":null,"id":req["id"]}),
+        Some("getblock") => {
+            json!({"result":{"height":1,"hash":FAKE_HASH},"error":null,"id":req["id"]})
+        }
+        _ => json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]}),
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(matches!(
+        state.mine_and_sync_background().await,
+        Err(BackgroundMineError::Sync(_))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_retries_same_set_after_generation_failure() {
+    // When generate fails, no block is produced. The transaction set must not
+    // be recorded as attempted so it is retried on the very next poll.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let url = rpc_server({
+        let tx = tx.clone();
+        move |req| match req["method"].as_str() {
+            Some("getrawmempool") => {
+                json!({"result":["tx1"],"error":null,"id":req["id"]})
+            }
+            Some("generate") => {
+                let _ = tx.send(());
+                json!({"result":null,"error":{"code":-1,"message":"fail"},"id":req["id"]})
+            }
+            _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
+        }
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // First tick fires at t=0.
+    rx.recv().await.expect("first generate call at t=0");
+    // Advance past the 2-second interval; generation failure must not have set
+    // `attempted`, so the same ["tx1"] is new again and generate is called.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv()
+        .await
+        .expect("second generate call proves same set is retried after failure");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_records_attempted_after_block_produced_with_sync_failure() {
+    // When generate succeeds but a subsequent step fails (Sync error), the set
+    // must be recorded so the same transactions do not trigger a second block.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let url = rpc_server({
+        let tx = tx.clone();
+        move |req| match req["method"].as_str() {
+            Some("getrawmempool") => {
+                json!({"result":["tx1"],"error":null,"id":req["id"]})
+            }
+            Some("generate") => {
+                let _ = tx.send(());
+                json!({"result":[FAKE_HASH],"error":null,"id":req["id"]})
+            }
+            // getblock fails → BackgroundMineError::Sync (block was produced).
+            _ => json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]}),
+        }
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // First tick: block produced, sync error, attempted = Some(["tx1"]).
+    rx.recv().await.expect("first generate call at t=0");
+    // Advance through two more ticks; the unchanged set must be skipped.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "generate must not be called again while mempool holds the same set"
+    );
+}
