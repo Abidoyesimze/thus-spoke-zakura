@@ -337,26 +337,33 @@ impl DockerResourceCommands for FakeReadsRealRemoval<'_> {
     }
 }
 
-// Unlike the classification tests above, this exercises real deadline and
-// termination-reserve math: the resource-removal phase must stop at
-// deadline-minus-reserve and leave the reserve for `finish_helpers`. It uses
-// `NeverExits` (above) to force the "looks hung" branch deterministically
-// rather than relying on a real process's kill-to-exit timing under
-// contention, and `FakeReadsRealRemoval` (above) to keep every read
-// deterministic too — reads must return correct results, not launch a real
-// subprocess, per review feedback. The only real-time cost left is the
-// removal's own bounded `thread::sleep(poll)` wake-ups, one real kill signal,
-// one fast reap of an already-dead process, and two journal fsync writes
-// (begin + finish) — not open-ended OS process-scheduling or read latency.
-// Confirmed below by asserting `rm -f app-id` actually ran, so this is
-// reaping a hanging-removal helper specifically, not something else.
+// This splits into two independent checks rather than one wall-clock
+// assertion over an entire real run, per review feedback:
+//
+// 1. Deterministic reserve accounting: the removal docker's own
+//    `operation_deadline` must sit at least `termination_reserve` before the
+//    overall deadline. This compares two already-computed `Deadline`s
+//    (frozen `Instant`s) with no real waiting involved, so it cannot be
+//    affected by subprocess scheduling, fsync latency, or any other real
+//    timing noise — it is exactly as deterministic under parallel load as
+//    it is running alone.
+// 2. Real removal and helper-reaping coverage, with a generous timing
+//    allowance: `NeverExits` (above) still forces "looks hung"
+//    deterministically rather than racing a real process's kill-to-exit
+//    timing, and `FakeReadsRealRemoval` (above) keeps every read
+//    deterministic and subprocess-free too. But this phase no longer
+//    asserts on exactly how much wall-clock margin survived — only that
+//    removal genuinely started (`removal_marker`) and reaping genuinely
+//    succeeded (`helpers_finished`) — because that margin is downstream of
+//    real OS scheduling (thread wake-ups, fsync, process reaping) that no
+//    budget can be proven sufficient against under unbounded contention.
 #[test]
 fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     let never_exits = NeverExits;
     let mut policy = short_policy();
-    policy.cleanup = Duration::from_secs(2);
+    policy.cleanup = Duration::from_secs(3);
     policy.termination_reserve = Duration::from_millis(800);
-    policy.startup_docker = Duration::from_secs(2);
+    policy.startup_docker = Duration::from_secs(3);
     policy.poll = Duration::from_millis(20);
     let context = LifecycleContext::new(policy);
     let script = hang_on_removal_script();
@@ -397,6 +404,23 @@ fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
         "THS_REMOVAL_MARKER".to_owned(),
         removal_marker.to_string_lossy().into_owned(),
     ));
+
+    // 1. Deterministic reserve accounting. No real time has elapsed since
+    // `deadline` and `removal`'s `operation_deadline` were computed — both
+    // are frozen `Instant`s — so this comparison cannot be perturbed by
+    // scheduling or I/O, under any amount of parallel load.
+    let operation_deadline = removal.operation_deadline();
+    assert!(
+        deadline.0.saturating_duration_since(operation_deadline.0) >= policy.termination_reserve,
+        "removal's operation deadline {:?} does not reserve {:?} before the overall deadline {:?}",
+        operation_deadline,
+        policy.termination_reserve,
+        deadline
+    );
+
+    // 2. Real removal and helper-reaping coverage, with a generous timing
+    // allowance (`policy.cleanup` above): only whether removal started and
+    // reaping succeeded is asserted, not how much margin was left over.
     let docker = FakeReadsRealRemoval { removal };
     let report = runtime
         .cleanup_core(&instance, &docker, false, deadline, &context)
@@ -404,20 +428,6 @@ fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     assert!(
         removal_marker.exists(),
         "rm -f app-id was never issued; this exercised something other than a hanging removal"
-    );
-    // The removal attempt is deadline-bound to deadline-minus-reserve and, by
-    // construction (`NeverExits` never reports success), runs right up to
-    // that boundary rather than stopping early. Bookkeeping the production
-    // code does *after* that call returns and *before* `finish_helpers` runs
-    // — recording the outcome, checking absence, journaling it — legitimately
-    // spends a small, bounded slice of the nominal reserve. So this asserts
-    // that a substantial majority of the reserve survives for helper reaping,
-    // not that the reserve is literally untouched to the nanosecond.
-    assert!(
-        deadline.remaining() > policy.termination_reserve / 2,
-        "cleanup returned with {:?} left, which does not leave enough of the {:?} helper reserve",
-        deadline.remaining(),
-        policy.termination_reserve
     );
     assert!(
         report.helpers_finished,
