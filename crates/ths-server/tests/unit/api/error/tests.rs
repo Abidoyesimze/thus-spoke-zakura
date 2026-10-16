@@ -180,6 +180,14 @@ async fn request_parsing_errors_use_the_json_error_envelope() {
             "blocks must be between 1 and 10,000",
         ),
         (
+            post_json("/api/v1/reorg", r#"{"depth":"three"}"#),
+            "depth must be a whole number",
+        ),
+        (
+            post_json("/api/v1/rollback", r#"{"depth":"three"}"#),
+            "depth must be a whole number",
+        ),
+        (
             Request::builder()
                 .uri("/api/v1/blocks/%FF")
                 .body(Body::empty())

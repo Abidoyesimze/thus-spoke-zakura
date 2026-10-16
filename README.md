@@ -45,6 +45,10 @@ Running both makes additional payments. For your own application, run
 lightwalletd addresses. See [Connect your application](book/connect-an-app.md)
 for the request format.
 
+To test chain reorganizations, run `ths reorg --depth 3` to replace recent
+blocks or `ths rollback --depth 3` to remove them. See the
+[CLI reference](book/cli.md) for limits and transaction retention options.
+
 ## Stop and clean up
 
 Press Ctrl+C in the terminal running `ths`. It attempts to delete that

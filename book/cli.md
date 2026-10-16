@@ -30,7 +30,7 @@ to run in order. For a worked dashboard flow, see [Chapter
   CLI.)
 - Amounts are ZEC decimal strings with up to 8 decimal places, e.g. `1`,
   `0.5`, `2.25000001`. These are disposable Regtest coins with no value.
-- Commands that call the app (`mine`, `faucet`, and `wallet` subcommands) require
+- Commands that call the app (`mine`, `reorg`, `rollback`, `faucet`, and `wallet` subcommands) require
   a running environment. Start one first with `ths` (or `ths --name <NAME>`).
   `stop` and `reset --force` can remove resources left by an interrupted run.
 
@@ -328,6 +328,38 @@ Job history and keys last only for the server process lifetime, with a limit of
 1,024 jobs and no key eviction. At capacity, new admissions return HTTP 503;
 existing-key replays and reads continue. Stopping the server cancels running work
 and discards this history. Jobs and deduplication do not survive a restart.
+
+### `ths reorg --depth <N> [--keep-txs]` / `ths rollback --depth <N>`
+
+`reorg` removes the last N blocks and mines N replacements, keeping the tip
+height but changing those block hashes. `rollback` removes them without
+replacements. Both reconcile the wallet and support `--name` and `--json`.
+Depth must be 1–1,000, within Zakura's non-finalized window, and leave at least
+block 1 for wallet reconciliation. Active mining, payment execution, or another
+chain operation causes HTTP 409.
+
+```console
+ths reorg --depth 3
+ths reorg --depth 3 --keep-txs --json
+ths rollback --depth 3
+ths wait
+```
+
+Without `--keep-txs`, ths does not rebroadcast dropped transactions; replacement
+mining still uses the node's mempool. With it, ths attempts to reinclude the
+original non-coinbase transactions and verifies their replacement-block inclusion.
+Invalid anchors or other admission failures may prevent reinclusion. Failures
+are reported in both output modes; `--json` also lists `retained_txids` and
+`failed_transactions`. The CLI exits nonzero if any transaction was not retained,
+even though the chain changed.
+
+Affected payment records become `unconfirmed`, keeping their txids and keys.
+The server observes them but does not automatically rebroadcast, replace, or
+mine them. Later canonical inclusion can restore `confirmed`. This is not a
+wallet snapshot restore: unexpired local transactions can still reserve inputs.
+The server owns admitted work after client disconnection. An error or lost
+response can follow a partial chain change; inspect the current tip before
+retrying. Neither invalidation nor replacement mining is automatically retried.
 
 ---
 
@@ -660,6 +692,8 @@ account 1 to account 3, all without opening the dashboard.
 | `ths open` | Open the running dashboard |
 | `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
+| `ths reorg --depth N [--keep-txs]` | Replace recent blocks, optionally attempting transaction reinclusion |
+| `ths rollback --depth N` | Remove recent blocks without replacements |
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
 | `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet activity [--limit N] [--json]` | Print recent development-wallet activity |

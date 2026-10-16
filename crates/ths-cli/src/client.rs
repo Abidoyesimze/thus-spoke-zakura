@@ -54,6 +54,77 @@ struct FaucetResult {
     last_error: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct ChainTip {
+    height: u64,
+    hash: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ChainChangeResult {
+    depth: u32,
+    old_tip: ChainTip,
+    new_tip: ChainTip,
+    removed_hashes: Vec<String>,
+    replacement_hashes: Vec<String>,
+    retained_txids: Vec<String>,
+    failed_transactions: Vec<TransactionFailure>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct TransactionFailure {
+    txid: String,
+    error: String,
+}
+
+pub(crate) fn change_chain(
+    dashboard: &str,
+    client: &reqwest::blocking::Client,
+    operation: &str,
+    depth: u32,
+    keep_txs: bool,
+) -> Result<ChainChangeResult> {
+    let body = if operation == "reorg" {
+        serde_json::json!({"depth": depth, "keep_txs": keep_txs})
+    } else {
+        serde_json::json!({"depth": depth})
+    };
+    client
+        .post(format!("{dashboard}/api/v1/{operation}"))
+        .json(&body)
+        .send()
+        .map_err(anyhow::Error::from)
+        .and_then(decode_response)
+        .context("chain operation failed; inspect the current tip before retrying")
+}
+
+pub(crate) fn render_chain_change(
+    result: &ChainChangeResult,
+    name: &InstanceName,
+    operation: &str,
+    json: bool,
+) -> Result<String> {
+    if json {
+        return Ok(serde_json::to_string_pretty(result)?);
+    }
+    let action = if operation == "reorg" {
+        "Reorganized"
+    } else {
+        "Rolled back"
+    };
+    let mut output = format!(
+        "{action} {} blocks on {name}.\nNew tip: {} ({})",
+        result.depth, result.new_tip.height, result.new_tip.hash
+    );
+    for failure in &result.failed_transactions {
+        output.push_str(&format!(
+            "\nNot retained: {}: {}",
+            failure.txid, failure.error
+        ));
+    }
+    Ok(output)
+}
+
 fn confirmed_status() -> String {
     "confirmed".to_owned()
 }
@@ -462,6 +533,26 @@ impl Runtime {
 
         if job.state == MiningJobState::Failed {
             bail!(job.error.unwrap_or_else(|| "mining failed".to_owned()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn change_chain(
+        &self,
+        name: &InstanceName,
+        operation: &str,
+        depth: u32,
+        keep_txs: bool,
+        json: bool,
+    ) -> Result<()> {
+        let (dashboard, client) = self.instance_client(name)?;
+        let result = change_chain(&dashboard, &client, operation, depth, keep_txs)?;
+        println!("{}", render_chain_change(&result, name, operation, json)?);
+        if !result.failed_transactions.is_empty() {
+            bail!(
+                "chain changed, but {} transaction(s) could not be retained",
+                result.failed_transactions.len()
+            );
         }
         Ok(())
     }

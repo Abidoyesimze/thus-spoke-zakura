@@ -157,9 +157,10 @@ docker pull zakuracore/zakura:1.6.0
 docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --list
 cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
+cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact reorg_and_rollback_preserve_canonical_wallet_and_payment_state
 ```
 
-Linux CI runs broadcast recovery, concurrent sends, address-faucet restart
+Linux CI runs reorg/rollback, broadcast recovery, concurrent sends, address-faucet restart
 recovery, and queued-response cases on every push and PR. The other cases in
 `tests/activity_recovery.rs` cover startup funding, pool transfers, and
 external faucets. The fixture owns and cleans up only its own Docker resources;

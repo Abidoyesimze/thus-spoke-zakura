@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn parses_reorg_and_rollback_depths() {
+    for args in [
+        vec!["ths", "reorg", "--depth", "3"],
+        vec!["ths", "reorg", "--depth", "1000", "--keep-txs", "--json"],
+        vec!["ths", "--name", "alice", "rollback", "--depth", "1"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    for command in ["reorg", "rollback"] {
+        for depth in ["0", "1001", "-1", "1.5"] {
+            assert!(Cli::try_parse_from(["ths", command, "--depth", depth]).is_err());
+        }
+        assert!(Cli::try_parse_from(["ths", command]).is_err());
+    }
+    assert!(Cli::try_parse_from(["ths", "rollback", "--depth", "1", "--keep-txs"]).is_err());
+}
+
+#[test]
 fn separates_building_from_starting() {
     let default = Cli::try_parse_from(["ths"]).unwrap();
     assert!(default.command.is_none());
