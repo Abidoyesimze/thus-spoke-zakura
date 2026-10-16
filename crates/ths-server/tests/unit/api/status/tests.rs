@@ -13,7 +13,12 @@ async fn status_counts_accounts_without_reading_the_seed() {
         .unwrap();
 
     let response = router(state)
-        .oneshot(Request::get("/api/v1/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/status")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -24,8 +29,51 @@ async fn status_counts_accounts_without_reading_the_seed() {
     assert_eq!(status["account_count"], 5);
 }
 
+#[tokio::test]
+async fn non_loopback_host_cannot_access_the_seed_endpoint() {
+    let (state, _dir) = state_with_local_wallet();
+    let response = router(state)
+        .oneshot(
+            Request::post("/api/v1/dev/seed")
+                .header("host", "attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"confirmation":"I understand this seed is for regtest only"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        error,
+        serde_json::json!({
+            "error": {
+                "message": "Host must be a loopback address",
+                "status": 403
+            }
+        })
+    );
+}
+
 use super::*;
 use crate::wallet::WALLET_BIRTHDAY_HEIGHT;
+
+#[test]
+fn public_dashboard_endpoint_uses_configured_port_or_loopback_default() {
+    assert_eq!(
+        public_dashboard_endpoint(Some("http://127.0.0.1:32805")),
+        "http://127.0.0.1:32805"
+    );
+    assert_eq!(public_dashboard_endpoint(None), "http://127.0.0.1:8080");
+}
+
 fn wallet_status(
     state: &'static str,
     fully_scanned_height: Option<u64>,
@@ -55,6 +103,7 @@ fn settlement_for_test(
         node.map(checkpoint).as_ref(),
         lightwalletd.map(checkpoint).as_ref(),
         wallet,
+        true,
     )
 }
 
@@ -95,10 +144,10 @@ fn settlement_requires_all_three_components_at_the_same_tip() {
         hash: "replacement".to_owned(),
     };
     let wallet = wallet_status("ready", Some(105), None);
-    let status = settlement_status(Some(&canonical), Some(&replacement), &wallet);
+    let status = settlement_status(Some(&canonical), Some(&replacement), &wallet, true);
     assert_eq!(status.settlement_blocker, Some("chain_mismatch"));
 
-    let status = settlement_status(Some(&replacement), Some(&replacement), &wallet);
+    let status = settlement_status(Some(&replacement), Some(&replacement), &wallet, true);
     assert!(
         !status.settled,
         "a same-height reorg needs wallet reconciliation"
@@ -163,9 +212,26 @@ fn settlement_allows_a_canonical_tip_before_the_wallet_birthday() {
     let mut wallet = wallet_status("ready", None, None);
     wallet.observed_height = Some(tip.height);
     wallet.observed_hash = Some(tip.hash.clone());
-    assert!(settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+    assert!(settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
     wallet.observed_hash = Some("orphaned".to_owned());
-    assert!(!settlement_status(Some(&tip), Some(&tip), &wallet).settled);
+    assert!(!settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
+}
+
+#[test]
+fn settlement_waits_for_startup_after_the_components_agree() {
+    let tip = ChainCheckpoint {
+        height: 101,
+        hash: "canonical".to_owned(),
+    };
+    let wallet = wallet_status("ready", Some(101), None);
+    let status = settlement_status(Some(&tip), Some(&tip), &wallet, false);
+    assert!(!status.settled);
+    assert_eq!(status.settlement_blocker, Some("starting"));
+
+    let status = settlement_status(None, Some(&tip), &wallet, false);
+    assert_eq!(status.settlement_blocker, Some("node_unavailable"));
+
+    assert!(settlement_status(Some(&tip), Some(&tip), &wallet, true).settled);
 }
 
 use crate::state::tests::{api_get, counting_rpc};
