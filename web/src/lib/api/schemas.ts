@@ -93,6 +93,8 @@ export const statusSchema = z.object({
   account_count: z.number().int().nonnegative(),
   auto_mine: z.boolean(),
   network: z.string(),
+  settled: z.boolean().optional(),
+  settlement_blocker: z.string().nullable().optional(),
   // Optional so a dashboard built before the server grew this field still loads.
   endpoints: endpointsSchema.optional(),
   // Optional so a newer dashboard remains compatible with an older server.
