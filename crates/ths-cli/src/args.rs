@@ -81,6 +81,19 @@ pub(crate) enum Command {
         #[arg(value_parser = clap::value_parser!(u32).range(1..=10_000))]
         blocks: u32,
     },
+    /// Replace recent Regtest blocks with a new branch.
+    Reorg {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        depth: u32,
+        /// Attempt to include the dropped transactions in replacement blocks.
+        #[arg(long)]
+        keep_txs: bool,
+    },
+    /// Remove recent Regtest blocks without mining replacements.
+    Rollback {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        depth: u32,
+    },
     /// Send disposable Regtest ZEC to a unified or transparent address.
     Faucet {
         /// Regtest unified or transparent destination address.

@@ -44,7 +44,9 @@ impl From<MiningAdmissionError> for ApiError {
             MiningAdmissionError::InvalidBlocks | MiningAdmissionError::InvalidKey => {
                 StatusCode::BAD_REQUEST
             }
-            MiningAdmissionError::KeyConflict | MiningAdmissionError::Busy => StatusCode::CONFLICT,
+            MiningAdmissionError::KeyConflict
+            | MiningAdmissionError::Busy
+            | MiningAdmissionError::ChainBusy => StatusCode::CONFLICT,
             MiningAdmissionError::Capacity => StatusCode::SERVICE_UNAVAILABLE,
         };
         Self {
@@ -55,7 +57,12 @@ impl From<MiningAdmissionError> for ApiError {
 }
 impl From<anyhow::Error> for ApiError {
     fn from(error: anyhow::Error) -> Self {
-        let status = if error.downcast_ref::<IdempotencyConflict>().is_some() {
+        let status = if let Some(error) = error.downcast_ref::<crate::chain::ChainChangeError>() {
+            match error {
+                crate::chain::ChainChangeError::InvalidDepth => StatusCode::BAD_REQUEST,
+                crate::chain::ChainChangeError::Busy => StatusCode::CONFLICT,
+            }
+        } else if error.downcast_ref::<IdempotencyConflict>().is_some() {
             StatusCode::CONFLICT
         } else {
             match error.downcast_ref::<PaymentError>() {

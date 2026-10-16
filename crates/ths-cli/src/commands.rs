@@ -49,6 +49,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Open => runtime.open(&name),
         Command::Endpoints => runtime.endpoints(&name, cli.json),
         Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
+        Command::Reorg { depth, keep_txs } => {
+            runtime.change_chain(&name, "reorg", depth, keep_txs, cli.json)
+        }
+        Command::Rollback { depth } => {
+            runtime.change_chain(&name, "rollback", depth, false, cli.json)
+        }
         Command::Faucet { address, amount } => {
             runtime.faucet(&name, &address, amount.zatoshi(), cli.json)
         }

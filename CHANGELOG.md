@@ -22,6 +22,12 @@ and environment workflows.
   Follow its `Location` with GET and inspect the pending, confirmed, or failed
   status. Replaying a terminal request returns its stored outcome with HTTP
   200. [#235](https://github.com/zcashlabs/thus-spoke-zakura/pull/235)
+- **Payment status after chain changes:** API clients must accept `unconfirmed`
+  for payments whose confirming blocks are removed by `ths reorg` or
+  `ths rollback`. The original transaction and idempotency key are preserved;
+  the server observes these payments without automatically rebroadcasting,
+  replacing, or mining them.
+  [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307)
 - **Mining JSON migration:** `ths mine --json` now prints a mining job rather
   than the old `{blocks, hashes}` result. It includes the job ID, requested and
   completed blocks, state, error, and `progress_uncertain`.
@@ -60,6 +66,12 @@ and environment workflows.
   block target, action limits, and fee recycling.
   [#132](https://github.com/zcashlabs/thus-spoke-zakura/pull/132),
   [#214](https://github.com/zcashlabs/thus-spoke-zakura/pull/214)
+- **Reorg and rollback testing:** `ths reorg --depth N` replaces recent blocks,
+  while `ths rollback --depth N` removes them without replacements. Use
+  `reorg --keep-txs` to attempt reinclusion of dropped transactions. Both
+  commands reconcile wallet balances and have matching HTTP APIs. A failed
+  or interrupted request may have changed the chain; inspect its tip before
+  retrying. [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307)
 - **Environment workflows:** `ths run` starts a fresh settled environment for
   a child command and cleans it up afterwards. `ths list` reports environment
   and container status, while `ths logs` accepts `--head` and `--tail`.

@@ -1,6 +1,75 @@
 use super::*;
 
 #[test]
+fn chain_changes_forward_the_command_and_report_retention_failures_in_both_outputs() {
+    let response = serde_json::json!({
+        "depth":3,"old_tip":{"height":108,"hash":"old-tip"},
+        "new_tip":{"height":108,"hash":"new-tip"},
+        "removed_hashes":["a","b","c"],"replacement_hashes":["d","e","f"],
+        "retained_txids":["kept"],"failed_transactions":[{"txid":"dropped","error":"invalid anchor"}]
+    });
+    for (operation, keep_txs, body) in [
+        (
+            "reorg",
+            true,
+            serde_json::json!({"depth":3,"keep_txs":true}),
+        ),
+        (
+            "reorg",
+            false,
+            serde_json::json!({"depth":3,"keep_txs":false}),
+        ),
+        ("rollback", false, serde_json::json!({"depth":3})),
+    ] {
+        let (url, requests) = serve(vec![("200 OK", response.to_string())]);
+        let result = change_chain(
+            &url,
+            &reqwest::blocking::Client::new(),
+            operation,
+            3,
+            keep_txs,
+        )
+        .unwrap();
+        let (request_line, request_body) = requests.recv().unwrap();
+        assert_eq!(request_line, format!("POST /api/v1/{operation} HTTP/1.1"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request_body).unwrap(),
+            body
+        );
+        let json = render_chain_change(&result, &name("alpha"), operation, true).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            response
+        );
+        let text = render_chain_change(&result, &name("alpha"), operation, false).unwrap();
+        assert!(text.contains("3 blocks on alpha"));
+        assert!(text.contains("New tip: 108 (new-tip)"));
+        assert!(text.contains("Not retained: dropped: invalid anchor"));
+        assert!(text.starts_with(if operation == "reorg" {
+            "Reorganized"
+        } else {
+            "Rolled back"
+        }));
+    }
+}
+
+#[test]
+fn chain_changes_do_not_retry_rejected_or_lost_responses() {
+    for status in ["409 Conflict", "drop"] {
+        let (url, requests) = serve(vec![(status, "busy")]);
+        let error =
+            change_chain(&url, &reqwest::blocking::Client::new(), "reorg", 3, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("inspect the current tip before retrying")
+        );
+        assert_eq!(requests.recv().unwrap().0, "POST /api/v1/reorg HTTP/1.1");
+        assert!(requests.try_recv().is_err());
+    }
+}
+
+#[test]
 fn responses_decode_or_report_their_status_and_body() {
     let (url, _requests) = serve(vec![
         (

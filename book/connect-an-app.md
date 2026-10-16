@@ -199,6 +199,8 @@ These are every route the server serves today, from
 | `POST /api/v1/faucet/address` | Treasury payment to a supported Regtest address. Needs an idempotency key; external recipients have a separate stored faucet record. |
 | `GET /api/v1/faucet/address?idempotency_key=<key>` | Read an internal or external address-faucet result, or 404 if none is stored. |
 | `POST /api/v1/mine` | Generate 1–10,000 blocks and wait for wallet synchronization. Each call uses a fresh internal key. |
+| `POST /api/v1/reorg` | `{depth, keep_txs?}` removes recent blocks and mines replacements. Returns old/new tips, block hashes, and best-effort transaction-retention results. |
+| `POST /api/v1/rollback` | `{depth}` removes recent blocks without replacements and reconciles the wallet. Neither chain-changing POST is automatically retried. |
 | `POST /api/v1/mining/jobs` | Start a keyed mining job with `{blocks,idempotency_key}`; returns HTTP 202 and the job. |
 | `GET /api/v1/mining/jobs`, `/mining/jobs/{id}` | Read the latest job or a specific job; see [Chapter 5](mining-and-sync.md). |
 | `POST /api/v1/zip321/parse` | Parse one Regtest payment URI into its address, pool, optional amount, and memo; moves no funds. |

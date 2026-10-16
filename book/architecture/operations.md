@@ -105,7 +105,7 @@ The POST response is one activity object, and the same object is what
 | `amount_zatoshi` | Integer zatoshi paid to the destination. It does not include the fee. |
 | `txid` | The prepared transaction's ID; empty while status is `preparing`. |
 | `block_hash` | The confirming block's hash, or `null` before confirmation. |
-| `status` | `preparing`, `prepared`, `broadcast`, `confirmed`, or a stored terminal `failed` result. |
+| `status` | `preparing`, `prepared`, `broadcast`, `confirmed`, `unconfirmed` after a deliberate reorg/rollback, or a stored terminal `failed` result. |
 | `created_at` | When the row was inserted, as `YYYY-MM-DD HH:MM:SS` UTC. |
 | `last_error` | Stored diagnostic, or `null`. |
 
@@ -183,7 +183,14 @@ those checks are useful, but their boundary matters. Never reuse a key for
 a different amount or recipient. Do not reconstruct a balance by summing
 activity records; use `GET /api/v1/accounts` after wallet sync.
 
-A chain reorganization can replace the block named by a previously confirmed
+`ths reorg` and `ths rollback` clear affected confirmations in activity and
+external faucet records, marking them `unconfirmed` while preserving the original
+transaction, request, and key. Background handling only observes these payments;
+it does not rebroadcast, replace, or auto-mine them. Replays return that same
+unconfirmed request. A later canonical confirmation restores `confirmed` with
+its new block hash.
+
+An external chain reorganization can replace the block named by a previously confirmed
 activity. The server reconciles wallet balances against the new canonical
 chain, but it does not recheck activity already marked `confirmed`. If
 current inclusion matters, query Zakura for the transaction and compare its

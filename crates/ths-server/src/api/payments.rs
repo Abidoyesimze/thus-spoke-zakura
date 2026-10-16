@@ -600,7 +600,7 @@ fn payment_response<T>(
 ) -> ApiResult<PaymentResponse<T>> {
     let status = match status {
         "confirmed" | "failed" => StatusCode::OK,
-        "preparing" | "prepared" | "broadcast" => StatusCode::ACCEPTED,
+        "preparing" | "prepared" | "broadcast" | "unconfirmed" => StatusCode::ACCEPTED,
         status => return Err(anyhow::anyhow!("payment has unsupported status {status}").into()),
     };
     let mut url =
