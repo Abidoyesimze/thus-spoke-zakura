@@ -301,18 +301,55 @@ impl ChildOps for NeverExits {
     }
 }
 
+/// Fakes every ownership/absence read deterministically and instantly, and
+/// delegates removal (`run()`) to a real `LifecycleDocker` so the thing
+/// actually under test — a hanging removal and its reaping — stays real.
+/// This is the `DockerResourceCommands` seam, one level above
+/// `LifecycleDocker`/`ChildOps`: reads never spawn a subprocess at all, so
+/// neither fork/exec scheduling nor a real read's own tail latency can
+/// compete with the removal for the termination reserve. Responses below are
+/// exactly the reads `cleanup_core` issues for this fixture's one tracked
+/// container (confirmed by tracing `consider`/`resource_absent` for a
+/// resource whose recorded mutation outcome is `Acknowledged`, not
+/// `Pending`/`Uncertain`, so it takes the `resource_absent`, not
+/// `recorded_identity_absent`, path); anything else is a test bug, not a
+/// case to paper over.
+struct FakeReadsRealRemoval<'a> {
+    removal: LifecycleDocker<'a>,
+}
+
+impl DockerResourceCommands for FakeReadsRealRemoval<'_> {
+    fn output(&self, args: &[&str]) -> Result<String> {
+        match args {
+            ["container", "inspect", "app-id"] => Ok(
+                r#"[{"Id":"app-id","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#
+                    .to_owned(),
+            ),
+            ["container", "ls", "-a", "--format", "{{.Names}}"]
+            | ["volume", "ls", "--format", "{{.Name}}"]
+            | ["network", "ls", "--format", "{{.Name}}"] => Ok(String::new()),
+            _ => anyhow::bail!("unexpected docker read in hanging-removal test: {args:?}"),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Result<()> {
+        self.removal.run(args)
+    }
+}
+
 // Unlike the classification tests above, this exercises real deadline and
 // termination-reserve math: the resource-removal phase must stop at
 // deadline-minus-reserve and leave the reserve for `finish_helpers`. It uses
 // `NeverExits` (above) to force the "looks hung" branch deterministically
 // rather than relying on a real process's kill-to-exit timing under
-// contention, so the remaining real-time cost is just a bounded number of
-// `thread::sleep(poll)` wake-ups plus the normal journal/absence-check work —
-// not an open-ended wait on OS process-scheduling or fsync tail latency.
-// `with_child_ops` only reaches the removal (`run()`/mutation) call, not the
-// ownership-preflight or absence-check reads (`output()`), so this exercises
-// a hanging removal specifically — confirmed below by asserting `rm -f
-// app-id` actually ran.
+// contention, and `FakeReadsRealRemoval` (above) to keep every read
+// deterministic too — reads must return correct results, not launch a real
+// subprocess, per review feedback. The only real-time cost left is the
+// removal's own bounded `thread::sleep(poll)` wake-ups, one real kill signal,
+// one fast reap of an already-dead process, and two journal fsync writes
+// (begin + finish) — not open-ended OS process-scheduling or read latency.
+// Confirmed below by asserting `rm -f app-id` actually ran, so this is
+// reaping a hanging-removal helper specifically, not something else.
 #[test]
 fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     let never_exits = NeverExits;
@@ -352,14 +389,15 @@ fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     drop(journal);
     let removal_marker = root.path().join("removal-started");
     let deadline = Deadline::after(policy.cleanup);
-    let mut docker =
+    let mut removal =
         lifecycle_docker(&context, deadline, Cancellation::Ignore).with_child_ops(&never_exits);
-    docker.program = "/bin/sh".into();
-    docker.prefix_args = vec![script.path().join("docker").to_string_lossy().into_owned()];
-    docker.env.push((
+    removal.program = "/bin/sh".into();
+    removal.prefix_args = vec![script.path().join("docker").to_string_lossy().into_owned()];
+    removal.env.push((
         "THS_REMOVAL_MARKER".to_owned(),
         removal_marker.to_string_lossy().into_owned(),
     ));
+    let docker = FakeReadsRealRemoval { removal };
     let report = runtime
         .cleanup_core(&instance, &docker, false, deadline, &context)
         .unwrap();
