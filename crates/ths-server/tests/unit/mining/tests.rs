@@ -761,7 +761,11 @@ async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
     // When the generate reply is lost (transport/decode failure), the node may
     // have already produced a block. The loop must reconcile against the chain
     // tip and suppress re-mining the same transaction set.
+    //
+    // The pre-generate checkpoint returns the genesis tip; the reconciliation
+    // checkpoint returns a new tip — confirming the block was produced.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let checkpoint_calls = Arc::new(AtomicUsize::new(0));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn({
@@ -773,6 +777,7 @@ async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
                     "/",
                     post(move |Json(req): Json<Value>| {
                         let tx = tx.clone();
+                        let checkpoint_calls = checkpoint_calls.clone();
                         async move {
                             match req["method"].as_str() {
                                 Some("getrawmempool") => {
@@ -786,12 +791,19 @@ async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
                                     (StatusCode::OK, "not-a-valid-rpc-response").into_response()
                                 }
                                 Some("getblockchaininfo") => {
-                                    // Checkpoint reflects the block that was produced.
+                                    let n = checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+                                    let (blocks, hash) = if n == 0 {
+                                        // Before generate: chain at genesis.
+                                        (0u64, "0000000000000000000000000000000000000000000000000000000000000000")
+                                    } else {
+                                        // Reconciliation: chain has advanced.
+                                        (1u64, FAKE_HASH)
+                                    };
                                     Json(json!({
                                         "result": {
                                             "chain": "regtest",
-                                            "blocks": 1,
-                                            "bestblockhash": FAKE_HASH,
+                                            "blocks": blocks,
+                                            "bestblockhash": hash,
                                             "verificationprogress": 1.0
                                         },
                                         "error": null,
@@ -815,10 +827,13 @@ async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
     state.mark_started();
     tokio::spawn(mempool_mining_loop(state));
 
-    // First tick fires at t=0; lost reply → Unknown → reconcile → attempted = Some(["tx1"]).
+    // First tick fires at t=0: before=genesis, generate → Unknown →
+    // unresolved = {genesis, ["tx1"]}.
     rx.recv().await.expect("first generate call at t=0");
 
-    // Let reconciliation (getblockchaininfo) complete before advancing time.
+    // Advance to t=2: reconciliation tick reads current tip (H1), which differs
+    // from before (genesis) → chain advanced → attempted = Some(["tx1"]).
+    tokio::time::advance(Duration::from_secs(2)).await;
     for _ in 0..20 {
         tokio::task::yield_now().await;
     }
@@ -836,4 +851,212 @@ async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
         rx.try_recv().is_err(),
         "generate must not be called again after a lost reply is reconciled as produced"
     );
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_unknown_on_gateway_timeout() {
+    // HTTP 504 can occur after the node has forwarded and executed the request;
+    // it must not be treated as a pre-execution rejection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(|| async { (StatusCode::GATEWAY_TIMEOUT, "").into_response() }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(
+        matches!(
+            state.mine_and_sync_background().await,
+            Err(BackgroundMineError::Unknown(_))
+        ),
+        "HTTP 504 must be Unknown, not Generation"
+    );
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_unknown_on_empty_hash_result() {
+    // A success response carrying no hash does not prove no block was produced;
+    // the node may have generated before returning the unusable acknowledgment.
+    let url = rpc_server(|req| match req["method"].as_str() {
+        Some("generate") => json!({"result":[],"error":null,"id":req["id"]}),
+        _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(
+        matches!(
+            state.mine_and_sync_background().await,
+            Err(BackgroundMineError::Unknown(_))
+        ),
+        "empty hash result must be Unknown, not Generation"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_retries_when_generate_fails_without_producing_block() {
+    // When the generate reply is lost but the chain tip did not advance,
+    // no block was produced and the transaction set must be retried.
+    // This covers both "first attempt before any block exists" (before = H0,
+    // current = H0) and "unrelated block present before generate" (stale
+    // last_checkpoint from a prior mine would have caused false suppression
+    // in the old design; the fresh before-generate snapshot avoids it).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(move |Json(req): Json<Value>| {
+                    let tx = tx.clone();
+                    async move {
+                        match req["method"].as_str() {
+                            Some("getrawmempool") => {
+                                Json(json!({"result":["tx1"],"error":null,"id":req["id"]}))
+                                    .into_response()
+                            }
+                            Some("generate") => {
+                                let _ = tx.send(());
+                                // Reply is lost; before == current after this,
+                                // so reconciliation must allow a retry.
+                                (StatusCode::OK, "not-a-valid-rpc-response").into_response()
+                            }
+                            Some("getblockchaininfo") => {
+                                // Tip never changes: our generate produced no block.
+                                Json(json!({
+                                    "result": {
+                                        "chain": "regtest",
+                                        "blocks": 0,
+                                        "bestblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+                                        "verificationprogress": 1.0
+                                    },
+                                    "error": null,
+                                    "id": req["id"]
+                                }))
+                                .into_response()
+                            }
+                            _ => Json(json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]})).into_response(),
+                        }
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // Tick 0: before=H0, generate → Unknown → unresolved = {H0, ["tx1"]}.
+    rx.recv().await.expect("first generate call at t=0");
+
+    // Tick 2 (t=2): reconcile — current=H0 == before(H0) → no block → retry.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tick 4 (t=4): mining tick — same set is new again → second generate.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv().await.expect(
+        "second generate call proves the set is retried after reconciliation shows no block",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_defers_reconciliation_when_checkpoint_temporarily_unavailable() {
+    // When the checkpoint read fails during reconciliation, the loop must carry
+    // the unresolved attempt forward rather than permanently suppressing the set.
+    // Once the checkpoint becomes available again, reconciliation proceeds.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn({
+        async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move |Json(req): Json<Value>| {
+                        let tx = tx.clone();
+                        let checkpoint_calls = checkpoint_calls.clone();
+                        async move {
+                            match req["method"].as_str() {
+                                Some("getrawmempool") => {
+                                    Json(json!({"result":["tx1"],"error":null,"id":req["id"]}))
+                                        .into_response()
+                                }
+                                Some("generate") => {
+                                    let _ = tx.send(());
+                                    (StatusCode::OK, "not-a-valid-rpc-response").into_response()
+                                }
+                                Some("getblockchaininfo") => {
+                                    let n = checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+                                    if n == 1 {
+                                        // First reconciliation attempt: temporarily unavailable.
+                                        Json(json!({"result":null,"error":{"code":-1,"message":"temporarily unavailable"},"id":req["id"]})).into_response()
+                                    } else {
+                                        // Before-generate and subsequent: stable genesis tip.
+                                        Json(json!({
+                                            "result": {
+                                                "chain": "regtest",
+                                                "blocks": 0,
+                                                "bestblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+                                                "verificationprogress": 1.0
+                                            },
+                                            "error": null,
+                                            "id": req["id"]
+                                        })).into_response()
+                                    }
+                                }
+                                _ => Json(json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]})).into_response(),
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // Tick 0: before=H0, generate → Unknown → unresolved = {H0, ["tx1"]}.
+    rx.recv().await.expect("first generate call at t=0");
+
+    // Tick 2 (t=2): reconcile — checkpoint fails → defer (unresolved retained).
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tick 4 (t=4): reconcile — checkpoint returns H0 == before(H0) → no block → retry.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tick 6 (t=6): mining tick → second generate call confirms the set was retried.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv()
+        .await
+        .expect("second generate call proves the set is retried after deferred reconciliation");
 }
