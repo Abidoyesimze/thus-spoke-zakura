@@ -69,9 +69,11 @@ and environment workflows.
 - **Reorg and rollback testing:** `ths reorg --depth N` replaces recent blocks,
   while `ths rollback --depth N` removes them without replacements. Use
   `reorg --keep-txs` to attempt reinclusion of dropped transactions. Both
-  commands reconcile wallet balances and have matching HTTP APIs. A failed
-  or interrupted request may have changed the chain; inspect its tip before
-  retrying. [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307)
+  commands reconcile wallet balances and have matching HTTP APIs. Wallet sync
+  retries transient lightwalletd cache-repair errors. A failed or interrupted
+  request may have changed the chain; inspect its tip before retrying.
+  [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307),
+  [#388](https://github.com/zcashlabs/thus-spoke-zakura/pull/388)
 - **Environment workflows:** `ths run` starts a fresh settled environment for
   a child command and cleans it up afterwards. `ths list` reports environment
   and container status, while `ths logs` accepts `--head` and `--tail`.
