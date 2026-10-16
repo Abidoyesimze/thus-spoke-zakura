@@ -55,11 +55,25 @@ const PENDING = {
 function sendImpl(quote: typeof QUOTE, payment?: typeof PENDING, parsed: unknown = null) {
   return (input: RequestInfo | URL, init?: RequestInit) => {
     if (requestUrl(input).endsWith('/zip321/parse')) {
+      const raw = typeof init?.body === 'string' ? init.body : '{}';
+      const uri = (JSON.parse(raw) as { uri: string }).uri;
+      const address = uri.slice('zcash:'.length).split('?')[0] ?? '';
       return Promise.resolve(
-        new Response(JSON.stringify(parsed), {
-          status: 200,
-          headers: { 'content-type': 'application/json' },
-        }),
+        new Response(
+          JSON.stringify(
+            parsed ?? {
+              address,
+              destination_pool: address.startsWith('t') ? 'transparent' : 'ironwood',
+              to_account: null,
+              amount_zatoshi: null,
+              memo: null,
+            },
+          ),
+          {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          },
+        ),
       );
     }
     if (requestUrl(input).includes('/activity?')) {
@@ -129,6 +143,65 @@ describe('SendDialog', () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  it('quotes and sends a transparent external address through the transparent pool', async () => {
+    const address = 'tmAg2wTARgKBHA9mFouqR727cU98MJmfjSq';
+    const transparentQuote = { ...QUOTE, fee_zatoshi: 20_000, max_zatoshi: 400_000_000 };
+    fetchMock.mockImplementation((input, init) => {
+      if (requestUrl(input).endsWith('/send/quote')) {
+        const raw = typeof init?.body === 'string' ? init.body : '{}';
+        const pool = (JSON.parse(raw) as { destination_pool: string }).destination_pool;
+        return Promise.resolve(Response.json(pool === 'transparent' ? transparentQuote : QUOTE));
+      }
+      return sendImpl(QUOTE)(input, init);
+    });
+    renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    await selectTransferField('Destination', 'Other address');
+    await userEvent.type(screen.getByLabelText('Destination address'), address);
+    await waitFor(() =>
+      expect(screen.getByText('Destination pool').parentElement).toHaveTextContent(
+        'Transparent (public)',
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByText(/4 ZEC spendable after a 0.0002 ZEC network fee/),
+      ).toBeInTheDocument(),
+    );
+    await userEvent.click(screen.getByRole('button', { name: 'Max' }));
+    expect(screen.getByLabelText('Amount (ZEC)')).toHaveValue('4');
+    expect(screen.getByLabelText('Memo (optional)')).toBeDisabled();
+    await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+    await waitFor(() => expect(sendCalls(fetchMock)).toHaveLength(1));
+    expect(body(fetchMock)).toMatchObject({
+      to_address: address,
+      destination_pool: 'transparent',
+      amount_zatoshi: 400_000_000,
+    });
+    expect(body(fetchMock)).not.toHaveProperty('memo');
+  });
+
+  it.each(['not-an-address', 't1wrongnetworkaddress'])(
+    'rejects %s before sending',
+    async (address) => {
+      fetchMock.mockImplementation((input, init) =>
+        requestUrl(input).endsWith('/zip321/parse')
+          ? Promise.resolve(
+              new Response(
+                JSON.stringify({ error: { message: 'Not a valid Regtest address', status: 400 } }),
+                { status: 400 },
+              ),
+            )
+          : sendImpl(QUOTE)(input, init),
+      );
+      renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+      await selectTransferField('Destination', 'Other address');
+      await userEvent.type(screen.getByLabelText('Destination address'), address);
+      await userEvent.click(screen.getByRole('button', { name: /Send ZEC/i }));
+      expect(await screen.findByText('Not a valid Regtest address')).toBeInTheDocument();
+      expect(sendCalls(fetchMock)).toHaveLength(0);
+    },
+  );
 
   async function submitAmount(amount: string) {
     renderWithProviders(<SendDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
