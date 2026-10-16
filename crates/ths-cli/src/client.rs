@@ -396,11 +396,6 @@ impl Runtime {
             );
         }
 
-        // The job reached a terminal state: replaying this key would only ever
-        // return this same frozen job, so forget it and let a future `mine`
-        // with the same block count start a fresh one.
-        journal.clear(&[(&intent, &idempotency_key)])?;
-
         if json {
             let output = MineOutput {
                 id: job.id.clone(),
@@ -413,6 +408,15 @@ impl Runtime {
             };
             writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
         }
+
+        // The job reached a terminal state: replaying this key would only ever
+        // return this same frozen job, so forget it and let a future `mine`
+        // with the same block count start a fresh one. Cleared only after the
+        // output above is written: if that write fails, the key must still
+        // survive so a retry does not start a second job for output we never
+        // actually delivered.
+        journal.clear(&[(&intent, &idempotency_key)])?;
+
         if job.state == MiningJobState::Failed {
             bail!(job.error.unwrap_or_else(|| "mining failed".to_owned()));
         }
@@ -933,17 +937,23 @@ fn submit_mining_job(
     let body = serde_json::json!({"blocks": blocks, "idempotency_key": idempotency_key});
     loop {
         let Some(left) = remaining(deadline) else {
-            bail!("timed out before the mining job was submitted");
+            bail!(
+                "timed out submitting the mining job; it may have been accepted and could \
+                 still be running. Run the same command to check it again."
+            );
         };
-        match client
+        if let Ok(response) = client
             .post(format!("{dashboard}/api/v1/mining/jobs"))
             .json(&body)
             .timeout(MINE_POLL_ATTEMPT_TIMEOUT.min(left))
             .send()
         {
-            Ok(response) => return decode_response(response),
-            Err(_) => continue,
+            return decode_response(response);
         }
+        // An unreachable server fails instantly, so without a pause this
+        // would otherwise spin for the whole deadline instead of retrying
+        // at a reasonable rate.
+        std::thread::sleep(MINE_POLL_INTERVAL.min(left));
     }
 }
 

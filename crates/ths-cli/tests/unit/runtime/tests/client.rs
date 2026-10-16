@@ -133,6 +133,87 @@ fn mine_reports_partial_progress_alongside_the_servers_error() {
     );
 }
 
+/// Always fails to write, as a broken pipe or a full disk would.
+struct FailingWriter;
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("the pipe is closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn mine_keeps_the_journal_key_when_writing_the_json_result_fails() {
+    let (url, _requests) = serve(vec![(
+        "202 Accepted",
+        r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#,
+    )]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            FailingWriter,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            true,
+        )
+        .unwrap_err();
+
+    // The job completed, but its result was never actually delivered, so the
+    // key must survive: clearing it here would let a retry start a second
+    // job for output the caller never received.
+    let saved = IntentJournal::open(&runtime.instance_dir(&alpha), "mining")
+        .unwrap()
+        .read()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(saved.contains_key("mine:1"));
+}
+
+#[test]
+fn submission_retries_pause_between_attempts_instead_of_busy_looping() {
+    // Each attempt fails instantly (a dropped connection, not a stall), so
+    // without a pause between attempts this would retry as fast as the
+    // network allows instead of at a reasonable rate.
+    let (url, requests) = serve(vec![("drop", ""); 20]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let mut out = Vec::new();
+    let error = runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_millis(900),
+            1,
+            false,
+        )
+        .unwrap_err();
+    let full_error = format!("{error:#}");
+    assert!(
+        full_error.contains("may have been accepted"),
+        "{full_error}"
+    );
+
+    let attempts = requests.try_iter().count();
+    assert!(
+        attempts <= 6,
+        "expected a handful of paused attempts within ~900ms, got {attempts}"
+    );
+}
+
 #[test]
 fn mine_status_line_reports_progress_for_every_state() {
     let mining = MiningJob {
