@@ -51,6 +51,16 @@ export const activitySchema = z.object({
 });
 export type Activity = z.infer<typeof activitySchema>;
 
+export const addressFaucetSchema = z.object({
+  address: z.string(),
+  amount_zatoshi: zatoshi,
+  txid: z.string(),
+  block_hash: z.string().nullable(),
+  status: z.string(),
+  last_error: z.string().nullable(),
+});
+export type AddressFaucet = z.infer<typeof addressFaucetSchema>;
+
 /** A single-payment ZIP-321 URI as resolved by the server. */
 export const paymentUriSchema = z.object({
   address: z.string(),
