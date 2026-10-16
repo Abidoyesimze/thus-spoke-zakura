@@ -188,7 +188,7 @@ These are every route the server serves today, from
 
 | Route | Notes |
 | --- | --- |
-| `GET /api/v1/health` | 200 after startup finishes, Zakura answers, and the wallet has published at least one snapshot; 503 otherwise. The natural readiness probe. |
+| `GET /api/v1/health` | 200 after startup finishes, Zakura and lightwalletd answer, and the wallet has published at least one snapshot; 503 otherwise. The natural readiness probe. |
 | `GET /api/v1/status` | Node tip, account count, network, endpoints, `wallet_sync`, and settlement status. |
 | `GET /api/v1/accounts` | Accounts 1–5 with balances, addresses, and viewing keys. |
 | `GET /api/v1/activity` | Recorded development payments; see [Chapter 6](architecture/operations.md#call-the-api-with-a-deliberate-key) for the object's thirteen fields. |

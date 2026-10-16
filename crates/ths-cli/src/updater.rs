@@ -1,7 +1,7 @@
 use std::{
     env, fs,
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, ExitCode, Stdio},
     time::Duration,
 };
@@ -60,8 +60,8 @@ pub fn run(requested: Option<&str>, check: bool, json: bool) -> Result<ExitCode>
         }
     };
 
-    let executable = env::current_exe().context("locating the running launcher")?;
-    let install_dir = executable
+    let launcher = installed_launcher()?;
+    let install_dir = launcher
         .parent()
         .context("the running launcher has no parent directory")?;
     run_installer(INSTALLER, &target, install_dir)?;
@@ -87,11 +87,23 @@ fn startup_notice_from(endpoint: &str, current: &Version) -> Option<String> {
 
 pub fn uninstall() -> Result<ExitCode> {
     ensure_release_distribution()?;
-    let executable = env::current_exe().context("locating the running launcher")?;
-    remove_installed_executable(&executable)?;
-    println!("Uninstalled ths from {}.", executable.display());
+    let launcher = installed_launcher()?;
+    remove_installed_executable(&launcher)?;
+    println!("Uninstalled ths from {}.", launcher.display());
     println!("Cached Docker images and configuration were left in place.");
     Ok(ExitCode::SUCCESS)
+}
+
+/// The launcher file that update and uninstall act on. On macOS `current_exe` returns the path the
+/// launcher was run through, so a symlinked `ths` would be replaced or removed instead of the real
+/// launcher. Resolving it leaves the symlink in place.
+fn installed_launcher() -> Result<PathBuf> {
+    resolve_launcher(&env::current_exe().context("locating the running launcher")?)
+}
+
+fn resolve_launcher(executable: &Path) -> Result<PathBuf> {
+    fs::canonicalize(executable)
+        .with_context(|| format!("resolving the running launcher {}", executable.display()))
 }
 
 fn remove_installed_executable(executable: &Path) -> Result<()> {

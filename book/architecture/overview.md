@@ -71,6 +71,8 @@ The node mines to the treasury's transparent address. Normal transparent-output 
 The instance also has separate `chain`, `lightwalletd`, and `config`
 volumes. `ths` attempts instance-scoped cleanup on shutdown, interruption,
 or startup failure. It reports success only after verifying cleanup.
+Zakura runs with `ZAKURA_STATE__CACHE_DIR=/data`, so its state uses the `chain`
+volume mounted at `/data` instead of the image's default cache directory.
 
 Recovery records allocation identities as well as resource names. A known
 original container ID can be checked and removed without adopting a same-name
