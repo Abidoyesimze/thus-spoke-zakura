@@ -138,7 +138,7 @@ fn run_refuses_existing_instance_without_cleanup() {
 }
 
 #[test]
-fn stop_does_not_delete_an_instance_held_by_run() {
+fn stop_does_not_delete_an_instance_locked_by_another_command() {
     let runtime = runtime_for_tests();
     let lock = runtime.lock_instance(&name("alpha")).unwrap();
     let error = runtime.stop(&name("alpha")).unwrap_err();
@@ -249,4 +249,71 @@ fn interrupted_child_terminates_its_background_process_group() {
         .status()
         .is_ok_and(|status| status.success());
     assert!(!alive, "background descendant {} survived", pid.trim());
+}
+
+#[test]
+fn stop_routes_through_a_running_run() {
+    let runtime = runtime_for_tests();
+    let root = runtime.root.clone();
+    let received_signal = root.join("child-signal");
+    let script = format!(
+        "trap 'echo INT > {0}; exit 0' INT; trap 'echo TERM > {0}; exit 0' TERM; while :; do sleep 0.05; done",
+        received_signal.display()
+    );
+    let (handoff, received) = mpsc::channel();
+    let owner = thread::spawn(move || {
+        let (mut host, events) = RecordingHost::new();
+        host.real_child = true;
+        host.run_status = Some(RuntimeStatus {
+            node_height: Some(105),
+            lightwalletd_height: Some(105),
+            wallet_scanned_height: Some(105),
+            wallet_sync_state: "ready".into(),
+            settled: true,
+            settlement_blocker: None,
+        });
+        handoff.send(events.clone()).unwrap();
+        let mut context = LifecycleContext::new(LifecyclePolicy::default());
+        context.overall_deadline = Some(Deadline::after(Duration::from_secs(30)));
+        let (_sender, shutdown) = Shutdown::channel();
+        let runtime = Runtime { root };
+        let code = runtime
+            .run_with_policy(
+                &name("alpha"),
+                &[
+                    OsString::from("sh"),
+                    OsString::from("-c"),
+                    OsString::from(script),
+                ],
+                &runtime.root,
+                &host,
+                &shutdown,
+                &context,
+            )
+            .map_err(|error| format!("{error:#}"));
+        (code, events.lock().unwrap().clone())
+    });
+    let events = received.recv().unwrap();
+    startup::wait_for_event(&events, "child:alpha");
+    let started = Instant::now();
+
+    let report = startup::stop_after_owner_with(
+        &runtime,
+        &events,
+        "delete:alpha",
+        &RecordingDocker::new("", "", ""),
+    )
+    .unwrap();
+
+    assert!(report.verified());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let (code, events) = owner.join().unwrap();
+    assert_eq!(code, Ok(1));
+    assert_eq!(events.last().map(String::as_str), Some("delete:alpha"));
+    assert!(startup::session_files(&runtime).is_empty());
+    assert_eq!(
+        fs::read_to_string(&received_signal).unwrap().trim(),
+        "INT",
+        "stop must reach the child the way Ctrl+C does"
+    );
 }

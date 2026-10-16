@@ -76,6 +76,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 from,
                 to,
                 amount,
+                max,
                 memo,
             } => send(
                 &runtime,
@@ -83,7 +84,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 SendArgs {
                     from,
                     to: Some(to),
-                    amount: Some(amount),
+                    amount,
+                    max,
                     uri: None,
                     source_pool: Pool::Transparent,
                     destination_pool: Pool::Ironwood,
@@ -91,13 +93,19 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 },
                 cli.json,
             ),
-            WalletCommand::Unshield { from, to, amount } => send(
+            WalletCommand::Unshield {
+                from,
+                to,
+                amount,
+                max,
+            } => send(
                 &runtime,
                 &name,
                 SendArgs {
                     from,
                     to: Some(to),
-                    amount: Some(amount),
+                    amount,
+                    max,
                     uri: None,
                     source_pool: Pool::Ironwood,
                     destination_pool: Pool::Transparent,

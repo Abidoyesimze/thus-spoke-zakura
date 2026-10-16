@@ -1,4 +1,4 @@
-use super::error::{ApiError, ApiResult};
+use super::error::{ApiError, ApiJson, ApiQuery, ApiResult};
 use super::payments::require_key;
 use crate::state::AppState;
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
 };
 use axum::{
     Json,
-    extract::{Query, State},
+    extract::State,
     http::{HeaderMap, StatusCode, header::HOST},
     response::{IntoResponse, Response},
 };
@@ -142,7 +142,7 @@ pub(crate) struct SeedRequest {
 }
 pub(crate) async fn seed(
     State(state): State<AppState>,
-    Json(req): Json<SeedRequest>,
+    ApiJson(req): ApiJson<SeedRequest>,
 ) -> ApiResult<Json<Value>> {
     if req.confirmation != "I understand this seed is for regtest only" {
         return Err(ApiError::bad_request("exact confirmation phrase required"));
@@ -163,7 +163,7 @@ pub(crate) struct Page {
 }
 pub(crate) async fn activity(
     State(state): State<AppState>,
-    Query(page): Query<Page>,
+    ApiQuery(page): ApiQuery<Page>,
 ) -> ApiResult<Json<Vec<Activity>>> {
     if let Some(key) = page.idempotency_key {
         require_key(&key)?;

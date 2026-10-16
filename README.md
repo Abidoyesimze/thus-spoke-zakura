@@ -60,10 +60,18 @@ ID can be reconciled without changing their format.
 
 The recovery journal records resources by kind and name and retains their
 allocation identities. A per-name lock serializes startup, stop, and reset.
-`run` holds that lock until cleanup; ordinary foreground start releases it
-once ready so another command can stop the environment. Once ready,
-the foreground launcher watches the allocated app container and exits when
-another command deletes it, without deleting the environment again.
+`run` holds that lock until cleanup; foreground start releases it once ready.
+A second per-name lock is held by `start` or `run` until it exits, so another
+`start` or `run` with the same name is refused instead of replacing the
+running environment. While that launcher runs, `stop` and `reset --force` ask
+it to shut down, as Ctrl+C would, during startup, once ready, or while `run`'s
+command runs. They wait for its cleanup and then verify that nothing is left.
+Requests name the launcher's session, so a leftover request cannot stop a
+later launcher. A launcher stopped before it was ready exits with an error.
+Without a running launcher, `stop` and `reset --force` delete what is left
+themselves. The foreground launcher also watches the allocated app container
+and exits when it is deleted some other way, without deleting the environment
+again.
 
 ![Wallet dashboard with five development accounts](book/images/wallet.png)
 
@@ -389,6 +397,7 @@ Running `ths` with no command starts the default environment.
 | `ths wallet balances` | Print each development account's balances and addresses |
 | `ths wallet faucet --accounts 1,2,3 --amount 3` | Fund development accounts by index from the treasury; repeat the same command to check pending payments |
 | `ths wallet send --from 1 --to 2 --amount 1 --memo "hi"` | Send between development accounts or pools, with an optional Ironwood memo; repeat the same command to check a pending payment |
+| `ths wallet send --from 1 --to 2 --max` | Send the source pool's maximum spendable balance after the server-calculated fee |
 | `ths wallet send --from 1 --uri "zcash:..."` | Pay a ZIP-321 payment URI to any Regtest address; repeat the same command to check a pending payment |
 | `ths wallet activity --limit 20` | Print recent wallet transfers and faucet activity |
 | `ths wallet quote --from 1 --source-pool ironwood --destination-pool transparent` | Show an account's spendable funds, fee, and maximum send for one pool route without sending |
@@ -598,8 +607,10 @@ payment has a recorded error.
 A hidden sixth account acts as the mining and faucet
 treasury. Account 1 starts with 5 Ironwood ZEC, so you can experiment immediately.
 
-The local chain activates every network upgrade through NU6.3 at height 1, so it
-follows mainnet's current consensus rules. Shielded funds live in the Ironwood
+The local chain activates every network upgrade through NU7 at height 1.
+NU7 applies a 25-second block target, shielded action limits, and transaction
+fee recycling into the network sustainability mechanism (NSM). `ths mine`
+still generates blocks on demand. Shielded funds live in the Ironwood
 pool. The Orchard pool stopped accepting deposits at NU6.3, so the wallet API
 rejects `orchard` as a pool.
 

@@ -152,6 +152,8 @@ struct RecordingHost {
     deleted_elsewhere: bool,
     allocate_delay: Duration,
     run_status: Option<RuntimeStatus>,
+    while_running: Option<Box<dyn Fn() -> Ended>>,
+    real_child: bool,
 }
 
 impl RecordingHost {
@@ -169,6 +171,8 @@ impl RecordingHost {
                 deleted_elsewhere: false,
                 allocate_delay: Duration::ZERO,
                 run_status: None,
+                while_running: None,
+                real_child: false,
             },
             events,
         )
@@ -198,13 +202,23 @@ impl StartHost for RecordingHost {
 
     fn run_child(
         &self,
-        _command: &[OsString],
-        _current_dir: &Path,
+        command: &[OsString],
+        current_dir: &Path,
         name: &InstanceName,
-        _endpoints: &Endpoints,
-        _shutdown: &Shutdown,
+        endpoints: &Endpoints,
+        shutdown: &Shutdown,
     ) -> Result<ChildOutcome> {
         self.push(&format!("child:{name}"));
+        if self.real_child {
+            return run_child(
+                command,
+                current_dir,
+                name,
+                endpoints,
+                shutdown,
+                Duration::from_millis(100),
+            );
+        }
         Ok(ChildOutcome::Exited(42))
     }
 
@@ -333,6 +347,9 @@ impl StartHost for RecordingHost {
     ) -> Result<Ended> {
         self.push(&format!("wait_for_shutdown:{}", app_container.id));
         assert_eq!(app_container, &watched("app-1"));
+        if let Some(while_running) = &self.while_running {
+            return Ok(while_running());
+        }
         if self.shutdown_collision.is_some() {
             return Ok(Ended::Interrupted);
         }
@@ -382,7 +399,7 @@ fn faucet_journal_lock_probe() {
 
 /// answers loopback requests in turn with canned statuses and bodies, passing on each
 /// request line and body. `drop` closes the connection without a response, as a lost
-/// response would; `hang` holds it open without answering.
+/// response would; `hang` holds it open without answering; `delay` waits 200 ms before a 200.
 fn serve<B: Into<String> + Send + 'static>(
     responses: Vec<(&'static str, B)>,
 ) -> (String, mpsc::Receiver<(String, String)>) {
@@ -423,20 +440,26 @@ fn serve<B: Into<String> + Send + 'static>(
                     String::from_utf8(request).unwrap(),
                 ))
                 .unwrap();
-            match status {
+            let (status, tolerate_write_error) = match status {
                 "drop" => continue,
                 "hang" => {
                     std::thread::sleep(Duration::from_secs(60));
                     continue;
                 }
-                _ => {}
-            }
-            write!(
+                "delay" => {
+                    std::thread::sleep(Duration::from_millis(200));
+                    ("200 OK", true)
+                }
+                status => (status, false),
+            };
+            let response = write!(
                 stream,
                 "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
-            )
-            .unwrap();
+            );
+            if !tolerate_write_error {
+                response.unwrap();
+            }
         }
     });
     (url, received)

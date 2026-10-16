@@ -1,6 +1,7 @@
 use crate::state::AppState;
 use axum::{
     Router,
+    http::StatusCode,
     routing::{get, post},
 };
 use std::path::PathBuf;
@@ -45,7 +46,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/addresses/{address}", get(explorer::address))
         .route("/api/v1/search", get(explorer::search))
         .route("/api/v1/events", get(events::events))
+        .method_not_allowed_fallback(method_not_allowed)
         .fallback_service(dashboard::dashboard_router(static_dir))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn method_not_allowed() -> error::ApiError {
+    error::ApiError {
+        status: StatusCode::METHOD_NOT_ALLOWED,
+        message: "method is not allowed".into(),
+    }
 }

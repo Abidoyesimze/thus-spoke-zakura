@@ -21,7 +21,7 @@ use super::*;
 
 type TestState = testing::TestState<BlockCache, TestDb, LocalNetwork>;
 
-/// The SDK's default test network with every upgrade through NU6.3 active from
+/// The SDK's default test network with every upgrade through NU7 active from
 /// Sapling activation, like the local chain, so shielded value lives in Ironwood.
 fn test_state() -> TestState {
     let activation = Some(BlockHeight::from_u32(100_000));
@@ -30,6 +30,7 @@ fn test_state() -> TestState {
         nu6_1: activation,
         nu6_2: activation,
         nu6_3: activation,
+        nu7: activation,
         ..TestBuilder::<(), ()>::DEFAULT_NETWORK
     };
     TestBuilder::new()

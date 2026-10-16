@@ -328,6 +328,7 @@ fn wallet_quote_requires_an_account_and_both_pools() {
     );
     for extra in [
         &["--amount", "1"][..],
+        &["--max"],
         &["--to", "2"],
         &["--uri", "zcash:tm"],
     ] {
@@ -356,9 +357,12 @@ fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
     };
     assert_eq!(args.uri.as_deref(), Some("zcash:uregtest1abc?amount=1"));
     assert_eq!((args.to, args.amount), (None, None));
+    assert!(!args.max);
 
-    // --amount is still accepted for a URI that omits one.
+    // --amount or --max can supply an amount omitted by the URI.
     assert!(parse(&["--uri", "zcash:uregtest1abc", "--amount", "1"]).is_ok());
+    assert!(parse(&["--uri", "zcash:uregtest1abc", "--max"]).is_ok());
+    assert!(parse(&["--uri", "zcash:uregtest1abc", "--amount", "1", "--max"]).is_err());
     // The URI already names the destination, its pool, and any memo.
     assert!(parse(&["--uri", "zcash:uregtest1abc", "--to", "2"]).is_err());
     assert!(
@@ -371,7 +375,25 @@ fn wallet_send_takes_a_payment_uri_instead_of_a_destination() {
         .is_err()
     );
     assert!(parse(&["--uri", "zcash:uregtest1abc", "--memo", "hi"]).is_err());
-    // Without a URI, a destination and an amount are required.
+    // Without a URI, a destination and either --amount or --max are required.
     assert!(parse(&["--amount", "1"]).is_err());
     assert!(parse(&["--to", "2"]).is_err());
+    assert!(parse(&["--to", "2", "--max"]).is_ok());
+    assert!(parse(&["--to", "2", "--amount", "1", "--max"]).is_err());
+}
+
+#[test]
+fn shield_and_unshield_accept_exactly_one_amount_mode() {
+    for command in ["shield", "unshield"] {
+        let parse = |amount: &[&str]| {
+            let mut argv = vec!["ths", "wallet", command, "--from", "1", "--to", "1"];
+            argv.extend_from_slice(amount);
+            Cli::try_parse_from(argv)
+        };
+
+        assert!(parse(&["--amount", "1"]).is_ok());
+        assert!(parse(&["--max"]).is_ok());
+        assert!(parse(&[]).is_err());
+        assert!(parse(&["--amount", "1", "--max"]).is_err());
+    }
 }

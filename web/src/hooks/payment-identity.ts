@@ -125,8 +125,14 @@ export function retainedPaymentKey(name: string, owned: Map<string, string>) {
   );
 }
 
-export async function clearPayment(identity: PaymentIdentity, owned: Map<string, string>) {
-  await withPaymentLock(identity.name, () => {
+export async function clearPayment(
+  identity: PaymentIdentity,
+  owned: Map<string, string>,
+  canClear?: () => boolean,
+  onCleared?: () => void,
+) {
+  return withPaymentLock(identity.name, () => {
+    if (canClear && !canClear()) return false;
     const { kind, name, key } = identity;
     if (localStorage.getItem(name) === key) localStorage.removeItem(name);
     if (sessionStorage.getItem(name) === key) sessionStorage.removeItem(name);
@@ -136,6 +142,9 @@ export async function clearPayment(identity: PaymentIdentity, owned: Map<string,
     }
     if (owned.get(name) === key) owned.delete(name);
     window.dispatchEvent(new Event(changed));
+    // A later Resume may restore this row, so Forget must remove it before releasing the lock.
+    onCleared?.();
+    return true;
   });
 }
 
@@ -277,5 +286,12 @@ export function useRetainedPayments(kind: PaymentKind) {
       ),
     }));
   }, []);
-  return { ...snapshot, show, dismissKey };
+  const forgetKey = useCallback((key: string) => {
+    setSnapshot((previous) => ({
+      ...previous,
+      retained: previous.retained.filter((item) => item.key !== key),
+      displayed: previous.displayed.filter((item) => item.key !== key),
+    }));
+  }, []);
+  return { ...snapshot, show, dismissKey, forgetKey };
 }

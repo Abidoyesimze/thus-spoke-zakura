@@ -23,11 +23,12 @@ import { cn } from '@/lib/cn';
 export function PaymentStatus({
   identity,
   restored,
-  pendingKey,
+  inFlight,
   busy,
   claimAnnouncement,
   onTerminal,
   onResume,
+  onForget,
   onDismiss,
   onNew,
   container,
@@ -38,11 +39,12 @@ export function PaymentStatus({
 }: {
   identity: PaymentIdentity;
   restored: boolean;
-  pendingKey: string | null;
+  inFlight: boolean;
   busy: boolean;
   claimAnnouncement: (key: string) => boolean;
   onTerminal: (identity: PaymentIdentity) => Promise<void>;
   onResume: (identity: PaymentIdentity) => void;
+  onForget: () => Promise<void>;
   onDismiss: () => void;
   onNew: () => void;
   container: HTMLElement | null;
@@ -71,7 +73,7 @@ export function PaymentStatus({
   const terminal = isTerminalPayment(activity);
   const confirmed = activity?.status === 'confirmed';
   const failed = activity?.status === 'failed';
-  const inFlight = pendingKey === identity.key;
+  const canForget = status.isSuccess && activity === null && !inFlight;
   const variables = identity.variables;
   const destination = paymentRecipient(variables);
   useEffect(() => {
@@ -163,6 +165,17 @@ export function PaymentStatus({
       if (mounted.current) setCheckingCleanup(false);
     }
   };
+  const forget = async () => {
+    setCheckingCleanup(true);
+    try {
+      await onForget();
+      if (mounted.current) setCleanupError(null);
+    } catch (error) {
+      if (mounted.current) setCleanupError(errorMessage(error));
+    } finally {
+      if (mounted.current) setCheckingCleanup(false);
+    }
+  };
   const checking = !activity && status.isPending && status.isFetching;
   const label = confirmed
     ? 'Confirmed'
@@ -241,6 +254,11 @@ export function PaymentStatus({
       {!terminal && !activity && !status.isPending && !status.isError && (
         <p className="text-ink-muted mt-2">No record yet. The request is saved.</p>
       )}
+      {canForget && (
+        <p className="text-ink-muted mt-1">
+          Forgetting removes it from this browser only; it does not cancel server work.
+        </p>
+      )}
       {!terminal && activity?.last_error && (
         <PaymentWarning className="mt-2">
           <p>Latest execution error: {activity.last_error}</p>
@@ -296,6 +314,18 @@ export function PaymentStatus({
             >
               <RotateCcw aria-hidden />
               Resume
+            </Button>
+          )}
+          {canForget && (
+            <Button
+              type="button"
+              size="sm"
+              variant="ghost"
+              loading={checkingCleanup}
+              aria-describedby={titleId}
+              onClick={() => void forget()}
+            >
+              Forget saved request
             </Button>
           )}
           {confirmed && activity.txid && (
