@@ -665,17 +665,9 @@ impl Runtime {
         shutdown: &Shutdown,
     ) -> Result<()> {
         let context = LifecycleContext::new(LifecyclePolicy::default());
-        self.start_with_policy(
-            name,
-            no_open,
-            json,
-            port_offset,
-            MiningConfig::default(),
-            host,
-            shutdown,
-            &context,
-        )
+        self.start_with_policy(name, no_open, json, port_offset, host, shutdown, &context)
     }
+
     #[allow(clippy::too_many_arguments)]
     #[cfg(test)]
     pub(super) fn start_with_policy(
@@ -684,7 +676,6 @@ impl Runtime {
         no_open: bool,
         json: bool,
         port_offset: u16,
-        mining: MiningConfig,
         host: &dyn StartHost,
         shutdown: &Shutdown,
         context: &LifecycleContext,
@@ -696,6 +687,7 @@ impl Runtime {
             no_open,
             json,
             port_offset,
+            MiningConfig::default(),
             host,
             shutdown,
             context,
@@ -726,6 +718,7 @@ impl Runtime {
         no_open: bool,
         json: bool,
         port_offset: u16,
+        mining: MiningConfig,
         host: &dyn StartHost,
         shutdown: &Shutdown,
         context: &LifecycleContext,

@@ -387,7 +387,7 @@ async fn worker_panic_publishes_failure_and_releases_admission() {
 use crate::api::router;
 use crate::rpc::NodeRpc;
 use crate::state::tests::state_with_local_wallet;
-use axum::{Json, Router, http::StatusCode};
+use axum::{Json, Router, http::StatusCode, response::IntoResponse};
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicUsize;
 #[tokio::test]
@@ -728,5 +728,112 @@ async fn mempool_loop_records_attempted_after_block_produced_with_sync_failure()
     assert!(
         rx.try_recv().is_err(),
         "generate must not be called again while mempool holds the same set"
+    );
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_unknown_on_malformed_response() {
+    // A malformed (non-JSON) body from generate cannot confirm no block was
+    // produced; the error must be Unknown, not Generation.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(|| async { (StatusCode::OK, "not-a-valid-rpc-response") }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(matches!(
+        state.mine_and_sync_background().await,
+        Err(BackgroundMineError::Unknown(_))
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_suppresses_retry_after_lost_generate_reply() {
+    // When the generate reply is lost (transport/decode failure), the node may
+    // have already produced a block. The loop must reconcile against the chain
+    // tip and suppress re-mining the same transaction set.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn({
+        let tx = tx.clone();
+        async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/",
+                    post(move |Json(req): Json<Value>| {
+                        let tx = tx.clone();
+                        async move {
+                            match req["method"].as_str() {
+                                Some("getrawmempool") => {
+                                    Json(json!({"result":["tx1"],"error":null,"id":req["id"]}))
+                                        .into_response()
+                                }
+                                Some("generate") => {
+                                    // Signal the test, then return a malformed body.
+                                    // The block was produced but the reply is lost.
+                                    let _ = tx.send(());
+                                    (StatusCode::OK, "not-a-valid-rpc-response").into_response()
+                                }
+                                Some("getblockchaininfo") => {
+                                    // Checkpoint reflects the block that was produced.
+                                    Json(json!({
+                                        "result": {
+                                            "chain": "regtest",
+                                            "blocks": 1,
+                                            "bestblockhash": FAKE_HASH,
+                                            "verificationprogress": 1.0
+                                        },
+                                        "error": null,
+                                        "id": req["id"]
+                                    }))
+                                    .into_response()
+                                }
+                                _ => Json(json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]})).into_response(),
+                            }
+                        }
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        }
+    });
+
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // First tick fires at t=0; lost reply → Unknown → reconcile → attempted = Some(["tx1"]).
+    rx.recv().await.expect("first generate call at t=0");
+
+    // Let reconciliation (getblockchaininfo) complete before advancing time.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Advance through two more ticks; the unchanged set must be skipped.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "generate must not be called again after a lost reply is reconciled as produced"
     );
 }
