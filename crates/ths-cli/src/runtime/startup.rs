@@ -766,7 +766,10 @@ impl Runtime {
             if !json {
                 println!("\nPress Ctrl+C to stop and delete this development environment.");
             }
-            host.wait_for_shutdown(&allocated.app_container, shutdown)
+            let ready = self.mark_ready(name, ownership.session())?;
+            let ended = host.wait_for_shutdown(&allocated.app_container, shutdown);
+            drop(ready);
+            ended
         })();
         cleanup.state = CleanupGuard::Explicit;
         let primary = primary.map_err(|error| ownership.session().explain(name, error));
@@ -777,6 +780,13 @@ impl Runtime {
             );
             return Ok(());
         }
+        let _stopping = match self.mark_stopping(name) {
+            Ok(marker) => Some(marker),
+            Err(error) => {
+                eprintln!("could not mark {name} as stopping: {error:#}");
+                None
+            }
+        };
         if primary.is_ok() {
             print_progress(json, format_args!("\nStopping and deleting {name}…"));
         }

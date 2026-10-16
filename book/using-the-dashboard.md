@@ -28,7 +28,7 @@ Explorer and Network pages show just **Mine**. On each account card,
 ## Fund Account 2's transparent pool
 
 1. Select **Fund** on Account 2's card, or **Faucet** in the header.
-2. In the **Fund an account** dialog, choose **Destination account** 2,
+2. In the **Fund an account or address** dialog, choose **Destination** Account 2,
    **Destination pool** Transparent, and **Amount (ZEC)** 1. Select
    **Add funds**.
 3. Look at **Recent activity** for the transaction ID (`txid`), the unique
@@ -36,7 +36,7 @@ Explorer and Network pages show just **Mine**. On each account card,
    confirmed and the wallet snapshot catches up, Account 2's transparent
    balance should rise by 1 ZEC; its Ironwood balance is still separate.
 
-![The Fund an account dialog over the Wallet page, with Account 2 selected, Destination pool set to Transparent (public), Amount (ZEC) set to 1, a maximum of 5 ZEC per request, and an Add funds button.](images/faucet.png)
+![The Fund an account or address dialog over the Wallet page, with Account 2 selected, Destination pool set to Transparent (public), Amount (ZEC) set to 1, a maximum of 5 ZEC per request, and an Add funds button.](images/faucet.png)
 
 The same operation from the second terminal is:
 
@@ -51,6 +51,18 @@ block to confirm the account payment. It accepts at most 5 ZEC **per account
 per request**. If auto-mining fails, the recorded activity may remain
 `broadcast`. [Chapter 6](architecture/operations.md)
 compares these callers.
+
+## Fund an external Regtest address
+
+On Wallet, open **Faucet** and set **Destination** to **External address**.
+Enter a transparent Regtest address or a unified Regtest address with an
+Ironwood receiver, choose an amount of at most 5 ZEC, and select **Add funds**.
+The dashboard checks the address with the server before submitting the
+payment. If the response is lost, open **Payments** to resume the saved
+request with the same idempotency key. Do not start a second request for the
+same intended payment.
+
+![The faucet dialog with External address selected, a transparent Regtest destination, an amount of 1 ZEC, and the Add funds button.](images/faucet-external.png)
 
 ## Send Ironwood funds from Account 1 to Account 2
 

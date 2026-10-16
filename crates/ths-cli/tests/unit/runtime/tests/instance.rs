@@ -395,11 +395,11 @@ fn start_refusal_names_what_holds_the_environment() {
     assert!(refusal().contains("already running in another `ths start` or `ths run`"));
     let request = dir.path().join(".locks/alpha.session.stop");
     fs::write(&request, "").unwrap();
-    assert!(refusal().contains("being stopped or reset by another command"));
+    assert!(refusal().contains("is being stopped"));
     fs::remove_file(&request).unwrap();
     fs::remove_file(&session).unwrap();
     fs::write(&stopping, "").unwrap();
-    assert!(refusal().contains("being stopped or reset by another command"));
+    assert!(refusal().contains("is being stopped"));
 }
 
 #[test]
@@ -430,6 +430,39 @@ fn an_exiting_session_keeps_a_newer_session_file() {
 }
 
 #[test]
+fn owner_probes_never_refuse_a_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    assert!(!runtime.owner_active(&alpha).unwrap());
+    let held = runtime.claim_start(&alpha).unwrap();
+    assert!(runtime.owner_active(&alpha).unwrap());
+    drop(held);
+
+    let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let prober = {
+        let runtime = Runtime {
+            root: dir.path().to_path_buf(),
+        };
+        let probing = probing.clone();
+        std::thread::spawn(move || {
+            let alpha = name("alpha");
+            while probing.load(std::sync::atomic::Ordering::SeqCst) {
+                runtime.owner_active(&alpha).unwrap();
+            }
+        })
+    };
+    for _ in 0..200 {
+        drop(runtime.claim_start(&alpha).unwrap());
+        drop(runtime.lock_instance(&alpha).unwrap());
+    }
+    probing.store(false, std::sync::atomic::Ordering::SeqCst);
+    prober.join().unwrap();
+}
+
+#[test]
 fn listed_environments_do_not_expose_the_launcher_session() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Runtime {
@@ -452,4 +485,22 @@ fn listed_environments_do_not_expose_the_launcher_session() {
         .unwrap();
     let listed = serde_json::to_string(&environments).unwrap();
     assert!(!listed.contains("session"), "{listed}");
+}
+
+#[test]
+fn a_damaged_generation_file_does_not_lock_the_name_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+    fs::write(dir.path().join(".locks/alpha.generation"), "").unwrap();
+
+    drop(runtime.claim_start(&alpha).unwrap());
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".locks/alpha.generation")).unwrap(),
+        "1"
+    );
 }

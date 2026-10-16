@@ -1,7 +1,10 @@
 use crate::state::AppState;
 use axum::{
     Router,
-    http::StatusCode,
+    extract::Request,
+    http::{StatusCode, header::HOST, uri::Authority},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use std::path::PathBuf;
@@ -48,8 +51,42 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/events", get(events::events))
         .method_not_allowed_fallback(method_not_allowed)
         .fallback_service(dashboard::dashboard_router(static_dir))
+        .layer(middleware::from_fn(require_loopback_host))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn require_loopback_host(request: Request, next: Next) -> Response {
+    let Some(host) = request.headers().get(HOST) else {
+        // Browser requests always include Host. Preserve compatibility with
+        // direct HTTP/1.0 clients that omit it entirely.
+        return next.run(request).await;
+    };
+    let is_loopback = host
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<Authority>().ok())
+        .map(|authority| {
+            let host = authority
+                .host()
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+        .unwrap_or(false);
+
+    if is_loopback {
+        next.run(request).await
+    } else {
+        error::ApiError {
+            status: StatusCode::FORBIDDEN,
+            message: "Host must be a loopback address".into(),
+        }
+        .into_response()
+    }
 }
 
 async fn method_not_allowed() -> error::ApiError {

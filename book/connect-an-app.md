@@ -39,12 +39,12 @@ default instance reports:
 }
 ```
 
-The dashboard Network page shows the same fields for the selected instance;
-the screenshot below uses a named instance with a 220-port offset.
+The dashboard Network page shows the same fields for the selected instance.
+Use the URLs reported for your running instance.
 `GET /api/v1/status` calls the RPC field `zakura_rpc`. That naming difference
 is a property of the two current responses, not two different nodes.
 
-![The Network page: Height, Accounts, Verification and Chain tiles above a Node details panel listing the instance, network Regtest, height, and best block hash, and a Runtime endpoints panel listing the dashboard, Zakura RPC, lightwalletd, and P2P addresses with copy buttons. The Chain tile reads test, the raw value Zakura reports.](images/network.png)
+![The Network page: Height, Accounts, Verification and Chain tiles above a Node details panel listing the instance, network Regtest, height, and best block hash, and a Runtime endpoints panel listing the dashboard, Zakura RPC, lightwalletd, and P2P addresses with copy buttons. The Chain tile reads Regtest.](images/network.png)
 
 | Endpoint field | Example use |
 | --- | --- |

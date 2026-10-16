@@ -196,13 +196,19 @@ result of its earlier confirmation check.
 job. It generates blocks, reads the mined tip, reconciles the wallet, notifies
 dashboards, and returns `blocks` plus `hashes`. If a later step errors,
 blocks may already exist, even though the request has no success response.
-A lost connection does not cancel admitted work; another `ths mine` invocation
-uses a fresh internal key and can request additional mining.
+A lost connection does not cancel admitted work. Each legacy API request uses
+a fresh internal key and can request additional mining.
 
-The dashboard uses `POST /api/v1/mining/jobs` with a caller key and receives
-an accepted job before completion. Replaying the same accepted key and count
-returns that job within the server's lifetime. After a lost response, read
+The dashboard and `ths mine` use `POST /api/v1/mining/jobs` with a caller key
+and receive an accepted job before completion. Replaying the same accepted
+key and count returns that job within the server's lifetime. After a lost response, read
 `GET /api/v1/mining/jobs` to inspect the latest job before requesting more.
+
+The CLI saves its key before submission and retains it after an uncertain
+response, interruption, or polling timeout. Rerun `ths mine` with the same
+block count against the same instance to resume the saved job. After the CLI
+observes a finished job, it clears the key; the next invocation starts new
+mining. Jobs are not recovered after a server restart.
 
 After a timeout, compare the current **node height and tip hash** with
 what you observed before the request. Use Network, `GET /api/v1/status`,
