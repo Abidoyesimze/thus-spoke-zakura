@@ -222,7 +222,7 @@ export function FaucetDialog({
         {destination === ADDRESS_DESTINATION ? (
           <Field
             label="Destination address"
-            hint="A transparent or unified Regtest address."
+            hint="A transparent Regtest address or a unified address with an Ironwood receiver."
             error={form.formState.errors.to_address?.message}
           >
             {(aria) => (
