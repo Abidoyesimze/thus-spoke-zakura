@@ -1118,6 +1118,53 @@ fn a_stop_cleans_leftovers_older_than_the_launcher_it_stopped() {
 }
 
 #[test]
+fn a_stop_never_targets_a_session_published_after_its_owner_check() {
+    let runtime = runtime_for_tests();
+    let alpha = name("alpha");
+    let locks = runtime.root.join(".locks");
+    let first = runtime.claim_start(&alpha).unwrap();
+    let session = locks.join("alpha.session");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&session)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let cleaned = Arc::new(AtomicBool::new(false));
+    let other_shell = Runtime {
+        root: runtime.root.clone(),
+    };
+    let ran = cleaned.clone();
+    let stop = thread::spawn(move || {
+        let policy = LifecyclePolicy {
+            poll: Duration::from_millis(400),
+            ..stop_policy()
+        };
+        other_shell
+            .verified_cleanup_with(&name("alpha"), &policy, || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(verified_report())
+            })
+            .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    });
+    thread::sleep(Duration::from_millis(200));
+
+    drop(first);
+    let replacement = runtime.claim_start(&alpha).unwrap();
+    let writer = thread::spawn(move || fs::write(session, "replacement-session"));
+    thread::sleep(Duration::from_millis(100));
+
+    assert!(!locks.join("alpha.replacement-session.stop").exists());
+    let error = stop.join().unwrap().unwrap_err();
+    assert!(error.contains("another launcher started alpha"), "{error}");
+    assert!(!cleaned.load(Ordering::SeqCst));
+    writer.join().unwrap().unwrap();
+    drop(replacement);
+}
+
+#[test]
 fn start_reports_a_stop_in_progress() {
     let runtime = runtime_for_tests();
     let (inside, entered) = mpsc::channel();

@@ -415,10 +415,11 @@ impl Runtime {
                 let _lock = self.lock_instance(name)?;
                 return cleanup();
             }
+            let session = self.read_session(name)?;
             if self.read_owner(name)? != claimed {
                 return Err(superseded(name, &requested)?);
             }
-            match (&requested, self.read_session(name)?) {
+            match (&requested, session) {
                 (None, Some(id)) => {
                     let request = self.stop_request_path(name, &id);
                     fs::write(&request, "")?;
