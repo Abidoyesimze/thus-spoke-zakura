@@ -59,9 +59,12 @@ instead of selecting a random port.
 
 ### `ths wait [--timeout <SECONDS>]`
 
-Waits for an existing instance's node, lightwalletd index, and wallet to be
-settled at the same canonical tip. It creates no instance and makes no chain
-changes. The timeout defaults to **120 seconds**, and status reads are bounded
+Waits for an instance's node, lightwalletd index, and wallet to be settled at
+the same canonical tip, and for the `ths start` or `ths run` that owns it to
+report ready. It also waits for an instance that is still being created in
+another shell, and fails after a few seconds if no command is creating it or
+if its launcher has exited and left only its containers behind. It creates
+no instance and makes no chain changes. The timeout defaults to **120 seconds**, and status reads are bounded
 by the remaining budget. Timeout or interruption exits nonzero and leaves the
 instance running. On timeout, the error reports the last observed heights and
 settlement blocker. `--json` emits the settlement object on success:
@@ -279,15 +282,29 @@ ths mine 10 --json
 ```
 
 Counts must be **1–10,000**. Mining POSTs return 503 until startup finishes.
-The command uses `POST /api/v1/mine` input `{blocks}` and successful
-output `{blocks, hashes}`. Mining belongs to the server and continues if the
-client disconnects or the command's 300-second HTTP timeout expires. Before
-issuing another mining command after a timeout, inspect the latest job with
-`GET /api/v1/mining/jobs` and the canonical node height and tip hash at the
-dashboard endpoint shown by `ths endpoints`.
-Each request uses a fresh internal key: repeating a completed command
-mines another set of blocks. A different manual request during mining or wallet
-synchronization is rejected with HTTP 409.
+The command submits to the mining-job API (`POST /api/v1/mining/jobs` with
+`{blocks, idempotency_key}`; acceptance returns HTTP 202) and polls
+`GET /api/v1/mining/jobs/{id}` until the job completes or fails, printing
+progress as it goes in human-readable mode (including the mined tip hash on
+completion and the job ID on failure) and the final job as JSON with
+`--json`. Each poll is capped at 2 seconds, so a single stalled or dropped
+connection cannot delay Ctrl+C or the overall 300-second deadline; a poll
+that fails to get a response is retried within that deadline rather than
+ending the command, since the job may still be running on the server. The
+idempotency key for a given block count is saved to the instance directory
+before the request is sent and only cleared once the job reaches a terminal
+state, so a submission whose response is lost or fails to decode, or a
+command interrupted or timed out mid-poll, does not lose track of the job:
+the next `ths mine` with the same block count reuses the saved key and picks
+the same job back up instead of starting a second one. Once a job completes
+or fails, its key is forgotten, so repeating that command afterward starts a
+fresh job. A different manual request during mining or wallet synchronization
+is rejected with HTTP 409.
+
+`--json` output keeps the legacy endpoint's `blocks` (the confirmed count)
+and `hashes` fields, alongside the job's `id`, `requested_blocks`, `state`,
+`error`, and `progress_uncertain`. A failed job after partial progress still
+reports what it mined rather than only the error.
 
 Dashboard jobs use `POST /api/v1/mining/jobs` with `{blocks, idempotency_key}`;
 acceptance returns HTTP 202. Replaying an accepted key with the same count returns

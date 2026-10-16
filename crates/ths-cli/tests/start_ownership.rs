@@ -155,3 +155,59 @@ fn a_run_in_docker_preflight_already_owns_the_environment() {
     );
     assert!(started.elapsed() < PREFLIGHT);
 }
+
+#[test]
+fn wait_outlasts_a_start_in_slow_docker_preflight() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let mut start = fixture.spawn(&["--name", "pre", "start", "--no-open"]);
+    let mut wait = fixture.spawn(&["--name", "pre", "wait", "--timeout", "30"]);
+
+    loop {
+        let start_done = start.try_wait().unwrap().is_some();
+        if let Some(status) = wait.try_wait().unwrap() {
+            let output = wait.wait_with_output().unwrap();
+            assert!(
+                start_done,
+                "wait exited with {status} after {:?} while start was still running: {}",
+                started.elapsed(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if start_done && started.elapsed() > Duration::from_secs(40) {
+            panic!("wait outlived its timeout");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(started.elapsed() >= PREFLIGHT);
+    start.wait().unwrap();
+}
+
+#[test]
+fn wait_outlasts_a_run_in_slow_docker_preflight() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let mut start = fixture.spawn(&["--name", "pre", "run", "--", "true"]);
+    let mut wait = fixture.spawn(&["--name", "pre", "wait", "--timeout", "30"]);
+
+    loop {
+        let start_done = start.try_wait().unwrap().is_some();
+        if let Some(status) = wait.try_wait().unwrap() {
+            let output = wait.wait_with_output().unwrap();
+            assert!(
+                start_done,
+                "wait exited with {status} after {:?} while run was still running: {}",
+                started.elapsed(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            break;
+        }
+        if start_done && started.elapsed() > Duration::from_secs(40) {
+            panic!("wait outlived its timeout");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(started.elapsed() >= PREFLIGHT);
+    start.wait().unwrap();
+}

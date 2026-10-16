@@ -90,7 +90,9 @@ async fn mining_continues_without_request_receiver() {
     let update = terminal(observer).await;
     assert_eq!(update.job.state, MiningState::Completed);
     assert_eq!(update.hashes.unwrap().len(), 3);
-    assert_eq!(jobs.get(&id).await.unwrap().completed_blocks, 3);
+    let persisted = jobs.get(&id).await.unwrap();
+    assert_eq!(persisted.completed_blocks, 3);
+    assert_eq!(persisted.hashes.unwrap().len(), 3);
     assert_eq!(runtime.calls(), 3);
     assert_eq!(runtime.scans.load(Ordering::SeqCst), 1);
 }
@@ -258,6 +260,7 @@ async fn synchronization_failure_has_full_known_count() {
     assert_eq!(failed.state, MiningState::Failed);
     assert_eq!(failed.completed_blocks, 2);
     assert!(!failed.progress_uncertain);
+    assert!(failed.hashes.is_none());
     assert!(
         failed
             .error

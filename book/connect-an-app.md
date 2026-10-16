@@ -25,7 +25,8 @@ Keep `ths` running in one terminal. In another:
 ths endpoints --json
 ```
 
-For a named instance, use `ths --name alice endpoints --json`:
+For a named instance, use `ths --name alice endpoints --json` instead. The
+default instance reports:
 
 ```json
 {
@@ -38,12 +39,12 @@ For a named instance, use `ths --name alice endpoints --json`:
 }
 ```
 
-The dashboard Network page shows the same addresses, while
-`GET /api/v1/status` calls the RPC field `zakura_rpc`. That naming
-difference is a property of the two current responses, not two different
-nodes.
+The dashboard Network page shows the same fields for the selected instance.
+Use the URLs reported for your running instance.
+`GET /api/v1/status` calls the RPC field `zakura_rpc`. That naming difference
+is a property of the two current responses, not two different nodes.
 
-![The Network page: Height, Accounts, Verification and Chain tiles above a Node details panel listing the instance, network Regtest, height, and best block hash, and a Runtime endpoints panel listing the dashboard, Zakura RPC, lightwalletd, and P2P addresses with copy buttons. The Chain tile reads test, the raw value Zakura reports.](images/network.png)
+![The Network page: Height, Accounts, Verification and Chain tiles above a Node details panel listing the instance, network Regtest, height, and best block hash, and a Runtime endpoints panel listing the dashboard, Zakura RPC, lightwalletd, and P2P addresses with copy buttons. The Chain tile reads Regtest.](images/network.png)
 
 | Endpoint field | Example use |
 | --- | --- |

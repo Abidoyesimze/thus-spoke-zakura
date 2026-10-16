@@ -6,7 +6,7 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Field } from '@/components/ui/Field';
 import { useToast } from '@/components/ui/toast-context';
-import { errorMessage, type Account, type PaymentUri } from '@/lib/api';
+import { api, errorMessage, type Account, type PaymentUri } from '@/lib/api';
 import { shortHash } from '@/lib/format';
 import { formatZec, formatZecAmount } from '@/lib/money';
 import { useParsePaymentUri, type PaymentResult, type SendVariables } from '@/hooks/mutations';
@@ -45,6 +45,10 @@ export function SendDialog({
   const parseUri = useParsePaymentUri();
   const [paymentUri, setPaymentUri] = useState('');
   const paymentUriRevision = useRef(0);
+  const verifiedAddress = useRef<{
+    address: string;
+    destination_pool: 'ironwood' | 'transparent';
+  } | null>(null);
   const [paymentUriNeedsApply, setPaymentUriNeedsApply] = useState(false);
   const {
     send,
@@ -173,10 +177,26 @@ export function SendDialog({
 
   const fromAccount = useWatch({ control: form.control, name: 'from_account' });
   const toAccount = useWatch({ control: form.control, name: 'to_account' });
+  const toAddress = useWatch({ control: form.control, name: 'to_address' }) ?? '';
   const sourcePool = useWatch({ control: form.control, name: 'source_pool' });
   const destinationPool = useWatch({ control: form.control, name: 'destination_pool' });
   const memo = useWatch({ control: form.control, name: 'memo' }) ?? '';
   const memoEnabled = destinationPool === 'ironwood';
+
+  // The server validates the full address before a new payment. The prefix
+  // selects the quote pool while the address is being entered.
+  const addressPool = /^t/.test(toAddress.trim())
+    ? 'transparent'
+    : /^uregtest1/.test(toAddress.trim())
+      ? 'ironwood'
+      : undefined;
+  useEffect(() => {
+    if (toAccount === ADDRESS_DESTINATION && addressPool && destinationPool !== addressPool) {
+      form.setValue('destination_pool', addressPool, {
+        shouldValidate: form.formState.isSubmitted,
+      });
+    }
+  }, [toAccount, addressPool, destinationPool, form]);
 
   // A memo typed for an ironwood output must not linger (hidden) once the
   // destination switches to transparent, where it can never be sent.
@@ -203,6 +223,10 @@ export function SendDialog({
   });
 
   const applyPaymentUri = (parsed: PaymentUri) => {
+    verifiedAddress.current = {
+      address: parsed.address,
+      destination_pool: parsed.destination_pool,
+    };
     const options = { shouldValidate: form.formState.isSubmitted };
     form.setValue(
       'to_account',
@@ -258,6 +282,42 @@ export function SendDialog({
       if (retained) {
         send.resume(retained, submitted(uriRevision));
         return;
+      }
+      if (values.to_account === ADDRESS_DESTINATION) {
+        try {
+          const parsed =
+            verifiedAddress.current?.address === values.to_address &&
+            verifiedAddress.current.destination_pool === values.destination_pool
+              ? verifiedAddress.current
+              : await api.parsePaymentUri(`zcash:${values.to_address}`);
+          if (
+            parsed.address !== values.to_address ||
+            parsed.destination_pool !== values.destination_pool
+          ) {
+            form.setValue('destination_pool', parsed.destination_pool);
+            form.setError('to_address', {
+              message: 'The address changed the destination pool. Review the fee and submit again.',
+            });
+            releaseSendSubmission();
+            return;
+          }
+          verifiedAddress.current = {
+            address: parsed.address,
+            destination_pool: parsed.destination_pool,
+          };
+        } catch (error) {
+          form.setError('to_address', { message: errorMessage(error) });
+          releaseSendSubmission();
+          return;
+        }
+        const currentDraft = sendSchema.safeParse(form.getValues());
+        if (
+          !currentDraft.success ||
+          formName(variablesFor(currentDraft.data)) !== formName(variables)
+        ) {
+          releaseSendSubmission();
+          return;
+        }
       }
       if (values.amount > available) {
         form.setError('amount', {
@@ -411,13 +471,27 @@ export function SendDialog({
             options={destinationOptions}
             error={form.formState.errors.to_account?.message}
           />
-          <SelectField
-            control={form.control}
-            name="destination_pool"
-            label="Destination pool"
-            options={POOL_OPTIONS}
-            error={form.formState.errors.destination_pool?.message}
-          />
+          {toAccount === ADDRESS_DESTINATION ? (
+            <Field label="Destination pool" hint="Chosen from the address.">
+              {() => (
+                <p className="text-ink-muted py-2 text-[13px]">
+                  {addressPool === 'transparent'
+                    ? 'Transparent (public)'
+                    : addressPool === 'ironwood'
+                      ? 'Ironwood (shielded)'
+                      : 'Enter a Regtest address'}
+                </p>
+              )}
+            </Field>
+          ) : (
+            <SelectField
+              control={form.control}
+              name="destination_pool"
+              label="Destination pool"
+              options={POOL_OPTIONS}
+              error={form.formState.errors.destination_pool?.message}
+            />
+          )}
         </div>
 
         {toAccount === ADDRESS_DESTINATION && (
@@ -429,7 +503,11 @@ export function SendDialog({
             {(aria) => (
               <input
                 {...aria}
-                {...form.register('to_address')}
+                {...form.register('to_address', {
+                  onChange: () => {
+                    verifiedAddress.current = null;
+                  },
+                })}
                 autoComplete="off"
                 spellCheck={false}
                 className={controlStyles}

@@ -53,7 +53,7 @@ export function PaymentStatus({
   focusRequest: object | null;
   onView: () => void;
 }) {
-  const status = usePaymentStatus(identity.key, true);
+  const status = usePaymentStatus(identity.key, true, 'address' in identity.variables);
   const activity = status.data;
   const toast = useToast();
   const titleId = useId();
@@ -368,15 +368,17 @@ export function PaymentStatus({
       </div>
       <div id={detailsId} hidden={!detailsOpen} className="text-ink-muted mt-2 space-y-1">
         {restored && <p>Previous payment</p>}
-        <p>
-          Pool route:{' '}
-          {identity.kind === 'send'
-            ? `${identity.variables.source_pool} → ${identity.variables.destination_pool}`
-            : identity.variables.pool}
-        </p>
+        {identity.kind === 'send' ? (
+          <p>
+            Pool route: {identity.variables.source_pool} → {identity.variables.destination_pool}
+          </p>
+        ) : 'pool' in identity.variables ? (
+          <p>Pool route: {identity.variables.pool}</p>
+        ) : null}
         {identity.kind === 'send' && identity.variables.to_address && (
           <p>Destination: {identity.variables.to_address}</p>
         )}
+        {'address' in identity.variables && <p>Destination: {identity.variables.address}</p>}
         {identity.kind === 'send' && (
           <p>
             Memo:{' '}

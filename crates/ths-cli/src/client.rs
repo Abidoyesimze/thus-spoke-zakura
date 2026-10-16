@@ -6,10 +6,40 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct MineResult {
-    pub(crate) blocks: usize,
-    pub(crate) hashes: Vec<String>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub(crate) struct MiningJob {
+    pub(crate) id: String,
+    pub(crate) requested_blocks: u32,
+    pub(crate) completed_blocks: u32,
+    pub(crate) state: MiningJobState,
+    pub(crate) error: Option<String>,
+    pub(crate) progress_uncertain: bool,
+    // Older servers may omit this; treat it the same as "not completed yet".
+    #[serde(default)]
+    pub(crate) hashes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MiningJobState {
+    Mining,
+    Syncing,
+    Completed,
+    Failed,
+}
+
+/// `--json` output for `mine`. Keeps the `blocks`/`hashes` fields and meaning
+/// from the legacy endpoint's successful output, alongside the job API's
+/// richer state so a partial or failed job is not just a bare error string.
+#[derive(Debug, Serialize)]
+struct MineOutput {
+    id: String,
+    blocks: u32,
+    requested_blocks: u32,
+    state: MiningJobState,
+    error: Option<String>,
+    progress_uncertain: bool,
+    hashes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -66,6 +96,15 @@ struct ActivityHistoryEntry {
 /// processing them after the command stops waiting.
 const PAYMENT_WAIT: Duration = Duration::from_secs(30);
 const PAYMENT_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long `mine` waits for its job to finish. The environment keeps mining
+/// after the command stops waiting, the same as a payment.
+const MINE_WAIT: Duration = Duration::from_secs(300);
+const MINE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Caps one request (submitting or polling a job), matching the single-HTTP-
+/// attempt budget used for readiness probes elsewhere. A stalled or dropped
+/// connection errors out on its own instead of blocking the overall deadline.
+const MINE_POLL_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 
 trait Payment: serde::de::DeserializeOwned + Serialize {
     fn status(&self) -> &str;
@@ -333,20 +372,111 @@ impl Runtime {
 
     pub fn mine(&self, name: &InstanceName, blocks: u32, json: bool) -> Result<()> {
         let (dashboard, client) = self.instance_client(name)?;
-        let result: MineResult = client
-            .post(format!("{dashboard}/api/v1/mine"))
-            .json(&serde_json::json!({"blocks": blocks}))
-            .send()
-            .map_err(anyhow::Error::from)
-            .and_then(decode_response)
+        self.mine_with(
+            name,
+            &dashboard,
+            &client,
+            std::io::stdout().lock(),
+            Instant::now() + MINE_WAIT,
+            blocks,
+            json,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mine_with(
+        &self,
+        name: &InstanceName,
+        dashboard: &str,
+        client: &reqwest::blocking::Client,
+        mut out: impl std::io::Write,
+        deadline: Instant,
+        blocks: u32,
+        json: bool,
+    ) -> Result<()> {
+        let journal = IntentJournal::open(&self.instance_dir(name), "mining")?;
+        let intent = format!("mine:{blocks}");
+        let idempotency_key = journal.key_for(&intent)?;
+
+        let mut job = submit_mining_job(client, dashboard, blocks, &idempotency_key, deadline)
             .with_context(|| format!("asking environment {name} to mine {blocks} blocks"))?;
-        if json {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            println!("Mined {} blocks on {name}.", result.blocks);
-            if let Some(tip) = result.hashes.last() {
-                println!("New tip: {tip}");
+
+        let mut last_printed = None;
+        let timed_out = loop {
+            if !json {
+                let line = mine_status_line(&job, name);
+                if last_printed.as_ref() != Some(&line) {
+                    writeln!(out, "{line}")?;
+                    last_printed = Some(line);
+                }
             }
+            match job.state {
+                MiningJobState::Completed | MiningJobState::Failed => break false,
+                MiningJobState::Mining | MiningJobState::Syncing => {}
+            }
+            let Some(left) = remaining(deadline) else {
+                break true;
+            };
+            std::thread::sleep(MINE_POLL_INTERVAL.min(left));
+            // A poll's own failure (a stall, a reset, a dropped connection,
+            // anything that is not an actual response from the server) says
+            // nothing about whether the job is still running, so it is
+            // retried within the deadline rather than failing the command.
+            // Only a real response, even an error one, is authoritative and
+            // handled by `decode_response`.
+            let Some(left) = remaining(deadline) else {
+                break true;
+            };
+            match client
+                .get(format!("{dashboard}/api/v1/mining/jobs/{}", job.id))
+                .timeout(MINE_POLL_ATTEMPT_TIMEOUT.min(left))
+                .send()
+            {
+                Ok(response) => {
+                    job = decode_response(response)
+                        .with_context(|| format!("checking mining job {} on {name}", job.id))?;
+                }
+                Err(_) => continue,
+            }
+        };
+
+        if timed_out {
+            if json {
+                let output = unresolved_json(Some(&job), &idempotency_key)?;
+                writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+            } else {
+                writeln!(out, "{}", mine_status_line(&job, name))?;
+                writeln!(out, "Run the same command to check it again.")?;
+            }
+            bail!(
+                "mining job {} on {name} is still running; run the same command to check it again",
+                job.id
+            );
+        }
+
+        if json {
+            let output = MineOutput {
+                id: job.id.clone(),
+                blocks: job.completed_blocks,
+                requested_blocks: job.requested_blocks,
+                state: job.state,
+                error: job.error.clone(),
+                progress_uncertain: job.progress_uncertain,
+                hashes: job.hashes.clone(),
+            };
+            writeln!(out, "{}", serde_json::to_string_pretty(&output)?)?;
+        }
+
+        // The job reached a terminal state: replaying this key would only ever
+        // return this same frozen job, so forget it and let a future `mine`
+        // with the same block count start a fresh one. Cleared only after the
+        // output above is written: if that write fails, the key must still
+        // survive so a retry does not start a second job for output we never
+        // actually delivered.
+        journal.clear(&[(&intent, &idempotency_key)])?;
+
+        if job.state == MiningJobState::Failed {
+            bail!(job.error.unwrap_or_else(|| "mining failed".to_owned()));
         }
         Ok(())
     }
@@ -1022,6 +1152,68 @@ pub(crate) fn decode_response<T: serde::de::DeserializeOwned>(
         bail!("rejected ({status}): {detail}");
     }
     response.json().context("decoding response")
+}
+
+/// Only retries a transport-level send failure, where it is unknown whether
+/// the server received the request. A decoded HTTP response, even an error
+/// one, confirms the server saw this attempt, so it is returned immediately.
+/// Bounded by the same overall deadline as polling: a lost response after the
+/// server already accepted the request must not submit a second mining
+/// operation with a different idempotency key.
+fn submit_mining_job(
+    client: &reqwest::blocking::Client,
+    dashboard: &str,
+    blocks: u32,
+    idempotency_key: &str,
+    deadline: Instant,
+) -> Result<MiningJob> {
+    let body = serde_json::json!({"blocks": blocks, "idempotency_key": idempotency_key});
+    loop {
+        let Some(left) = remaining(deadline) else {
+            bail!(
+                "timed out submitting the mining job; it may have been accepted and could \
+                 still be running. Run the same command to check it again."
+            );
+        };
+        if let Ok(response) = client
+            .post(format!("{dashboard}/api/v1/mining/jobs"))
+            .json(&body)
+            .timeout(MINE_POLL_ATTEMPT_TIMEOUT.min(left))
+            .send()
+        {
+            return decode_response(response);
+        }
+        // An unreachable server fails instantly, so without a pause this
+        // would otherwise spin for the whole deadline instead of retrying
+        // at a reasonable rate.
+        std::thread::sleep(MINE_POLL_INTERVAL.min(left));
+    }
+}
+
+/// Wording mirrors the dashboard's `MiningStatus` component, so the CLI and
+/// the dashboard describe the same job the same way. The tip hash on
+/// completion and the job ID on failure restore what the legacy endpoint's
+/// text output showed, since the job itself is otherwise a bare count.
+pub(crate) fn mine_status_line(job: &MiningJob, name: &InstanceName) -> String {
+    let count = format!(
+        "{} of {} blocks confirmed on {name}",
+        job.completed_blocks, job.requested_blocks
+    );
+    let progress = if job.progress_uncertain {
+        format!("At least {count}; the last mining result is uncertain.")
+    } else {
+        format!("{count}.")
+    };
+    let state = match job.state {
+        MiningJobState::Mining => "Mining blocks…".to_owned(),
+        MiningJobState::Syncing => "Synchronizing wallet…".to_owned(),
+        MiningJobState::Completed => match job.hashes.as_ref().and_then(|hashes| hashes.last()) {
+            Some(tip) => format!("Mining completed. Wallet synchronized. New tip: {tip}"),
+            None => "Mining completed. Wallet synchronized.".to_owned(),
+        },
+        MiningJobState::Failed => format!("Mining job {} failed.", job.id),
+    };
+    format!("{progress} {state}")
 }
 
 fn format_zec(zatoshi: u64) -> String {

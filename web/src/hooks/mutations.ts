@@ -231,7 +231,10 @@ export function useSend(lifecycle?: PaymentLifecycle) {
 export function useFaucet(lifecycle?: PaymentLifecycle) {
   return usePaymentMutation(
     'faucet',
-    (variables: FaucetVariables, key) => api.faucet({ ...variables, idempotency_key: key }),
+    (variables: FaucetVariables, key) =>
+      'address' in variables
+        ? api.faucetAddress({ ...variables, idempotency_key: key })
+        : api.faucet({ ...variables, idempotency_key: key }),
     lifecycle,
   );
 }

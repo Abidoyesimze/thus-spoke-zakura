@@ -1,6 +1,10 @@
 # 4. Fund and send
 
-An account has two pool balances and that the treasury funds faucet requests. We will use the `default` instance from Chapter 1 to make those ideas visible. Keep `ths start --no-open` running in its first terminal; run commands below in a second terminal. If you stopped it, run `ths start --no-open` again — you get the same five accounts on a fresh chain.
+An account has separate transparent and Ironwood balances. The treasury funds
+faucet requests. We will use the `default` instance from Chapter 1 to see both
+in action. Keep `ths start --no-open` running in its first terminal; run the
+commands below in a second terminal. If you stopped it, start it again for a
+fresh chain with the same five accounts.
 
 The dashboard has **Wallet**, **Explorer**, and **Network** pages. Use `ths
 open` to bring it up. On desktop, the **Mine** button sits at the top of
@@ -24,7 +28,7 @@ Explorer and Network pages show just **Mine**. On each account card,
 ## Fund Account 2's transparent pool
 
 1. Select **Fund** on Account 2's card, or **Faucet** in the header.
-2. In the **Fund an account** dialog, choose **Destination account** 2,
+2. In the **Fund an account or address** dialog, choose **Destination** Account 2,
    **Destination pool** Transparent, and **Amount (ZEC)** 1. Select
    **Add funds**.
 3. Look at **Recent activity** for the transaction ID (`txid`), the unique
@@ -32,7 +36,7 @@ Explorer and Network pages show just **Mine**. On each account card,
    confirmed and the wallet snapshot catches up, Account 2's transparent
    balance should rise by 1 ZEC; its Ironwood balance is still separate.
 
-![The Fund an account dialog over the Wallet page, with Account 2 selected, Destination pool set to Transparent (public), Amount (ZEC) set to 1, a maximum of 5 ZEC per request, and an Add funds button.](images/faucet.png)
+![The Fund an account or address dialog over the Wallet page, with Account 2 selected, Destination pool set to Transparent (public), Amount (ZEC) set to 1, a maximum of 5 ZEC per request, and an Add funds button.](images/faucet.png)
 
 The same operation from the second terminal is:
 
@@ -48,6 +52,18 @@ per request**. If auto-mining fails, the recorded activity may remain
 `broadcast`. [Chapter 6](architecture/operations.md)
 compares these callers.
 
+## Fund an external Regtest address
+
+On Wallet, open **Faucet** and set **Destination** to **External address**.
+Enter a transparent Regtest address or a unified Regtest address with an
+Ironwood receiver, choose an amount of at most 5 ZEC, and select **Add funds**.
+The dashboard checks the address with the server before submitting the
+payment. If the response is lost, open **Payments** to resume the saved
+request with the same idempotency key. Do not start a second request for the
+same intended payment.
+
+![The faucet dialog with External address selected, a transparent Regtest destination, an amount of 1 ZEC, and the Add funds button.](images/faucet-external.png)
+
 ## Send Ironwood funds from Account 1 to Account 2
 
 This is a **different** pool movement from the transparent faucet payment.
@@ -59,8 +75,8 @@ This is a **different** pool movement from the transparent faucet payment.
    in **Memo (optional)**, then select **Send ZEC**.
 4. Check Recent activity for the transaction ID and actual status. After
    confirmation and wallet settlement, Account 2 has 1 Ironwood ZEC **and**
-   its earlier 1 transparent ZEC. Account 1's Ironwood balance falls by 1 ZEC **plus the
-   fee**; do not expect it to be exactly 4 ZEC.
+   its earlier 1 transparent ZEC. Account 1's Ironwood balance falls by 1 ZEC
+   **plus the fee**; do not expect it to be exactly 4 ZEC.
 
 The dialog does the fee arithmetic for you. As soon as it has an account and
 a pool it asks `POST /api/v1/send/quote`, and the hint under the amount field
@@ -78,8 +94,6 @@ ths wallet send --from 1 --to 2 --amount 1 --memo "hello from Regtest"
 Inspect the returned txid, status, and any confirming block hash, then the
 accounts snapshot for the actual pool balances and source fee. Choose either
 the UI action or the command for one intended payment.
-
-
 
 ![A send picks a source account and pool on the left and a destination account and pool on the right, with the amount flowing between the pools. Three notes: transparent change returns as an Ironwood note, the fee leaves the source on top of the amount, and a memo needs an Ironwood destination.](images/send-choices.svg)
 
