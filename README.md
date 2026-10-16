@@ -279,11 +279,17 @@ lifetime. At capacity, it rejects new admissions with HTTP 503 while reads and
 existing-key replays remain available. Stopping the server cancels running work
 and discards the history; jobs are not recovered after restart.
 
-`ths mine` still waits for the server-owned job and wallet synchronization before
-reporting success. Its HTTP client times out after 300 seconds, but an admitted
-job continues after that timeout or a client disconnection. Inspect the latest
-job before issuing another command. Each legacy request uses a fresh internal
-key, so repeating a command after completion starts another job.
+`ths mine` submits through this same job API, printing progress as it polls
+and reporting the confirmed count, the mined tip hash on completion, and the
+job ID on any error. The idempotency key is saved to the instance directory
+before the request goes out and only cleared once the job finishes, so a lost
+or undecodable response, an interruption, or a 300-second polling timeout all
+leave the key in place: the next `ths mine` with the same block count picks
+the same job back up instead of starting a second one. Once a job finishes,
+its key is forgotten, so repeating the command afterward starts a fresh job.
+Each poll is capped at 2 seconds, so a single stalled request cannot delay
+Ctrl+C or the overall deadline. `--json` keeps the `blocks` and `hashes`
+fields from the legacy endpoint alongside the job's id, state, and progress.
 
 ![Mine blocks on the local Regtest network](book/images/mine.png)
 

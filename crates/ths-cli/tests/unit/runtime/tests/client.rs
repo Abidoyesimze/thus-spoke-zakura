@@ -3,21 +3,409 @@ use super::*;
 #[test]
 fn responses_decode_or_report_their_status_and_body() {
     let (url, _requests) = serve(vec![
-        ("200 OK", r#"{"blocks":1,"hashes":["tip"]}"#),
+        (
+            "200 OK",
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#,
+        ),
         ("409 Conflict", "already claimed"),
         ("200 OK", "not json"),
     ]);
     let client = reqwest::blocking::Client::new();
     let get = || client.get(&url).send().unwrap();
 
-    let mined: MineResult = decode_response(get()).unwrap();
-    assert_eq!(mined.hashes, ["tip"]);
-    let rejected = decode_response::<MineResult>(get())
-        .unwrap_err()
-        .to_string();
+    let job: MiningJob = decode_response(get()).unwrap();
+    assert_eq!(job.state, MiningJobState::Completed);
+    let rejected = decode_response::<MiningJob>(get()).unwrap_err().to_string();
     assert_eq!(rejected, "rejected (409 Conflict): already claimed");
-    let malformed = format!("{:#}", decode_response::<MineResult>(get()).unwrap_err());
+    let malformed = format!("{:#}", decode_response::<MiningJob>(get()).unwrap_err());
     assert!(malformed.starts_with("decoding response: "), "{malformed}");
+}
+
+/// Mining journals do real file locking, so tests need an isolated root
+/// instead of sharing one.
+fn runtime_with_instance_dir(instance: &InstanceName) -> (tempfile::TempDir, Runtime) {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    fs::create_dir_all(runtime.instance_dir(instance)).unwrap();
+    (dir, runtime)
+}
+
+#[test]
+fn mine_polls_until_completion_and_reports_the_confirmed_count() {
+    let (url, requests) = serve(vec![
+        (
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":3,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"job-1","requested_blocks":3,"completed_blocks":1,"state":"mining","error":null,"progress_uncertain":false}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"job-1","requested_blocks":3,"completed_blocks":3,"state":"completed","error":null,"progress_uncertain":false,"hashes":["a","b","c"]}"#,
+        ),
+    ]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let mut out = Vec::new();
+    runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            3,
+            false,
+        )
+        .unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("New tip: c"), "{text}");
+
+    // The POST carries a JSON body; the two GET polls that follow carry none.
+    let mut requests = requests.try_iter();
+    let post: serde_json::Value = serde_json::from_str(&requests.next().unwrap().1).unwrap();
+    assert_eq!(post["blocks"], 3);
+    assert!(post["idempotency_key"].is_string());
+    assert_eq!(requests.count(), 2, "expected exactly two GET polls");
+
+    // A completed job's key is forgotten, so mining the same count again
+    // starts a fresh job rather than replaying this frozen one.
+    assert!(
+        IntentJournal::open(&runtime.instance_dir(&alpha), "mining")
+            .unwrap()
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn mine_reports_partial_progress_alongside_the_servers_error() {
+    let (url, _requests) = serve(vec![
+        (
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":5,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#,
+        ),
+        (
+            "200 OK",
+            r#"{"id":"job-1","requested_blocks":5,"completed_blocks":2,"state":"failed","error":"generate failed","progress_uncertain":true}"#,
+        ),
+    ]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let mut out = Vec::new();
+    let error = runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            5,
+            true,
+        )
+        .unwrap_err();
+    assert_eq!(error.to_string(), "generate failed");
+
+    let output = json_stdout(&out);
+    assert_eq!(output["id"], "job-1");
+    assert_eq!(output["blocks"], 2);
+    assert_eq!(output["requested_blocks"], 5);
+    assert_eq!(output["state"], "failed");
+    assert_eq!(output["progress_uncertain"], true);
+    assert_eq!(output["error"], "generate failed");
+
+    // A terminal job, failed or not, is forgotten the same way.
+    assert!(
+        IntentJournal::open(&runtime.instance_dir(&alpha), "mining")
+            .unwrap()
+            .read()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// Always fails to write, as a broken pipe or a full disk would.
+struct FailingWriter;
+
+impl std::io::Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("the pipe is closed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn mine_keeps_the_journal_key_when_writing_the_json_result_fails() {
+    let (url, _requests) = serve(vec![(
+        "202 Accepted",
+        r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#,
+    )]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            FailingWriter,
+            Instant::now() + Duration::from_secs(5),
+            1,
+            true,
+        )
+        .unwrap_err();
+
+    // The job completed, but its result was never actually delivered, so the
+    // key must survive: clearing it here would let a retry start a second
+    // job for output the caller never received.
+    let saved = IntentJournal::open(&runtime.instance_dir(&alpha), "mining")
+        .unwrap()
+        .read()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(saved.contains_key("mine:1"));
+}
+
+#[test]
+fn submission_retries_pause_between_attempts_instead_of_busy_looping() {
+    // Each attempt fails instantly (a dropped connection, not a stall), so
+    // without a pause between attempts this would retry as fast as the
+    // network allows instead of at a reasonable rate.
+    let (url, requests) = serve(vec![("drop", ""); 20]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let mut out = Vec::new();
+    let error = runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_millis(900),
+            1,
+            false,
+        )
+        .unwrap_err();
+    let full_error = format!("{error:#}");
+    assert!(
+        full_error.contains("may have been accepted"),
+        "{full_error}"
+    );
+
+    let attempts = requests.try_iter().count();
+    assert!(
+        attempts <= 6,
+        "expected a handful of paused attempts within ~900ms, got {attempts}"
+    );
+}
+
+#[test]
+fn mine_status_line_reports_progress_for_every_state() {
+    let mining = MiningJob {
+        id: "job-1".into(),
+        requested_blocks: 5,
+        completed_blocks: 2,
+        state: MiningJobState::Mining,
+        error: None,
+        progress_uncertain: false,
+        hashes: None,
+    };
+    assert_eq!(
+        mine_status_line(&mining, &name("alpha")),
+        "2 of 5 blocks confirmed on alpha. Mining blocks…"
+    );
+
+    let syncing = MiningJob {
+        state: MiningJobState::Syncing,
+        completed_blocks: 5,
+        ..mining.clone()
+    };
+    assert_eq!(
+        mine_status_line(&syncing, &name("alpha")),
+        "5 of 5 blocks confirmed on alpha. Synchronizing wallet…"
+    );
+
+    let completed_without_hashes = MiningJob {
+        state: MiningJobState::Completed,
+        ..syncing.clone()
+    };
+    assert_eq!(
+        mine_status_line(&completed_without_hashes, &name("alpha")),
+        "5 of 5 blocks confirmed on alpha. Mining completed. Wallet synchronized."
+    );
+
+    let completed = MiningJob {
+        hashes: Some(vec!["aaa".into(), "the-tip".into()]),
+        ..completed_without_hashes
+    };
+    assert_eq!(
+        mine_status_line(&completed, &name("alpha")),
+        "5 of 5 blocks confirmed on alpha. Mining completed. Wallet synchronized. New tip: the-tip"
+    );
+
+    let uncertain_failure = MiningJob {
+        state: MiningJobState::Failed,
+        completed_blocks: 1,
+        progress_uncertain: true,
+        ..mining
+    };
+    assert_eq!(
+        mine_status_line(&uncertain_failure, &name("alpha")),
+        "At least 1 of 5 blocks confirmed on alpha; the last mining result is uncertain. Mining job job-1 failed."
+    );
+}
+
+#[test]
+fn a_dropped_poll_connection_is_retried_within_the_deadline() {
+    // Distinct from a stalled poll: the connection is reset immediately, not
+    // held open past the attempt timeout. The job may still be running on
+    // the server, so a disconnected poll must not be treated as the job
+    // itself having failed.
+    let (url, requests) = serve(vec![
+        (
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#.to_owned(),
+        ),
+        ("drop", String::new()),
+        (
+            "200 OK",
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#.to_owned(),
+        ),
+    ]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let started = Instant::now();
+    let mut out = Vec::new();
+    runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_secs(10),
+            1,
+            false,
+        )
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "a dropped poll connection should be retried almost immediately: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(requests.try_iter().count(), 3);
+}
+
+#[test]
+fn a_stalled_poll_times_out_within_the_deadline_instead_of_hanging() {
+    // The server holds the connection open without answering. A single
+    // stalled request must not itself consume the whole deadline: the
+    // per-attempt timeout bounds it well below that.
+    let (url, _requests) = serve(vec![
+        (
+            "202 Accepted",
+            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":0,"state":"mining","error":null,"progress_uncertain":false}"#.to_owned(),
+        ),
+        ("hang", String::new()),
+    ]);
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let started = Instant::now();
+    let mut out = Vec::new();
+    let error = runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_millis(500),
+            1,
+            false,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("job-1"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "a stalled poll must not block anywhere close to the overall deadline: {:?}",
+        started.elapsed()
+    );
+
+    // Still running, not a terminal state: the key survives so a retry picks
+    // the same job back up instead of starting a second one.
+    let saved = IntentJournal::open(&runtime.instance_dir(&alpha), "mining")
+        .unwrap()
+        .read()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!(saved.contains_key("mine:1"));
+}
+
+#[test]
+fn an_unresolved_submission_key_survives_for_the_next_invocation() {
+    // The initial POST fails outright (no response at all), the failure mode
+    // a same-process retry cannot paper over once its own deadline is spent.
+    // The next `ths mine` with the same block count must still find and
+    // reuse the saved key rather than minting a new one.
+    let unreachable = "http://127.0.0.1:1";
+    let client = reqwest::blocking::Client::new();
+    let alpha = name("alpha");
+    let (_dir, runtime) = runtime_with_instance_dir(&alpha);
+
+    let mut out = Vec::new();
+    runtime
+        .mine_with(
+            &alpha,
+            unreachable,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_millis(300),
+            5,
+            false,
+        )
+        .unwrap_err();
+
+    let journal = IntentJournal::open(&runtime.instance_dir(&alpha), "mining").unwrap();
+    let first_attempt_key = journal.read().unwrap().get("mine:5").unwrap().clone();
+    drop(journal);
+
+    let (url, requests) = serve(vec![(
+        "202 Accepted",
+        r#"{"id":"job-1","requested_blocks":5,"completed_blocks":5,"state":"completed","error":null,"progress_uncertain":false,"hashes":["a"]}"#,
+    )]);
+    let mut out = Vec::new();
+    runtime
+        .mine_with(
+            &alpha,
+            &url,
+            &client,
+            &mut out,
+            Instant::now() + Duration::from_secs(5),
+            5,
+            false,
+        )
+        .unwrap();
+
+    let post: serde_json::Value =
+        serde_json::from_str(&requests.try_iter().next().unwrap().1).unwrap();
+    assert_eq!(post["idempotency_key"], first_attempt_key);
 }
 
 #[test]
