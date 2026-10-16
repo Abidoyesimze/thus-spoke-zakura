@@ -55,15 +55,9 @@ pub(crate) struct Instance {
 
 impl Runtime {
     pub fn status(&self, name: &InstanceName, json: bool) -> Result<bool> {
-        let instance = self.read_instance(name).or_else(|_| {
-            Ok::<_, anyhow::Error>(Instance {
-                name: name.to_string(),
-                version: 1,
-                endpoints: inspect_endpoints(&prefix(name))?,
-                created_at: None,
-                session: None,
-            })
-        })?;
+        let instance = self
+            .read_instance(name)
+            .or_else(|_| inspect_unrecorded_instance(name, &DockerCli))?;
         let environment = inspect_environment(instance, &DockerCli)?;
         let running = environment.state == "running";
         if json {
@@ -131,6 +125,29 @@ impl Runtime {
     pub(super) fn recovery_path(&self, name: &InstanceName) -> PathBuf {
         self.instance_dir(name).join(recovery::RECOVERY_FILE)
     }
+}
+
+fn inspect_unrecorded_instance(
+    name: &InstanceName,
+    docker: &impl DockerResourceCommands,
+) -> Result<Instance> {
+    let containers = SERVICES
+        .into_iter()
+        .map(|service| container_status(docker, name, service))
+        .collect::<Result<Vec<_>>>()?;
+    if containers
+        .iter()
+        .all(|container| container.state == "missing")
+    {
+        bail!("environment {name} is not running; start it with `ths --name {name}`");
+    }
+    Ok(Instance {
+        name: name.to_string(),
+        version: 1,
+        endpoints: inspect_endpoints(&prefix(name))?,
+        created_at: None,
+        session: None,
+    })
 }
 
 #[derive(Debug)]

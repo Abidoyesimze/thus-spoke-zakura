@@ -473,6 +473,26 @@ fn status_matches_list_and_fails_when_a_service_has_stopped() {
 }
 
 #[test]
+fn status_rejects_an_unknown_environment_without_a_raw_docker_error() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["--name", "ghost", "status"])
+        .env("THS_TEST_MISSING_INSPECT", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("environment ghost is not running"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no such object"), "{stderr}");
+}
+
+#[test]
 fn json_start_stdout_is_one_document_after_external_deletion() {
     let (success, stdout, stderr, commands, _) = output_after_shutdown(true, false, true);
     assert!(success, "{stderr}");

@@ -14,7 +14,14 @@ case "$1 $2" in
         ;;
     'image ls') : ;;
     'build '*|'pull '*) printf 'docker lifecycle output\n' ;;
-    'inspect --format') printf '%s\n' "$THS_TEST_PORT" ;;
+    'inspect --format')
+        if [ "${THS_TEST_MISSING_INSPECT:-0}" != 0 ]; then
+            for target do :; done
+            printf 'error: no such object: %s\n' "$target" >&2
+            exit 1
+        fi
+        printf '%s\n' "$THS_TEST_PORT"
+        ;;
     'container ls'|'volume ls'|'network ls')
         for resource in "$THS_TEST_STATE/$1"/*; do
             [ -f "$resource" ] || continue
