@@ -202,6 +202,32 @@ describe('FaucetDialog', () => {
       ).toBe(false);
     },
   );
+  it('routes a development-account address through the account faucet', async () => {
+    const address = 'tmAg2wTARgKBHA9mFouqR727cU98MJmfjSq';
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((input) =>
+      requestUrl(input).endsWith('/zip321/parse')
+        ? Promise.resolve(
+            Response.json({
+              address,
+              destination_pool: 'transparent',
+              to_account: 2,
+              amount_zatoshi: null,
+              memo: null,
+            }),
+          )
+        : Promise.resolve(Response.json([])),
+    );
+    renderWithProviders(<FaucetDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
+    await chooseExternalAddress();
+    await userEvent.type(screen.getByLabelText('Destination address'), address);
+    await userEvent.click(screen.getByRole('button', { name: 'Add funds' }));
+    expect(
+      await screen.findByText("This is Account 2's address. Choose Account 2 as the destination."),
+    ).toBeInTheDocument();
+    expect(
+      fetchSpy.mock.calls.some(([input]) => requestUrl(input).endsWith('/faucet/address')),
+    ).toBe(false);
+  });
   it('exposes modal semantics the previous hand-rolled dialog lacked', () => {
     renderWithProviders(<FaucetDialog open onOpenChange={vi.fn()} accounts={testAccounts} />);
 

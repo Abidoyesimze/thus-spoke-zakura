@@ -122,6 +122,12 @@ export function FaucetDialog({
           form.setError('to_address', { message: 'Enter a valid Regtest address.' });
           return;
         }
+        if (parsed.to_account !== null) {
+          form.setError('to_address', {
+            message: `This is Account ${parsed.to_account}'s address. Choose Account ${parsed.to_account} as the destination.`,
+          });
+          return;
+        }
         const current = faucetSchema.safeParse(form.getValues());
         if (
           !current.success ||
