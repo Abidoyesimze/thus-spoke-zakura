@@ -13,7 +13,12 @@ async fn status_counts_accounts_without_reading_the_seed() {
         .unwrap();
 
     let response = router(state)
-        .oneshot(Request::get("/api/v1/status").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/status")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -24,8 +29,51 @@ async fn status_counts_accounts_without_reading_the_seed() {
     assert_eq!(status["account_count"], 5);
 }
 
+#[tokio::test]
+async fn non_loopback_host_cannot_access_the_seed_endpoint() {
+    let (state, _dir) = state_with_local_wallet();
+    let response = router(state)
+        .oneshot(
+            Request::post("/api/v1/dev/seed")
+                .header("host", "attacker.example")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"confirmation":"I understand this seed is for regtest only"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(response.headers()["content-type"], "application/json");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        error,
+        serde_json::json!({
+            "error": {
+                "message": "Host must be a loopback address",
+                "status": 403
+            }
+        })
+    );
+}
+
 use super::*;
 use crate::wallet::WALLET_BIRTHDAY_HEIGHT;
+
+#[test]
+fn public_dashboard_endpoint_uses_configured_port_or_loopback_default() {
+    assert_eq!(
+        public_dashboard_endpoint(Some("http://127.0.0.1:32805")),
+        "http://127.0.0.1:32805"
+    );
+    assert_eq!(public_dashboard_endpoint(None), "http://127.0.0.1:8080");
+}
+
 fn wallet_status(
     state: &'static str,
     fully_scanned_height: Option<u64>,

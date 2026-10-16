@@ -10,7 +10,7 @@ use crate::{
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header::HOST},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
@@ -94,14 +94,11 @@ pub(crate) struct PublicEndpoints {
     p2p: String,
 }
 
-pub(crate) async fn status(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> ApiResult<Json<Status>> {
-    let dashboard_host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("127.0.0.1:8080");
+fn public_dashboard_endpoint(configured: Option<&str>) -> String {
+    configured.unwrap_or("http://127.0.0.1:8080").to_owned()
+}
+
+pub(crate) async fn status(State(state): State<AppState>) -> ApiResult<Json<Status>> {
     let (node, lightwalletd) =
         tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
     let node = node.ok();
@@ -119,7 +116,9 @@ pub(crate) async fn status(
         auto_mine: true,
         network: "Regtest",
         endpoints: PublicEndpoints {
-            dashboard: format!("http://{dashboard_host}"),
+            dashboard: public_dashboard_endpoint(
+                std::env::var("THS_PUBLIC_DASHBOARD").ok().as_deref(),
+            ),
             zakura_rpc: std::env::var("THS_PUBLIC_ZAKURA_RPC")
                 .unwrap_or_else(|_| "http://127.0.0.1:18232".into()),
             lightwalletd: std::env::var("THS_PUBLIC_LIGHTWALLETD")
