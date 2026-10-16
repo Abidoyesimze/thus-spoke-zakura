@@ -143,8 +143,16 @@ impl<'a> LifecycleDocker<'a> {
             command.env(key, value);
         }
         let mut helpers = self.context.helpers.borrow_mut();
+        // `output()` always calls with `Capture` (reads: inspect, ls); `run()`
+        // never does (mutations: rm, volume rm, network rm, volume create).
+        // The injected child_ops only applies to the mutation being removed,
+        // not to the read calls cleanup_core makes around it (ownership
+        // preflight, absence verification) — otherwise every read would also
+        // look permanently hung.
         #[cfg(test)]
-        if let Some(ops) = self.child_ops {
+        if mode != OutputMode::Capture
+            && let Some(ops) = self.child_ops
+        {
             return run_observed(
                 &mut command,
                 self.operation_deadline(),

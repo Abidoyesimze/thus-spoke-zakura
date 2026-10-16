@@ -309,6 +309,10 @@ impl ChildOps for NeverExits {
 // contention, so the remaining real-time cost is just a bounded number of
 // `thread::sleep(poll)` wake-ups plus the normal journal/absence-check work —
 // not an open-ended wait on OS process-scheduling or fsync tail latency.
+// `with_child_ops` only reaches the removal (`run()`/mutation) call, not the
+// ownership-preflight or absence-check reads (`output()`), so this exercises
+// a hanging removal specifically — confirmed below by asserting `rm -f
+// app-id` actually ran.
 #[test]
 fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
     let never_exits = NeverExits;
@@ -346,14 +350,23 @@ fn hanging_removal_leaves_the_termination_reserve_for_helpers() {
         .finish(index, MutationOutcome::Acknowledged, Some("app-id".into()))
         .unwrap();
     drop(journal);
+    let removal_marker = root.path().join("removal-started");
     let deadline = Deadline::after(policy.cleanup);
     let mut docker =
         lifecycle_docker(&context, deadline, Cancellation::Ignore).with_child_ops(&never_exits);
     docker.program = "/bin/sh".into();
     docker.prefix_args = vec![script.path().join("docker").to_string_lossy().into_owned()];
+    docker.env.push((
+        "THS_REMOVAL_MARKER".to_owned(),
+        removal_marker.to_string_lossy().into_owned(),
+    ));
     let report = runtime
         .cleanup_core(&instance, &docker, false, deadline, &context)
         .unwrap();
+    assert!(
+        removal_marker.exists(),
+        "rm -f app-id was never issued; this exercised something other than a hanging removal"
+    );
     // The removal attempt is deadline-bound to deadline-minus-reserve and, by
     // construction (`NeverExits` never reports success), runs right up to
     // that boundary rather than stopping early. Bookkeeping the production

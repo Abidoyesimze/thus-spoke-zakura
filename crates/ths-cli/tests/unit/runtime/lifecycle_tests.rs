@@ -342,7 +342,7 @@ fn hang_on_removal_script() -> tempfile::TempDir {
     let mut file = fs::File::create(&path).unwrap();
     write!(
         file,
-        "#!/bin/sh\nif [ \"$1\" = \"rm\" ]; then\n  sleep 30\nfi\nif [ \"$1\" = \"volume\" ] && [ \"$2\" = \"rm\" ]; then\n  sleep 30\nfi\nif [ \"$1\" = \"network\" ] && [ \"$2\" = \"rm\" ]; then\n  sleep 30\nfi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then\n  printf '%s\\n' '[{{\"Id\":\"app-id\",\"Config\":{{\"Labels\":{{\"com.zakura.ths.instance\":\"alpha\"}}}}}}]'\n  exit 0\nfi\nexit 0\n"
+        "#!/bin/sh\nif [ \"$1\" = \"rm\" ]; then\n  [ -n \"$THS_REMOVAL_MARKER\" ] && touch \"$THS_REMOVAL_MARKER\"\n  sleep 30\nfi\nif [ \"$1\" = \"volume\" ] && [ \"$2\" = \"rm\" ]; then\n  sleep 30\nfi\nif [ \"$1\" = \"network\" ] && [ \"$2\" = \"rm\" ]; then\n  sleep 30\nfi\nif [ \"$1\" = \"container\" ] && [ \"$2\" = \"inspect\" ]; then\n  printf '%s\\n' '[{{\"Id\":\"app-id\",\"Config\":{{\"Labels\":{{\"com.zakura.ths.instance\":\"alpha\"}}}}}}]'\n  exit 0\nfi\nexit 0\n"
     )
     .unwrap();
     make_executable(&path);
