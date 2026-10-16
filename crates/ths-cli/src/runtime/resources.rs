@@ -263,6 +263,8 @@ pub(super) fn ensure_zakura(
             &format!("{prefix}-config:/config:ro"),
             "-e",
             "CONFIG_FILE_PATH=/config/zakurad.toml",
+            "-e",
+            "ZAKURA_STATE__CACHE_DIR=/data",
             ZAKURA_IMAGE,
             "zakurad",
             "start",
