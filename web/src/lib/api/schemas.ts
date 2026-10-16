@@ -162,7 +162,7 @@ export const txInputSchema = z.looseObject({
 
 export const txOutputSchema = z.looseObject({
   n: z.number().int().default(0),
-  valueZat: z.number().int().default(0),
+  valueZat: z.number().int().optional(),
   scriptPubKey: z
     .looseObject({
       addresses: z.array(z.string()).default([]),
@@ -184,12 +184,14 @@ export const transactionSchema = z.looseObject({
   vout: z.array(txOutputSchema).default([]),
   vShieldedSpend: z.array(z.unknown()).default([]),
   vShieldedOutput: z.array(z.unknown()).default([]),
+  vjoinsplit: z.array(z.unknown()).optional(),
   orchard: z
     .looseObject({
       actions: z.array(z.unknown()).default([]),
       /**
        * Net value moving in or out of the Orchard pool. This is public chain
-       * data (ZIP 224), and on an otherwise shielded transfer it is the fee.
+       * data (ZIP 224). It is only the fee when no other pool or transparent
+       * value contributes to the transaction.
        */
       valueBalanceZat: z.number().optional(),
     })
