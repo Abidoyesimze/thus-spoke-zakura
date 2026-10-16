@@ -35,8 +35,15 @@ function PoolLabel({ pool }: { pool: Activity['source_pool'] }) {
   );
 }
 
+function accountLabel(accounts: number[] | undefined, account: number | null): string | null {
+  const ids = accounts?.length ? accounts : account === null ? [] : [account];
+  if (ids.length === 0) return null;
+  return `${ids.length === 1 ? 'Account' : 'Accounts'} ${ids.join(', ')}`;
+}
+
 function recipientLabel(activity: Activity): string {
-  if (activity.to_account !== null) return `Account ${activity.to_account}`;
+  const accounts = accountLabel(activity.to_accounts, activity.to_account);
+  if (accounts) return accounts;
   return shortHash(activity.to_address ?? '', 14, 6);
 }
 
@@ -46,11 +53,12 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
   const isFaucet = activity.kind === 'faucet';
   const isIncoming = activity.direction === 'incoming';
   const transactionPath = activity.txid ? `/explorer/tx/${activity.txid}` : null;
+  const source = accountLabel(activity.from_accounts, activity.from_account) ?? 'External';
   const transfer = isFaucet
     ? `Faucet → ${recipientLabel(activity)}`
     : isIncoming
-      ? `${activity.from_account === null ? 'External' : `Account ${activity.from_account}`} → ${recipientLabel(activity)}`
-      : `Account ${activity.from_account ?? '?'} → ${recipientLabel(activity)}`;
+      ? `${source} → ${recipientLabel(activity)}`
+      : `${source === 'External' ? 'Unknown' : source} → ${recipientLabel(activity)}`;
   const navigate = useNavigate();
 
   return (

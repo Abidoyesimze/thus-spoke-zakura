@@ -454,7 +454,14 @@ ths wallet activity --limit 20 --json
 
 JSON output is the unmodified activity schema returned by
 `GET /api/v1/activity`, including transaction direction, pools, decoded text
-memos, mining metadata, `created_at`, and nullable `block_hash`.
+memos, mining metadata, `created_at`, and nullable `block_hash`. The
+`from_accounts` and `to_accounts` arrays retain every development account
+affected by a transaction. Their singular counterparts are populated only
+when exactly one account is affected. Outputs to the hidden treasury are not
+included in the displayed amount, recipients, or account lists. Detecting a
+transparent source for an external incoming transaction is best effort and
+uses one short, shared lookup budget, so an unavailable Zakura node does not
+hold up the activity response.
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 

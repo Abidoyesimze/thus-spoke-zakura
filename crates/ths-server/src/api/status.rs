@@ -3,8 +3,7 @@ use super::payments::require_key;
 use crate::state::AppState;
 use crate::{
     db::{Account, Activity, USER_ACCOUNT_COUNT},
-    rpc::ChainCheckpoint,
-    rpc::ChainInfo,
+    rpc::{ChainCheckpoint, ChainInfo, NodeRpc},
     state::{WalletSyncStatus, wallet_matches_tip},
     wallet::CanonicalActivity,
 };
@@ -14,9 +13,13 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 pub(crate) async fn health(State(state): State<AppState>) -> Response {
     let node = state.0.rpc.chain_info().await.ok();
     let wallet = state.wallet_sync_status().await;
@@ -182,6 +185,8 @@ pub(crate) struct ActivityEntry {
     direction: String,
     from_account: Option<u8>,
     to_account: Option<u8>,
+    from_accounts: Vec<u8>,
+    to_accounts: Vec<u8>,
     to_address: Option<String>,
     recipient_addresses: Vec<String>,
     source_pool: Option<String>,
@@ -201,28 +206,47 @@ pub(crate) struct ActivityEntry {
     last_error: Option<String>,
 }
 
-fn journal_direction(activity: &Activity) -> &'static str {
-    if activity.kind == "faucet" {
+fn visible_account(account: Option<u8>) -> Option<u8> {
+    account.filter(|id| *id <= USER_ACCOUNT_COUNT)
+}
+
+fn only_account(accounts: &[u8]) -> Option<u8> {
+    match accounts {
+        [account] => Some(*account),
+        _ => None,
+    }
+}
+
+fn activity_direction(kind: &str, from_accounts: &[u8], to_accounts: &[u8]) -> &'static str {
+    if kind == "faucet" {
         "incoming"
-    } else if activity.from_account.is_some() && activity.from_account == activity.to_account {
-        "self"
-    } else if activity.from_account.is_some() && activity.to_account.is_some() {
-        "internal"
     } else {
-        "outgoing"
+        match (from_accounts, to_accounts) {
+            ([from], [to]) if from == to => "self",
+            ([], []) => "unknown",
+            ([], _) => "incoming",
+            (_, []) => "outgoing",
+            (_, _) => "internal",
+        }
     }
 }
 
 impl ActivityEntry {
     fn journal(activity: Activity) -> Self {
-        let direction = journal_direction(&activity).to_owned();
+        let from_account = visible_account(activity.from_account);
+        let to_account = visible_account(activity.to_account);
+        let from_accounts = from_account.into_iter().collect::<Vec<_>>();
+        let to_accounts = to_account.into_iter().collect::<Vec<_>>();
+        let direction = activity_direction(&activity.kind, &from_accounts, &to_accounts).to_owned();
         let recipient_addresses = activity.to_address.iter().cloned().collect();
         Self {
             id: activity.id,
             kind: activity.kind,
             direction,
-            from_account: activity.from_account,
-            to_account: activity.to_account,
+            from_account,
+            to_account,
+            from_accounts,
+            to_accounts,
             to_address: activity.to_address,
             recipient_addresses,
             source_pool: Some(activity.source_pool.clone()),
@@ -244,7 +268,9 @@ impl ActivityEntry {
 
     fn canonical(activity: CanonicalActivity) -> Self {
         let recipient_addresses = activity.recipient_addresses;
-        let to_address = (activity.to_account.is_none())
+        let to_address = activity
+            .to_accounts
+            .is_empty()
             .then(|| recipient_addresses.first().cloned())
             .flatten();
         Self {
@@ -253,6 +279,8 @@ impl ActivityEntry {
             direction: activity.direction.to_owned(),
             from_account: activity.from_account,
             to_account: activity.to_account,
+            from_accounts: activity.from_accounts,
+            to_accounts: activity.to_accounts,
             to_address,
             recipient_addresses,
             source_pool: (activity.source_pools.len() == 1)
@@ -280,12 +308,25 @@ impl ActivityEntry {
     }
 
     fn merge_journal(mut self, journal: Activity) -> Self {
-        self.direction = journal_direction(&journal).to_owned();
         self.id = journal.id;
         self.kind = journal.kind;
-        self.from_account = journal.from_account;
-        self.to_account = journal.to_account;
-        self.to_address = if journal.to_account.is_some() {
+        if let Some(account) = visible_account(journal.from_account)
+            && !self.from_accounts.contains(&account)
+        {
+            self.from_accounts.push(account);
+            self.from_accounts.sort_unstable();
+        }
+        if let Some(account) = visible_account(journal.to_account)
+            && !self.to_accounts.contains(&account)
+        {
+            self.to_accounts.push(account);
+            self.to_accounts.sort_unstable();
+        }
+        self.from_account = only_account(&self.from_accounts);
+        self.to_account = only_account(&self.to_accounts);
+        self.direction =
+            activity_direction(&self.kind, &self.from_accounts, &self.to_accounts).to_owned();
+        self.to_address = if !self.to_accounts.is_empty() {
             None
         } else {
             journal.to_address.clone().or(self.to_address)
@@ -333,17 +374,42 @@ fn add_public_source_pools(activity: &mut CanonicalActivity, transaction: &Value
 }
 
 async fn enrich_external_source_pools(state: &AppState, activity: &mut [CanonicalActivity]) {
-    for entry in activity
+    enrich_external_source_pools_within(&state.0.rpc, activity, Duration::from_secs(2)).await;
+}
+
+async fn enrich_external_source_pools_within(
+    rpc: &NodeRpc,
+    activity: &mut [CanonicalActivity],
+    budget: Duration,
+) {
+    const CONCURRENCY: usize = 8;
+    let deadline = Instant::now() + budget;
+    let requests = activity
         .iter_mut()
-        .filter(|entry| entry.direction == "incoming")
-    {
-        match state.0.rpc.transaction(&entry.txid).await {
-            Ok(transaction) => add_public_source_pools(entry, &transaction),
-            Err(error) => tracing::warn!(
+        .enumerate()
+        .filter(|(_, entry)| entry.direction == "incoming")
+        .map(|(index, entry)| (index, entry.txid.clone()))
+        .collect::<Vec<_>>();
+    let mut responses = stream::iter(requests)
+        .map(|(index, txid)| async move {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let result = if remaining.is_zero() {
+                None
+            } else {
+                Some(rpc.transaction_within(&txid, remaining).await)
+            };
+            (index, txid, result)
+        })
+        .buffer_unordered(CONCURRENCY);
+    while let Some((index, txid, result)) = responses.next().await {
+        match result {
+            Some(Ok(transaction)) => add_public_source_pools(&mut activity[index], &transaction),
+            Some(Err(error)) => tracing::warn!(
                 error = %format_args!("{error:#}"),
-                txid = %entry.txid,
+                %txid,
                 "reading public activity inputs failed"
             ),
+            None => {}
         }
     }
 }

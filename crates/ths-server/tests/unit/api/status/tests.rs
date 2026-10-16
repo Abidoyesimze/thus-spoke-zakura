@@ -29,6 +29,8 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
         direction,
         from_account: Some(1),
         to_account: Some(2),
+        from_accounts: vec![1],
+        to_accounts: vec![2],
         recipient_addresses: Vec::new(),
         source_pools: vec!["ironwood".to_owned()],
         destination_pools: vec!["ironwood".to_owned()],
@@ -47,6 +49,7 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
 fn internal_transfer_is_returned_once_with_both_accounts() {
     let mut canonical = canonical_activity("outgoing", "internal-tx");
     canonical.to_account = None;
+    canonical.to_accounts.clear();
     canonical.recipient_addresses = vec!["uregtest1account2".to_owned()];
     let activity = unified_activity(
         vec![journal_send("internal-tx")],
@@ -60,8 +63,33 @@ fn internal_transfer_is_returned_once_with_both_accounts() {
     assert_eq!(activity[0].direction, "internal");
     assert_eq!(activity[0].from_account, Some(1));
     assert_eq!(activity[0].to_account, Some(2));
+    assert_eq!(activity[0].from_accounts, [1]);
+    assert_eq!(activity[0].to_accounts, [2]);
     assert_eq!(activity[0].to_address, None);
     assert_eq!(activity[0].recipient_addresses, ["uregtest1account2"]);
+}
+
+#[test]
+fn multi_account_transaction_preserves_every_affected_account() {
+    let mut canonical = canonical_activity("incoming", "multi-account-tx");
+    canonical.from_account = None;
+    canonical.to_account = None;
+    canonical.from_accounts.clear();
+    canonical.to_accounts = vec![2, 3];
+    canonical.recipient_addresses = vec![
+        "uregtest1account2".to_owned(),
+        "uregtest1account3".to_owned(),
+    ];
+    canonical.amount_zatoshi = 300_000_000;
+
+    let activity = unified_activity(Vec::new(), vec![canonical], 30);
+
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].direction, "incoming");
+    assert_eq!(activity[0].to_account, None);
+    assert_eq!(activity[0].to_accounts, [2, 3]);
+    assert_eq!(activity[0].to_address, None);
+    assert_eq!(activity[0].amount_zatoshi, 300_000_000);
 }
 
 #[test]
@@ -87,7 +115,9 @@ fn canonical_confirmation_clears_a_stale_journal_error() {
 fn external_incoming_and_unresolved_journal_entries_are_both_retained() {
     let mut incoming = canonical_activity("incoming", "external-tx");
     incoming.from_account = None;
+    incoming.from_accounts.clear();
     incoming.to_account = Some(3);
+    incoming.to_accounts = vec![3];
     incoming.recipient_addresses = vec!["uregtest1account3".to_owned()];
     let mut pending = journal_send("");
     pending.status = "preparing".to_owned();
@@ -113,6 +143,7 @@ fn external_incoming_and_unresolved_journal_entries_are_both_retained() {
 fn canonical_activity_preserves_every_recipient_address() {
     let mut canonical = canonical_activity("outgoing", "multi-recipient-tx");
     canonical.to_account = None;
+    canonical.to_accounts.clear();
     canonical.recipient_addresses = vec![
         "uregtest1external1".to_owned(),
         "uregtest1external2".to_owned(),
@@ -135,6 +166,7 @@ fn canonical_activity_preserves_every_recipient_address() {
 fn transparent_inputs_are_reported_as_a_public_source_pool() {
     let mut incoming = canonical_activity("incoming", "transparent-incoming");
     incoming.from_account = None;
+    incoming.from_accounts.clear();
     incoming.source_pools.clear();
 
     add_public_source_pools(
@@ -153,6 +185,7 @@ fn transparent_inputs_are_reported_as_a_public_source_pool() {
 fn coinbase_does_not_look_like_a_transparent_payment_source() {
     let mut incoming = canonical_activity("incoming", "coinbase");
     incoming.from_account = None;
+    incoming.from_accounts.clear();
     incoming.source_pools.clear();
 
     add_public_source_pools(
@@ -174,6 +207,7 @@ fn confirmed_activity_uses_chain_order_and_does_not_invent_incoming_creation_tim
 
     let mut incoming = canonical_activity("incoming", "later-incoming-tx");
     incoming.from_account = None;
+    incoming.from_accounts.clear();
     incoming.mined_height = Some(121);
     incoming.tx_index = Some(0);
     incoming.created_at = None;
@@ -193,6 +227,33 @@ fn activity_limit_is_applied_after_journal_and_wallet_history_are_merged() {
         1,
     );
     assert_eq!(activity.len(), 1);
+}
+
+#[tokio::test]
+async fn stalled_node_uses_one_bounded_enrichment_budget() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rpc = NodeRpc::new(format!("http://{}", listener.local_addr().unwrap()));
+    let mut incoming = (0..16)
+        .map(|index| {
+            let mut activity = canonical_activity("incoming", &format!("incoming-{index}"));
+            activity.from_account = None;
+            activity.from_accounts.clear();
+            activity.source_pools.clear();
+            activity
+        })
+        .collect::<Vec<_>>();
+
+    tokio::time::timeout(
+        Duration::from_millis(250),
+        enrich_external_source_pools_within(&rpc, &mut incoming, Duration::from_millis(50)),
+    )
+    .await
+    .expect("incoming lookups exceeded their shared budget");
+    assert!(
+        incoming
+            .iter()
+            .all(|activity| activity.source_pools.is_empty())
+    );
 }
 
 #[tokio::test]

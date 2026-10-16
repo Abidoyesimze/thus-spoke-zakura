@@ -100,6 +100,47 @@ describe('ActivityList incoming transactions', () => {
     expect(within(row!).getByText('ironwood')).toBeInTheDocument();
     expect(within(row!).getByText('Block 121')).toBeInTheDocument();
   });
+
+  it('renders every affected development account', () => {
+    const txid = 'ac'.repeat(32);
+    renderWithProviders(
+      <MemoryRouter>
+        <ActivityList
+          activity={{
+            isPending: false,
+            isError: false,
+            error: null,
+            data: [
+              {
+                id: 'wallet-incoming-multi',
+                kind: 'transaction',
+                direction: 'incoming',
+                from_account: null,
+                to_account: null,
+                from_accounts: [],
+                to_accounts: [2, 3],
+                to_address: null,
+                source_pool: null,
+                destination_pool: 'ironwood',
+                amount_zatoshi: 300_000_000n,
+                txid,
+                block_hash: 'cd'.repeat(32),
+                mined_height: 121,
+                status: 'confirmed',
+                last_error: null,
+                created_at: null,
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'External → Accounts 2, 3' })).toHaveAttribute(
+      'href',
+      `/explorer/tx/${txid}`,
+    );
+  });
 });
 
 describe('ActivityList error state', () => {

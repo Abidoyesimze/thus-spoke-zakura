@@ -35,11 +35,13 @@ export type PaymentRequest = z.infer<typeof paymentRequestSchema>;
 
 export const activitySchema = z.object({
   id: z.string(),
-  kind: z.enum(['send', 'faucet', 'transaction']).catch('send'),
+  kind: z.enum(['send', 'faucet', 'transaction']),
   direction: z.enum(['incoming', 'outgoing', 'internal', 'self', 'unknown']).optional(),
   from_account: z.number().int().nullable().default(null),
   /** Null when the recipient is an address outside the development accounts. */
   to_account: z.number().int().nullable().default(null),
+  from_accounts: z.array(z.number().int().min(1).max(5)).optional(),
+  to_accounts: z.array(z.number().int().min(1).max(5)).optional(),
   to_address: z.string().nullable().default(null),
   recipient_addresses: z.array(z.string()).optional(),
   source_pool: poolSchema.nullable(),

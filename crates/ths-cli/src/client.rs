@@ -153,6 +153,10 @@ struct ActivityHistoryEntry {
     from_account: Option<u8>,
     to_account: Option<u8>,
     #[serde(default)]
+    from_accounts: Vec<u8>,
+    #[serde(default)]
+    to_accounts: Vec<u8>,
+    #[serde(default)]
     to_address: Option<String>,
     #[serde(default)]
     source_pool: Option<String>,
@@ -1359,6 +1363,27 @@ fn activity_pool(primary: Option<&str>, pools: &[String]) -> String {
     })
 }
 
+fn activity_account(accounts: &[u8], account: Option<u8>) -> Option<String> {
+    match accounts {
+        [] => account.map(|account| format!("account {account}")),
+        [account] => Some(format!("account {account}")),
+        accounts => Some(format!(
+            "accounts {}",
+            accounts
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn activity_recipient(entry: &ActivityHistoryEntry) -> String {
+    activity_account(&entry.to_accounts, entry.to_account)
+        .or_else(|| entry.to_address.clone())
+        .unwrap_or_else(|| "an unknown recipient".to_owned())
+}
+
 pub(crate) fn activity_lines(activity: &[serde_json::Value]) -> Result<String> {
     if activity.is_empty() {
         return Ok("No wallet activity yet.".to_owned());
@@ -1374,16 +1399,19 @@ pub(crate) fn activity_lines(activity: &[serde_json::Value]) -> Result<String> {
                 activity_pool(entry.destination_pool.as_deref(), &entry.destination_pools);
             let source = if entry.kind == "faucet" {
                 format!("faucet ({source_pool})")
-            } else if entry.direction.as_deref() == Some("incoming") && entry.from_account.is_none()
+            } else if entry.direction.as_deref() == Some("incoming")
+                && entry.from_accounts.is_empty()
+                && entry.from_account.is_none()
             {
                 format!("external ({source_pool})")
             } else {
-                match entry.from_account {
-                    Some(account) => format!("account {account} ({source_pool})"),
-                    None => format!("unknown account ({source_pool})"),
-                }
+                format!(
+                    "{} ({source_pool})",
+                    activity_account(&entry.from_accounts, entry.from_account)
+                        .unwrap_or_else(|| "unknown account".to_owned())
+                )
             };
-            let destination = recipient(entry.to_account, entry.to_address.as_deref());
+            let destination = activity_recipient(&entry);
             let mut lines = vec![
                 format!(
                     "{}  {}  {} ZEC",
