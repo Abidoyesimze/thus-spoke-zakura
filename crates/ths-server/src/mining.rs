@@ -1,3 +1,4 @@
+use crate::rpc::{ChainCheckpoint, RpcError, RpcUnavailable};
 use crate::state::{AppState, notify};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -453,17 +454,33 @@ impl AppState {
     /// wallet. Used by the interval and mempool background loops, so it never
     /// counts toward a manual mining job.
     ///
-    /// Returns `Err(BackgroundMineError::Generation(_))` when no block was
-    /// produced (safe to retry with the same transaction set) and
+    /// Returns `Err(BackgroundMineError::Generation(_))` when the node
+    /// explicitly rejected the request before generating (safe to retry with
+    /// the same transaction set), `Err(BackgroundMineError::Unknown(_))` when
+    /// a transport or decode failure on `generate` leaves the outcome
+    /// uncertain (caller must reconcile before retrying), and
     /// `Err(BackgroundMineError::Sync(_))` when a block was produced but a
     /// subsequent step failed (do not retry generation with the same set).
     pub(crate) async fn mine_and_sync_background(&self) -> Result<(), BackgroundMineError> {
-        let mut hashes = self
-            .0
-            .rpc
-            .generate(1)
-            .await
-            .map_err(BackgroundMineError::Generation)?;
+        let mut hashes = match self.0.rpc.generate(1).await {
+            Ok(hashes) => hashes,
+            Err(error) => {
+                // An explicit RPC error or proxy rejection means the node did
+                // not execute the request; no block was produced.
+                return Err(
+                    if error.downcast_ref::<RpcError>().is_some()
+                        || error.downcast_ref::<RpcUnavailable>().is_some()
+                    {
+                        BackgroundMineError::Generation(error)
+                    } else {
+                        // A transport or decode failure may occur after the
+                        // node has already mined a block; we cannot conclude
+                        // no block was produced.
+                        BackgroundMineError::Unknown(error)
+                    },
+                );
+            }
+        };
         if hashes.len() != 1 || hashes[0].is_empty() {
             return Err(BackgroundMineError::Generation(anyhow::anyhow!(
                 "Zakura must return exactly one nonempty mined block hash"
@@ -494,8 +511,13 @@ impl AppState {
 /// same transaction set may be retried.
 #[derive(Debug)]
 pub(crate) enum BackgroundMineError {
-    /// `generate` failed; no block was produced. Safe to retry with the same set.
+    /// `generate` failed with an explicit node or proxy rejection; no block
+    /// was produced. Safe to retry with the same set.
     Generation(anyhow::Error),
+    /// `generate` failed with a transport or decode error; the node may or may
+    /// not have produced a block. Caller must reconcile chain state before
+    /// deciding whether the same set may be retried.
+    Unknown(anyhow::Error),
     /// A block was produced but a subsequent step (block-metadata fetch or
     /// wallet sync) failed. Do not retry generation with the same transaction set.
     Sync(anyhow::Error),
@@ -517,6 +539,12 @@ pub(crate) async fn interval_mining_loop(state: AppState, block_time: Duration) 
                 tracing::warn!(
                     error = %format_args!("{error:#}"),
                     "background interval mining failed to generate a block"
+                );
+            }
+            Err(BackgroundMineError::Unknown(error)) => {
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    "background interval mining lost a generate reply; outcome unknown"
                 );
             }
             Err(BackgroundMineError::Sync(error)) => {
@@ -551,6 +579,9 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempted: Option<Vec<String>> = None;
+    // Tracks the chain tip after each confirmed mining outcome so Unknown
+    // errors can be reconciled: if the tip advanced, a block was produced.
+    let mut last_checkpoint: Option<ChainCheckpoint> = None;
     loop {
         interval.tick().await;
         if !state.started() {
@@ -581,6 +612,7 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
                 // Block produced and synced; record the set so an unchanged
                 // mempool is skipped until a new transaction arrives.
                 attempted = Some(set);
+                last_checkpoint = state.0.rpc.checkpoint().await.ok();
             }
             Err(BackgroundMineError::Generation(error)) => {
                 // No block was produced; do not record the set so the same
@@ -590,10 +622,33 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
                     "background mempool mining failed to generate a block"
                 );
             }
+            Err(BackgroundMineError::Unknown(error)) => {
+                // Transport or decode failure: the node may have produced a
+                // block. Reconcile against the current chain tip before
+                // deciding whether the same set may be retried.
+                let current = state.0.rpc.checkpoint().await;
+                let chain_advanced = match (&last_checkpoint, &current) {
+                    (Some(prev), Ok(curr)) => prev != curr,
+                    // No baseline or unreadable tip: assume produced to be safe.
+                    _ => true,
+                };
+                if chain_advanced {
+                    attempted = Some(set);
+                }
+                if let Ok(curr) = current {
+                    last_checkpoint = Some(curr);
+                }
+                tracing::warn!(
+                    error = %format_args!("{error:#}"),
+                    chain_advanced,
+                    "background mempool mining lost a generate reply"
+                );
+            }
             Err(BackgroundMineError::Sync(error)) => {
                 // A block was produced; record the set to avoid re-mining the
                 // same transactions while sync is retried separately.
                 attempted = Some(set);
+                last_checkpoint = state.0.rpc.checkpoint().await.ok();
                 tracing::warn!(
                     error = %format_args!("{error:#}"),
                     "background mempool mining produced a block but wallet sync failed"
