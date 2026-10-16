@@ -122,7 +122,12 @@ and environment workflows.
 
 - **Documentation:** The project now includes a GitBook covering setup,
   accounts, payments, mining, operations, application integration, and
-  troubleshooting. [#122](https://github.com/zcashlabs/thus-spoke-zakura/pull/122)
+  troubleshooting. Dashboard guides clarify external Regtest destinations and
+  payment-request editing, and developer source maps point to the current
+  server modules.
+  [#122](https://github.com/zcashlabs/thus-spoke-zakura/pull/122),
+  [#390](https://github.com/zcashlabs/thus-spoke-zakura/pull/390),
+  [#391](https://github.com/zcashlabs/thus-spoke-zakura/pull/391)
 - **Maintainability:** The server, wallet, launcher, and dashboard were split
   into focused application modules with shared lifecycle and validation code.
   [#178](https://github.com/zcashlabs/thus-spoke-zakura/pull/178),
@@ -138,7 +143,7 @@ and environment workflows.
 - **Contributors:** Thank you to @amiabix, @AnmolBansalDEV, @Annkkitaaa,
   @jonwalch, @megabyte0x, @nikhilkumar1612, @Not-Sarthak, @paoValle,
   @piatoss3612, @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @tanctl,
-  and @vkpatva.
+  @vkpatva, and @yashgo0018.
 - **Full changelog:** [Compare v0.3.0 with v0.4.0](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.3.0...v0.4.0).
 
 ## v0.3.0
