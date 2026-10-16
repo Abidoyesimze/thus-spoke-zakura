@@ -59,6 +59,25 @@ instance's databases remain intact. This is not an end-to-end exactly-once
 guarantee: a fresh key requests a new payment, and deleting the instance deletes
 its recovery records.
 
+## HTTP admission and status
+
+`POST /api/v1/send`, `POST /api/v1/faucet`, and
+`POST /api/v1/faucet/address` save an intent before processing it. The response
+is HTTP **202** while the payment is pending, or **200** when its stored status
+is `confirmed` or `failed`. Both include the operation and a relative
+`Location` with the encoded idempotency key.
+
+Neither status code alone proves the payment succeeded: inspect the operation's
+`status`. Follow `Location` with **GET** to check a pending payment. The server
+keeps working if the caller disconnects and resumes saved payments after a
+restart. Status reads do not start payment work.
+
+`preparing`, `prepared`, and `broadcast` are pending. Only `confirmed` and
+`failed` are terminal. A pending operation can have an empty `txid`. A
+`last_error` can describe a retryable failure and clears when processing
+continues. Keep the same key after a timeout. Reusing it with different
+payment details is rejected.
+
 ## Call the API with a deliberate key
 
 This example uses integer zatoshi. Run it against the live dashboard URL of
@@ -71,7 +90,7 @@ curl -fsS "$DASHBOARD_URL/api/v1/send" \
   --data '{"from_account":1,"to_account":2,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":100000000,"idempotency_key":"book-account-1-to-2-v1"}'
 ```
 
-The response is one activity object, and the same object is what
+The POST response is one activity object, and the same object is what
 `GET /api/v1/activity` returns in a list. It has thirteen fields:
 
 | Field | Meaning |
@@ -97,6 +116,29 @@ are not read back through this API.
 Keep this key only for this intended payment. If the server has recorded it,
 repeating the **same direct API request** with the same key retrieves or
 finishes that activity.
+
+## Resume a faucet payment after a lost response
+
+1. Get the dashboard URL for your instance as shown above. Choose a key for
+   this one-ZEC payment to Account 2 and keep the exact request:
+
+   ```console
+   curl -i "$DASHBOARD_URL/api/v1/faucet" \
+     -H 'content-type: application/json' \
+     --data '{"account_id":2,"pool":"ironwood","amount_zatoshi":100000000,"idempotency_key":"book-faucet-account-2-v1"}'
+   ```
+
+2. If the response is lost, repeat **that same request** against the same
+   instance. The key identifies this payment; a new key requests another one.
+3. GET the returned `Location` until the stored status is `confirmed` or
+   `failed`. For this example, that is:
+
+   ```console
+   curl -fsS "$DASHBOARD_URL/api/v1/activity?idempotency_key=book-faucet-account-2-v1"
+   ```
+
+   The response is a one-item array. A mined block alone does not prove this
+   payment was confirmed.
 
 ## Which caller are you retrying?
 
@@ -154,13 +196,19 @@ result of its earlier confirmation check.
 job. It generates blocks, reads the mined tip, reconciles the wallet, notifies
 dashboards, and returns `blocks` plus `hashes`. If a later step errors,
 blocks may already exist, even though the request has no success response.
-A lost connection does not cancel admitted work; another `ths mine` invocation
-uses a fresh internal key and can request additional mining.
+A lost connection does not cancel admitted work. Each legacy API request uses
+a fresh internal key and can request additional mining.
 
-The dashboard uses `POST /api/v1/mining/jobs` with a caller key and receives
-an accepted job before completion. Replaying the same accepted key and count
-returns that job within the server's lifetime. After a lost response, read
+The dashboard and `ths mine` use `POST /api/v1/mining/jobs` with a caller key
+and receive an accepted job before completion. Replaying the same accepted
+key and count returns that job within the server's lifetime. After a lost response, read
 `GET /api/v1/mining/jobs` to inspect the latest job before requesting more.
+
+The CLI saves its key before submission and retains it after an uncertain
+response, interruption, or polling timeout. Rerun `ths mine` with the same
+block count against the same instance to resume the saved job. After the CLI
+observes a finished job, it clears the key; the next invocation starts new
+mining. Jobs are not recovered after a server restart.
 
 After a timeout, compare the current **node height and tip hash** with
 what you observed before the request. Use Network, `GET /api/v1/status`,
