@@ -208,7 +208,9 @@ ths stop
 external deletion and exits; you do not need to interrupt it separately.
 Cleanup errors retain `lifecycle-recovery.json` for this instance. A successful
 message requires verified deletion; neither stop nor reset removes another
-instance's resources.
+instance's resources. If the name has no instance metadata, recovery state, or
+owned Docker resources, both commands report that the environment does not
+exist and exit nonzero.
 
 ### `ths reset --force`
 

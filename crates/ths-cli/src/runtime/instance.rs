@@ -457,7 +457,9 @@ impl Runtime {
                 let _stopping = self.mark_stopping(name)?;
                 remove_if_present(&self.session_path(name))?;
                 let _lock = self.lock_instance(name)?;
-                return cleanup();
+                let mut report = cleanup()?;
+                report.environment_found |= claimed.is_some() || requested.is_some();
+                return Ok(report);
             }
             let session = self.read_session(name)?;
             if self.read_owner(name)? != claimed {

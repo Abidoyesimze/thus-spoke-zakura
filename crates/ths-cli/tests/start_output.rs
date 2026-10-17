@@ -493,6 +493,27 @@ fn status_rejects_an_unknown_environment_without_a_raw_docker_error() {
 }
 
 #[test]
+fn cleanup_commands_reject_an_unknown_environment() {
+    let fixture = Fixture::new();
+    for arguments in [
+        vec!["--name", "ghost", "stop"],
+        vec!["--name", "ghost", "reset", "--force"],
+    ] {
+        let output = fixture.command().args(arguments).output().unwrap();
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("environment ghost does not exist"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Stopped and deleted"), "{stderr}");
+        assert!(!stderr.contains("Deleted ghost"), "{stderr}");
+    }
+}
+
+#[test]
 fn json_start_stdout_is_one_document_after_external_deletion() {
     let (success, stdout, stderr, commands, _) = output_after_shutdown(true, false, true);
     assert!(success, "{stderr}");
