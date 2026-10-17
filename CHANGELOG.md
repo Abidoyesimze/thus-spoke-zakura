@@ -77,9 +77,12 @@ and environment workflows.
 - **Environment workflows:** `ths run` starts a fresh settled environment for
   a child command and cleans it up afterwards. `ths list` reports environment
   and container status, while `ths logs` accepts `--head` and `--tail`.
+  `ths endpoints --env` prints shell exports matching the environment variables
+  passed to a `ths run` child.
   [#76](https://github.com/zcashlabs/thus-spoke-zakura/pull/76),
   [#101](https://github.com/zcashlabs/thus-spoke-zakura/pull/101),
-  [#141](https://github.com/zcashlabs/thus-spoke-zakura/pull/141)
+  [#141](https://github.com/zcashlabs/thus-spoke-zakura/pull/141),
+  [#311](https://github.com/zcashlabs/thus-spoke-zakura/pull/311)
 - **Loopback Host validation:** Local API clients and reverse proxies must send
   a loopback `Host` header. The app rejects non-loopback hosts to prevent DNS
   rebinding against the unauthenticated local API.
@@ -96,6 +99,18 @@ and environment workflows.
   [#202](https://github.com/zcashlabs/thus-spoke-zakura/pull/202),
   [#276](https://github.com/zcashlabs/thus-spoke-zakura/pull/276),
   [#277](https://github.com/zcashlabs/thus-spoke-zakura/pull/277)
+- **Runtime health and storage:** Health probes check both Zakura and
+  lightwalletd on every request. Zakura stores its chain state in the mounted
+  chain volume rather than the container filesystem.
+  [#296](https://github.com/zcashlabs/thus-spoke-zakura/pull/296),
+  [#283](https://github.com/zcashlabs/thus-spoke-zakura/pull/283)
+- **Launcher updates and pipes:** Update and uninstall resolve launcher
+  symlinks to operate on the real binary while preserving the link. Successful
+  updates in JSON mode emit the report on stdout and installer output on
+  stderr. `ths logs` exits successfully when its reader closes the pipe.
+  [#323](https://github.com/zcashlabs/thus-spoke-zakura/pull/323),
+  [#333](https://github.com/zcashlabs/thus-spoke-zakura/pull/333),
+  [#343](https://github.com/zcashlabs/thus-spoke-zakura/pull/343)
 - **Secure local API and compatible releases:** The app rejects non-loopback
   Host headers and release workflow shell steps safely handle release tags.
   Linux launcher artifacts are built against an older glibc baseline and smoke
@@ -105,18 +120,38 @@ and environment workflows.
 - **Clear API failures:** JSON-body, query, path, and method rejections now use
   the API error envelope, allowing clients to display actionable errors rather
   than generic HTTP-status messages. [#285](https://github.com/zcashlabs/thus-spoke-zakura/pull/285)
+- **Payment validation and startup:** Send fee quotes return HTTP 503 while
+  the environment is starting or the wallet remains unscanned, instead of an
+  unexpected HTTP 500. ZIP-321 parsing rejects explicitly zero payment amounts
+  with HTTP 400; omitting the amount still lets the sender supply one.
+  [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299),
+  [#246](https://github.com/zcashlabs/thus-spoke-zakura/pull/246)
 - **Accurate dashboard state:** The dashboard distinguishes node connectivity
   from wallet readiness, displays settlement and wallet-freshness information,
   preserves payment drafts and recovery identities, and keeps navigation tied
-  to the current action. [#171](https://github.com/zcashlabs/thus-spoke-zakura/pull/171),
+  to the current action. Queries refresh when the event stream connects or
+  reconnects, preventing an older response from leaving balances stale.
+  Payment creation times use the local date and time, and following a payment
+  transaction closes the Payments dialog.
+  [#171](https://github.com/zcashlabs/thus-spoke-zakura/pull/171),
   [#289](https://github.com/zcashlabs/thus-spoke-zakura/pull/289),
   [#382](https://github.com/zcashlabs/thus-spoke-zakura/pull/382),
-  [#385](https://github.com/zcashlabs/thus-spoke-zakura/pull/385)
+  [#385](https://github.com/zcashlabs/thus-spoke-zakura/pull/385),
+  [#306](https://github.com/zcashlabs/thus-spoke-zakura/pull/306),
+  [#321](https://github.com/zcashlabs/thus-spoke-zakura/pull/321),
+  [#337](https://github.com/zcashlabs/thus-spoke-zakura/pull/337)
+- **Mining controls:** The global Mine action remains available on mobile.
+  Block counts accept decimal digits only, within the existing 1–10,000 range;
+  exponent and hexadecimal forms are rejected.
+  [#314](https://github.com/zcashlabs/thus-spoke-zakura/pull/314),
+  [#302](https://github.com/zcashlabs/thus-spoke-zakura/pull/302)
 - **Explorer accuracy:** Explorer search gives useful feedback for hashes and
   transparent addresses. Transaction views keep pool values separate and show
-  a fee only when complete values make it verifiable.
+  a fee only when complete values make it verifiable. Older-block pages label
+  the first block actually shown rather than implying an exclusive cursor.
   [#129](https://github.com/zcashlabs/thus-spoke-zakura/pull/129),
-  [#383](https://github.com/zcashlabs/thus-spoke-zakura/pull/383)
+  [#383](https://github.com/zcashlabs/thus-spoke-zakura/pull/383),
+  [#336](https://github.com/zcashlabs/thus-spoke-zakura/pull/336)
 
 ### Project updates
 
@@ -141,9 +176,10 @@ and environment workflows.
 ### Credits and comparison
 
 - **Contributors:** Thank you to @amiabix, @AnmolBansalDEV, @Annkkitaaa,
-  @jonwalch, @megabyte0x, @nikhilkumar1612, @Not-Sarthak, @paoValle,
-  @piatoss3612, @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @tanctl,
-  @vkpatva, and @yashgo0018.
+  @guha-rahul, @jonwalch, @kaushikc44, @MayurK-cmd, @megabyte0x,
+  @nikhilkumar1612, @Not-Sarthak, @od-hunter, @paoValle, @piatoss3612,
+  @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @tanctl, @vkpatva,
+  and @yashgo0018.
 - **Full changelog:** [Compare v0.3.0 with v0.4.0](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.3.0...v0.4.0).
 
 ## v0.3.0
