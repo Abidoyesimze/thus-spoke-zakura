@@ -123,6 +123,74 @@ fn unlabeled_network_collision_preserves_data_and_metadata() {
 }
 
 #[test]
+fn unlabeled_network_is_adopted_when_its_containers_are_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "ths-alpha");
+    docker.inspect(
+        "container",
+        "ths-alpha-app",
+        r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
+    );
+    docker.inspect(
+        "volume",
+        "ths-alpha-wallet",
+        r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
+    );
+    docker.inspect(
+        "network",
+        "ths-alpha",
+        r#"[{"Id":"old-network","Labels":{},"Containers":{"owned-container":{"Name":"ths-alpha-app"}}}]"#,
+    );
+
+    runtime
+        .delete_instance_resources_with(&name("alpha"), &docker)
+        .unwrap();
+
+    assert_eq!(
+        *docker.runs.lock().unwrap(),
+        [
+            "rm -f owned-container",
+            "volume rm ths-alpha-wallet",
+            "network rm old-network",
+        ]
+    );
+}
+
+#[test]
+fn unlabeled_network_with_a_foreign_container_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let mut docker = RecordingDocker::new("ths-alpha-app\nother-app", "", "ths-alpha");
+    docker.inspect(
+        "container",
+        "ths-alpha-app",
+        r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
+    );
+    docker.inspect(
+        "container",
+        "other-app",
+        r#"[{"Id":"foreign-container","Config":{"Labels":{}}}]"#,
+    );
+    docker.inspect(
+        "network",
+        "ths-alpha",
+        r#"[{"Id":"old-network","Labels":{},"Containers":{"owned-container":{"Name":"ths-alpha-app"},"foreign-container":{"Name":"other-app"}}}]"#,
+    );
+
+    let error = runtime
+        .delete_instance_resources_with(&name("alpha"), &docker)
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("not owned"), "{error:#}");
+    assert!(docker.runs.lock().unwrap().is_empty());
+}
+
+#[test]
 fn new_networks_are_labeled_for_owned_cleanup() {
     struct NewNetwork(AtomicBool);
 
