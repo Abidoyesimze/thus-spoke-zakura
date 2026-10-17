@@ -141,6 +141,116 @@ fn stop_is_refused_unless_confirmed() {
     );
 }
 
+#[test]
+fn rpc_refuses_a_foreign_container_that_reuses_the_name() {
+    let (url, requests) = serve(
+        "200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":"foreign-node-was-called","error":null}"#,
+    );
+    let fixture = RpcFixture::new(&url, "original");
+    let docker = InspectDocker::new(
+        "original",
+        None,
+        zakura_inspect("foreign", url_port(&url), serde_json::json!({})),
+    );
+
+    let error = call(&fixture, docker, "getblockcount", false).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to adopt a replacement"),
+        "{}",
+        error.to_string()
+    );
+    assert!(requests.try_recv().is_err(), "foreign container was called");
+}
+
+#[test]
+fn rpc_refuses_a_same_name_replacement() {
+    let (url, requests) = serve(
+        "200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":"replacement-was-called","error":null}"#,
+    );
+    let port = url_port(&url);
+    let fixture = RpcFixture::new(&url, "original");
+    let replacement = zakura_inspect(
+        "replacement",
+        port,
+        serde_json::json!({"com.zakura.ths.instance": "alpha"}),
+    );
+    let docker = InspectDocker::new("original", Some(replacement.clone()), replacement);
+
+    let error = call(&fixture, docker, "stop", true).unwrap_err();
+
+    assert!(
+        error.to_string().contains("does not match replacement"),
+        "{}",
+        error.to_string()
+    );
+    assert!(
+        requests.try_recv().is_err(),
+        "replacement container was called"
+    );
+}
+
+#[test]
+fn rpc_calls_the_recorded_owned_container() {
+    let (url, requests) = serve(
+        "200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":42,"error":null}"#,
+    );
+    let port = url_port(&url);
+    let fixture = RpcFixture::new(&url, "original");
+    let docker = InspectDocker::new(
+        "original",
+        Some(zakura_inspect(
+            "original",
+            port,
+            serde_json::json!({"com.zakura.ths.instance": "alpha"}),
+        )),
+        zakura_inspect("foreign", port, serde_json::json!({})),
+    );
+
+    call(&fixture, docker, "getblockcount", false).unwrap();
+    let request: serde_json::Value =
+        serde_json::from_str(&requests.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+    assert_eq!(request["method"], "getblockcount");
+}
+
+#[test]
+fn rpc_refuses_when_the_recorded_container_publishes_a_different_port() {
+    let (url, requests) = serve(
+        "200 OK",
+        r#"{"jsonrpc":"2.0","id":1,"result":"wrong-port-was-called","error":null}"#,
+    );
+    let fixture = RpcFixture::new(&url, "original");
+    let docker = InspectDocker::new(
+        "original",
+        Some(zakura_inspect(
+            "original",
+            1,
+            serde_json::json!({"com.zakura.ths.instance": "alpha"}),
+        )),
+        String::new(),
+    );
+
+    let error = call(&fixture, docker, "getblockcount", false).unwrap_err();
+
+    assert!(
+        error.to_string().contains("publishes RPC on 127.0.0.1:1"),
+        "{}",
+        error.to_string()
+    );
+    assert!(requests.try_recv().is_err(), "stale RPC url was called");
+}
+
+fn call(fixture: &RpcFixture, docker: InspectDocker, method: &str, yes: bool) -> Result<()> {
+    super::with_rpc_docker(docker, || {
+        fixture.runtime.rpc(&fixture.name, method, &[], false, yes)
+    })
+}
+
 fn serve(status: &'static str, body: &str) -> (String, mpsc::Receiver<String>) {
     use std::net::TcpListener;
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -181,4 +291,106 @@ fn serve(status: &'static str, body: &str) -> (String, mpsc::Receiver<String>) {
         }
     });
     (url, received)
+}
+
+struct RpcFixture {
+    _dir: tempfile::TempDir,
+    runtime: Runtime,
+    name: InstanceName,
+}
+
+impl RpcFixture {
+    fn new(rpc: &str, container_id: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = Runtime {
+            root: dir.path().to_path_buf(),
+        };
+        let name = name("alpha");
+        fs::create_dir_all(runtime.instance_dir(&name)).unwrap();
+        let mut endpoints = endpoints_for(&host_ports(0).unwrap());
+        endpoints.rpc = rpc.to_owned();
+        runtime.write_instance(&name, &endpoints).unwrap();
+        let mut journal =
+            recovery::RecoveryJournal::create(runtime.recovery_path(&name), &name).unwrap();
+        let index = journal
+            .begin(
+                recovery::ResourceRef {
+                    kind: recovery::ResourceKind::Container,
+                    name: format!("{}-zakura", prefix(&name)),
+                    identity: None,
+                },
+                Vec::new(),
+                recovery::MutationOperation::Create,
+            )
+            .unwrap();
+        journal
+            .finish(
+                index,
+                recovery::MutationOutcome::Acknowledged,
+                Some(container_id.to_owned()),
+            )
+            .unwrap();
+        Self {
+            _dir: dir,
+            runtime,
+            name,
+        }
+    }
+}
+
+struct InspectDocker {
+    recorded_id: &'static str,
+    recorded: Option<String>,
+    named: String,
+}
+
+impl InspectDocker {
+    fn new(recorded_id: &'static str, recorded: Option<String>, named: String) -> Self {
+        Self {
+            recorded_id,
+            recorded,
+            named,
+        }
+    }
+}
+
+impl DockerResourceCommands for InspectDocker {
+    fn output(&self, args: &[&str]) -> Result<String> {
+        match args {
+            ["container", "inspect", id] if *id == self.recorded_id => self
+                .recorded
+                .clone()
+                .ok_or_else(|| anyhow!("no such container {id}")),
+            ["container", "inspect", _] => Ok(self.named.clone()),
+            ["container", "ls", ..] => Ok("ths-alpha-zakura\n".into()),
+            _ => bail!("unexpected Docker read: {}", args.join(" ")),
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Result<()> {
+        bail!("unexpected Docker run: {}", args.join(" "));
+    }
+}
+
+fn zakura_inspect(id: &str, port: u16, labels: serde_json::Value) -> String {
+    serde_json::json!([{
+        "Id": id,
+        "Name": "/ths-alpha-zakura",
+        "Config": {"Labels": labels},
+        "State": {"Running": true},
+        "NetworkSettings": {
+            "Ports": {
+                "18232/tcp": [{"HostIp": "127.0.0.1", "HostPort": port.to_string()}]
+            }
+        }
+    }])
+    .to_string()
+}
+
+fn url_port(url: &str) -> u16 {
+    reqwest::Url::parse(url).unwrap().port().unwrap()
+}
+
+fn name(value: &str) -> InstanceName {
+    value.parse().unwrap()
 }
