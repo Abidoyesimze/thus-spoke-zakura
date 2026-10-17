@@ -102,7 +102,7 @@ async fn height_wait_deadline_includes_stalled_lightwalletd_calls() {
     let result = tokio::time::timeout(
         Duration::from_millis(250),
         wallet.wait_for_block(&target, Duration::from_millis(50), |_| async {
-            Ok(BlockHash([1; 32]).to_string())
+            Ok(Some(BlockHash([1; 32]).to_string()))
         }),
     )
     .await;
@@ -187,7 +187,7 @@ async fn block_wait_outlasts_a_stale_lightwalletd_cache() {
     wallet
         .wait_for_block(&target, Duration::from_secs(5), |height| async move {
             assert_eq!(height, 1);
-            Ok(BlockHash([2; 32]).to_string())
+            Ok(Some(BlockHash([2; 32]).to_string()))
         })
         .await
         .unwrap();
@@ -209,7 +209,7 @@ async fn block_wait_stops_when_zakura_replaces_the_block() {
     let error = tokio::time::timeout(
         Duration::from_millis(500),
         wallet.wait_for_block(&target, Duration::from_secs(5), |_| async {
-            Ok(BlockHash([1; 32]).to_string())
+            Ok(Some(BlockHash([1; 32]).to_string()))
         }),
     )
     .await
@@ -217,6 +217,30 @@ async fn block_wait_stops_when_zakura_replaces_the_block() {
     .unwrap_err();
 
     assert!(error.to_string().contains("replaced block"), "{error:#}");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn block_wait_stops_when_zakura_rolls_back_below_the_height() {
+    // A rollback that removes the target height leaves lightwalletd answering `OutOfRange` until
+    // the chain grows back. The wait must end once Zakura no longer has the height instead of
+    // holding the wallet lock the rollback's own sync needs.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (wallet, _dir, requests) = lightwalletd_blocks(listener, vec![None]);
+    let target = ChainCheckpoint {
+        height: 1,
+        hash: BlockHash([1; 32]).to_string(),
+    };
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        wallet.wait_for_block(&target, Duration::from_secs(5), |_| async { Ok(None) }),
+    )
+    .await
+    .expect("block wait kept waiting for a rolled back height")
+    .unwrap_err();
+
+    assert!(error.to_string().contains("rolled back below"), "{error:#}");
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 }
 

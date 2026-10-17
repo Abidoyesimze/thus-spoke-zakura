@@ -43,7 +43,7 @@ impl AppState {
                     .wait_for_block(
                         &ChainCheckpoint { height, hash },
                         deadline.saturating_duration_since(Instant::now()),
-                        |height| self.0.rpc.block_hash(height),
+                        |height| self.0.rpc.canonical_hash(height),
                     )
                     .await?;
             }

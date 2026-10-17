@@ -446,8 +446,9 @@ impl RealWallet {
     /// Waits until lightwalletd serves `target` from its block cache. lightwalletd answers
     /// `GetLatestBlock` straight from Zakura, so a height alone does not prove the indexer caught
     /// up: right after a rollback its cache still serves the removed block at that height until
-    /// its next poll. `canonical_hash` reads Zakura's hash at a height, so the wait ends as soon
-    /// as the chain replaces `target` instead of waiting for a block that will never be indexed.
+    /// its next poll. `canonical_hash` reads Zakura's hash at a height (`None` once the chain is
+    /// shorter), so the wait ends as soon as a reorg replaces `target` or a rollback removes it
+    /// instead of waiting for a block that will never be indexed.
     pub async fn wait_for_block<F, Fut>(
         &self,
         target: &ChainCheckpoint,
@@ -456,7 +457,7 @@ impl RealWallet {
     ) -> Result<()>
     where
         F: Fn(u32) -> Fut,
-        Fut: std::future::Future<Output = Result<String>>,
+        Fut: std::future::Future<Output = Result<Option<String>>>,
     {
         let height = u32::try_from(target.height)?;
         let mut served = None;
@@ -480,13 +481,16 @@ impl RealWallet {
                 if indexed.as_deref() == Some(target.hash.as_str()) {
                     return Ok::<_, anyhow::Error>(());
                 }
-                if indexed.is_some() {
-                    let canonical = canonical_hash(height).await?;
-                    anyhow::ensure!(
-                        canonical == target.hash,
+                match canonical_hash(height).await? {
+                    Some(canonical) if canonical == target.hash => {}
+                    Some(canonical) => anyhow::bail!(
                         "Zakura replaced block {} at height {height} with {canonical} before lightwalletd indexed it",
                         target.hash
-                    );
+                    ),
+                    None => anyhow::bail!(
+                        "Zakura rolled back below height {height} before lightwalletd indexed block {}",
+                        target.hash
+                    ),
                 }
                 served = indexed;
                 tokio::time::sleep(Duration::from_millis(250)).await;
