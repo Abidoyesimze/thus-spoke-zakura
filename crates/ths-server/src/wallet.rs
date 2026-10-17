@@ -239,6 +239,12 @@ impl RealWallet {
         &self.lightwalletd
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_lightwalletd(mut self, endpoint: String) -> Self {
+        self.lightwalletd = endpoint;
+        self
+    }
+
     async fn with_db<T, F>(&self, operation: F) -> Result<T>
     where
         T: Send + 'static,

@@ -73,9 +73,11 @@ impl Runtime {
         Ok(())
     }
 
-    pub fn endpoints(&self, name: &InstanceName, json: bool) -> Result<()> {
+    pub fn endpoints(&self, name: &InstanceName, json: bool, env: bool) -> Result<()> {
         let endpoints = self.read_instance(name)?.endpoints;
-        if json {
+        if env {
+            println!("{}", endpoint_exports(name, &endpoints));
+        } else if json {
             println!("{}", serde_json::to_string_pretty(&endpoints)?);
         } else {
             println!("{}", endpoint_lines(&endpoints));
@@ -196,6 +198,31 @@ pub(super) fn endpoint_lines(e: &Endpoints) -> String {
         "  Dashboard    {}\n  Zakura RPC   {}\n  lightwalletd {}  (network={}, tls={})\n  P2P          {}",
         e.dashboard, e.rpc, e.lightwalletd, e.network, e.tls, e.p2p
     )
+}
+
+/// Variables `ths run` passes to its child. `endpoints --env` prints this list.
+/// `THS_NETWORK` is `regtest` and `THS_LIGHTWALLETD_TLS` is `false`.
+pub(super) fn child_environment(
+    name: &InstanceName,
+    endpoints: &Endpoints,
+) -> [(&'static str, String); 7] {
+    [
+        ("THS_INSTANCE", name.to_string()),
+        ("THS_NETWORK", "regtest".to_owned()),
+        ("THS_API_URL", endpoints.dashboard.clone()),
+        ("THS_ZAKURA_RPC_URL", endpoints.rpc.clone()),
+        ("THS_LIGHTWALLETD_URL", endpoints.lightwalletd.clone()),
+        ("THS_LIGHTWALLETD_TLS", "false".to_owned()),
+        ("THS_P2P_ADDR", endpoints.p2p.clone()),
+    ]
+}
+
+pub(super) fn endpoint_exports(name: &InstanceName, endpoints: &Endpoints) -> String {
+    child_environment(name, endpoints)
+        .into_iter()
+        .map(|(key, value)| format!("export {key}={value}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub(super) struct InstanceLock(File);

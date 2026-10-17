@@ -16,16 +16,22 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 pub(crate) async fn health(State(state): State<AppState>) -> Response {
-    let node = state.0.rpc.chain_info().await.ok();
+    let (node, lightwalletd) =
+        tokio::join!(state.0.rpc.chain_info(), state.0.wallet.latest_checkpoint());
+    let node = node.ok();
     let wallet = state.wallet_sync_status().await;
-    let status = if state.started() && node.is_some() && wallet.last_success_at.is_some() {
+    let ok = state.started()
+        && node.is_some()
+        && lightwalletd.is_ok()
+        && wallet.last_success_at.is_some();
+    let status = if ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (
         status,
-        Json(json!({"ok": state.started() && node.is_some() && wallet.last_success_at.is_some(), "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
+        Json(json!({"ok": ok, "instance": state.0.instance, "node": node, "wallet_sync": wallet})),
     )
         .into_response()
 }

@@ -154,14 +154,18 @@ Opens the running dashboard in your default browser.
 ths open
 ```
 
-### `ths endpoints [--json]`
+### `ths endpoints [--json | --env]`
 
 Prints the dashboard, Zakura RPC, lightwalletd, and P2P endpoints, useful for
-scripts and other developer tooling.
+scripts and other developer tooling. `--env` prints `export` lines for the
+same variables `ths run` passes to its child, so
+`eval "$(ths endpoints --env)"` can set them for an environment that is
+already running. `--env` cannot be combined with `--json`.
 
 ```console
 ths endpoints
 ths endpoints --json
+ths endpoints --env
 ```
 
 JSON output includes `"network": "regtest"` and `"tls": false`; lightwalletd
@@ -173,7 +177,8 @@ Prints or streams logs for a service in the named environment. Defaults to the
 `app` (dashboard/server) service. Without `--tail` or `--head`, it prints
 all available Docker logs. Counts must be positive. `--head` conflicts with
 `--tail` and `--follow`; `--tail` can be combined with `--follow`. Output remains
-log text even with the global `--json` flag.
+log text even with the global `--json` flag. If the reader closes the pipe, the
+command stops without an error.
 
 ```console
 ths logs                       # available logs from the app service
@@ -695,7 +700,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths pull` | Pull the exact images for this launcher version |
 | `ths status [--json]` | Show app-container running state and endpoints |
 | `ths open` | Open the running dashboard |
-| `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
+| `ths endpoints [--json \| --env]` | Print endpoints, or `export` lines for the variables `ths run` passes to its child |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths reorg --depth N [--keep-txs]` | Replace recent blocks, optionally attempting transaction reinclusion |
 | `ths rollback --depth N` | Remove recent blocks without replacements |

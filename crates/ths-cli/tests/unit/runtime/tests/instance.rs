@@ -89,6 +89,41 @@ fn reports_the_conflicting_loopback_port() {
 }
 
 #[test]
+fn endpoint_exports_match_the_variables_run_passes_to_its_child() {
+    let endpoints = endpoints_for(&host_ports(0).unwrap());
+    assert_eq!(
+        endpoint_exports(&name("alpha"), &endpoints),
+        "\
+export THS_INSTANCE=alpha
+export THS_NETWORK=regtest
+export THS_API_URL=http://127.0.0.1:32805
+export THS_ZAKURA_RPC_URL=http://127.0.0.1:18232
+export THS_LIGHTWALLETD_URL=http://127.0.0.1:9067
+export THS_LIGHTWALLETD_TLS=false
+export THS_P2P_ADDR=127.0.0.1:18233"
+    );
+
+    let mut shifted = endpoints_for(&host_ports(10).unwrap());
+    shifted.network = "other".to_owned();
+    shifted.tls = true;
+    let exports = endpoint_exports(&name("beta"), &shifted);
+    for expected in [
+        "export THS_INSTANCE=beta",
+        "export THS_NETWORK=regtest",
+        "export THS_API_URL=http://127.0.0.1:32815",
+        "export THS_ZAKURA_RPC_URL=http://127.0.0.1:18242",
+        "export THS_LIGHTWALLETD_URL=http://127.0.0.1:9077",
+        "export THS_LIGHTWALLETD_TLS=false",
+        "export THS_P2P_ADDR=127.0.0.1:18243",
+    ] {
+        assert!(
+            exports.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+}
+
+#[test]
 fn endpoints_json_includes_regtest_and_plaintext_lightwalletd() {
     let json = serde_json::to_value(endpoints_for(&host_ports(0).unwrap())).unwrap();
     assert_eq!(json["dashboard"], "http://127.0.0.1:32805");
