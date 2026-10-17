@@ -81,6 +81,19 @@ pub(crate) enum Command {
         #[arg(value_parser = clap::value_parser!(u32).range(1..=10_000))]
         blocks: u32,
     },
+    /// Replace recent Regtest blocks with a new branch.
+    Reorg {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        depth: u32,
+        /// Attempt to include the dropped transactions in replacement blocks.
+        #[arg(long)]
+        keep_txs: bool,
+    },
+    /// Remove recent Regtest blocks without mining replacements.
+    Rollback {
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=1000))]
+        depth: u32,
+    },
     /// Send disposable Regtest ZEC to a unified or transparent address.
     Faucet {
         /// Regtest unified or transparent destination address.
@@ -163,8 +176,11 @@ pub(crate) enum WalletCommand {
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         to: u8,
         /// Amount of ZEC to shield, up to 8 decimal places.
-        #[arg(long)]
-        amount: SendAmount,
+        #[arg(long, required_unless_present = "max", conflicts_with = "max")]
+        amount: Option<SendAmount>,
+        /// Shield the maximum spendable transparent balance after fees.
+        #[arg(long, required_unless_present = "amount", conflicts_with = "amount")]
+        max: bool,
         /// Text memo for the recipient (up to 512 bytes).
         #[arg(long, value_parser = parse_memo)]
         memo: Option<String>,
@@ -178,8 +194,11 @@ pub(crate) enum WalletCommand {
         #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
         to: u8,
         /// Amount of ZEC to unshield, up to 8 decimal places.
-        #[arg(long)]
-        amount: SendAmount,
+        #[arg(long, required_unless_present = "max", conflicts_with = "max")]
+        amount: Option<SendAmount>,
+        /// Unshield the maximum spendable Ironwood balance after fees.
+        #[arg(long, required_unless_present = "amount", conflicts_with = "amount")]
+        max: bool,
     },
 }
 
@@ -202,8 +221,19 @@ pub(crate) struct SendArgs {
     pub(crate) uri: Option<String>,
     /// Amount of ZEC to send, up to 8 decimal places. With --uri, only for a
     /// URI that does not set an amount.
-    #[arg(long, required_unless_present = "uri")]
+    #[arg(
+        long,
+        required_unless_present_any = ["uri", "max"],
+        conflicts_with = "max"
+    )]
     pub(crate) amount: Option<SendAmount>,
+    /// Send the maximum spendable source-pool balance after fees.
+    #[arg(
+        long,
+        required_unless_present_any = ["uri", "amount"],
+        conflicts_with = "amount"
+    )]
+    pub(crate) max: bool,
     /// Pool to spend from.
     #[arg(long = "source-pool", value_enum, default_value = "ironwood")]
     pub(crate) source_pool: Pool,
