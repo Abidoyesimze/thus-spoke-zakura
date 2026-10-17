@@ -67,6 +67,7 @@ impl From<anyhow::Error> for ApiError {
         } else {
             match error.downcast_ref::<PaymentError>() {
                 Some(PaymentError::TreasuryExhausted) => StatusCode::SERVICE_UNAVAILABLE,
+                Some(PaymentError::ScanRequired) => StatusCode::SERVICE_UNAVAILABLE,
                 Some(PaymentError::InsufficientFunds { .. }) => StatusCode::UNPROCESSABLE_ENTITY,
                 Some(PaymentError::TransparentMemo) => StatusCode::BAD_REQUEST,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,

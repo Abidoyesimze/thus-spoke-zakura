@@ -1135,6 +1135,50 @@ async fn send_quote_rejects_unknown_pools_as_bad_requests() {
     }
 }
 
+/// While startup is pending the quote is unavailable, like send and faucet,
+/// instead of failing against an unscanned wallet.
+#[tokio::test]
+async fn send_quote_reports_startup_as_unavailable() {
+    let (state, _dir) = crate::state::tests::offline_state();
+    let (status, body) = api_request(
+        &state,
+        "POST",
+        "/api/v1/send/quote",
+        json!({"from_account": 1, "source_pool": "ironwood", "destination_pool": "ironwood"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({"error": {"message": "the environment is still starting", "status": 503}}),
+    );
+}
+
+/// A started server with an unscanned wallet reports the quote as
+/// unavailable rather than as an unexpected error, for either pool.
+#[tokio::test]
+async fn send_quote_reports_an_unscanned_wallet_as_unavailable() {
+    let (state, _dir) = state_with_local_wallet();
+    for (source_pool, destination_pool) in [("ironwood", "ironwood"), ("transparent", "ironwood")] {
+        let (status, body) = api_request(
+            &state,
+            "POST",
+            "/api/v1/send/quote",
+            json!({"from_account": 1, "source_pool": source_pool, "destination_pool": destination_pool}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{source_pool}->{destination_pool}"
+        );
+        assert_eq!(
+            body["error"]["status"], 503,
+            "{source_pool}->{destination_pool}: {body}"
+        );
+    }
+}
+
 use crate::state::tests::{api_get, api_request};
 #[tokio::test]
 async fn address_faucet_status_reads_internal_and_external_records() {
