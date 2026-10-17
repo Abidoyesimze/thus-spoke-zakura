@@ -51,6 +51,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Tx { txid } => runtime.explorer(&name, "transactions", Some(&txid), cli.json),
         Command::Block { id } => runtime.explorer(&name, "blocks", id.as_deref(), cli.json),
         Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
+        Command::Reorg { depth, keep_txs } => {
+            runtime.change_chain(&name, "reorg", depth, keep_txs, cli.json)
+        }
+        Command::Rollback { depth } => {
+            runtime.change_chain(&name, "rollback", depth, false, cli.json)
+        }
         Command::Faucet { address, amount } => {
             runtime.faucet(&name, &address, amount.zatoshi(), cli.json)
         }
@@ -67,6 +73,7 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 from,
                 to,
                 amount,
+                max,
                 memo,
             } => send(
                 &runtime,
@@ -74,7 +81,8 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 SendArgs {
                     from,
                     to: Some(to),
-                    amount: Some(amount),
+                    amount,
+                    max,
                     uri: None,
                     source_pool: Pool::Transparent,
                     destination_pool: Pool::Ironwood,
@@ -82,13 +90,19 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 },
                 cli.json,
             ),
-            WalletCommand::Unshield { from, to, amount } => send(
+            WalletCommand::Unshield {
+                from,
+                to,
+                amount,
+                max,
+            } => send(
                 &runtime,
                 &name,
                 SendArgs {
                     from,
                     to: Some(to),
-                    amount: Some(amount),
+                    amount,
+                    max,
                     uri: None,
                     source_pool: Pool::Ironwood,
                     destination_pool: Pool::Transparent,
