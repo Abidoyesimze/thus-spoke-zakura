@@ -118,11 +118,12 @@ export const mineSchema = z.object({
     .string()
     .min(1, 'Enter a number of blocks.')
     .transform((value, ctx) => {
-      const blocks = Number(value);
-      if (!Number.isInteger(blocks)) {
+      // Number() accepts exponent, hex, binary, and octal forms (1e4, 0x10, 0b11, 0o10).
+      if (!/^\d+$/.test(value)) {
         ctx.addIssue({ code: 'custom', message: 'Enter a whole number of blocks.' });
         return z.NEVER;
       }
+      const blocks = Number(value.replace(/^0+/, '') || '0');
       if (blocks < MINE_MIN_BLOCKS || blocks > MINE_MAX_BLOCKS) {
         ctx.addIssue({
           code: 'custom',
