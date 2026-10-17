@@ -19,6 +19,7 @@ import { paymentRecipient, type PaymentIdentity } from '@/hooks/payment-identity
 import { errorMessage } from '@/lib/api';
 import { formatZecAmount } from '@/lib/money';
 import { cn } from '@/lib/cn';
+import { absoluteTime } from '@/lib/format';
 
 export function PaymentStatus({
   identity,
@@ -389,7 +390,7 @@ export function PaymentStatus({
                 : identity.variables.memo}
           </p>
         )}
-        {activity?.created_at && <p>Created: {activity.created_at}</p>}
+        {activity?.created_at && <p>Created: {absoluteTime(activity.created_at)}</p>}
         {failed && <p>Adding funds won’t restart this payment. Start a new one to try again.</p>}
       </div>
     </article>,
