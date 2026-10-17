@@ -1,4 +1,4 @@
-use crate::rpc::{ChainCheckpoint, RpcError, RpcUnavailable};
+use crate::rpc::{ChainCheckpoint, RpcError};
 use crate::state::{AppState, notify};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -454,44 +454,52 @@ impl AppState {
     /// wallet. Used by the interval and mempool background loops, so it never
     /// counts toward a manual mining job.
     ///
-    /// Returns `Err(BackgroundMineError::Generation(_))` when there is
-    /// positive evidence that the request was rejected before execution (an
-    /// explicit RPC error, or HTTP 429/503 which cannot follow forwarding),
-    /// `Err(BackgroundMineError::Unknown(_))` when the outcome is uncertain
-    /// (transport or decode failure, or HTTP 502/504 which can follow
-    /// forwarding), and `Err(BackgroundMineError::Sync(_))` when a block was
-    /// produced but a subsequent step failed (do not retry with the same set).
+    /// Returns `Err(BackgroundMineError::Generation(_))` when no block was
+    /// produced: either the pre-generate checkpoint was unavailable (generate
+    /// was not called), or `generate` failed with an explicit JSON-RPC error.
+    /// Returns `Err(BackgroundMineError::Unknown { before, .. })` when the
+    /// outcome is uncertain; `before` is the chain tip read inside the chain
+    /// lock immediately before `generate` and is always valid. Returns
+    /// `Err(BackgroundMineError::Sync(_))` when a block was produced but a
+    /// subsequent step failed (do not retry generation with the same set).
     pub(crate) async fn mine_and_sync_background(&self) -> Result<(), BackgroundMineError> {
-        // Hold the chain operations read lock across generation and sync so that
-        // reorg/rollback (which takes the write lock) cannot interleave with us.
+        // Hold the chain operations read lock across the checkpoint read,
+        // generation, and sync so that reorg/rollback (which holds the write
+        // lock) cannot change the chain tip between this function's checkpoint
+        // read and the generate call.
         let _chain = self.0.mining.chain_operations.read().await;
+        // Read the pre-generate checkpoint while holding the lock. If this
+        // fails, skip the attempt entirely: without a valid baseline we cannot
+        // reconcile a lost generate reply, so it is safer to retry on the next
+        // tick than to call generate with no way to detect duplication.
+        let before = self
+            .0
+            .rpc
+            .checkpoint()
+            .await
+            .map_err(BackgroundMineError::Generation)?;
         let mut hashes = match self.0.rpc.generate(1).await {
             Ok(hashes) => hashes,
             Err(error) => {
-                // An explicit RPC error or a proxy status that cannot follow
-                // forwarding is a known pre-execution rejection. 429 Too Many
-                // Requests and 503 Service Unavailable indicate the upstream
-                // was not reached. 502 Bad Gateway, like 504 Gateway Timeout,
-                // can come after the proxy forwarded the request (e.g. the
-                // upstream responded but the proxy failed reading it), so both
-                // are uncertain.
-                let is_known_rejection = error.downcast_ref::<RpcError>().is_some()
-                    || error
-                        .downcast_ref::<RpcUnavailable>()
-                        .is_some_and(|u| matches!(u.0.as_u16(), 429 | 503));
-                return Err(if is_known_rejection {
+                // Only an explicit JSON-RPC error from the node proves the
+                // request was rejected before execution. Any HTTP status from a
+                // proxy (including 429, 502, 503, 504) does not: proxies can
+                // return these codes after forwarding the request and failing to
+                // read or receive the upstream response.
+                return Err(if error.downcast_ref::<RpcError>().is_some() {
                     BackgroundMineError::Generation(error)
                 } else {
-                    BackgroundMineError::Unknown(error)
+                    BackgroundMineError::Unknown { error, before }
                 });
             }
         };
         if hashes.len() != 1 || hashes[0].is_empty() {
             // A success response with an unusable hash does not prove no block
             // was produced; the node may have generated before returning it.
-            return Err(BackgroundMineError::Unknown(anyhow::anyhow!(
-                "Zakura returned an unusable generation acknowledgment"
-            )));
+            return Err(BackgroundMineError::Unknown {
+                error: anyhow::anyhow!("Zakura returned an unusable generation acknowledgment"),
+                before,
+            });
         }
         let tip_hash = hashes.remove(0);
         let height = self
@@ -518,13 +526,21 @@ impl AppState {
 /// same transaction set may be retried.
 #[derive(Debug)]
 pub(crate) enum BackgroundMineError {
-    /// `generate` failed with an explicit node or proxy rejection; no block
-    /// was produced. Safe to retry with the same set.
+    /// `generate` was not called, or failed with an explicit JSON-RPC error
+    /// from the node. No block was produced. Safe to retry with the same set.
+    ///
+    /// Also returned when the pre-generate checkpoint read fails: without a
+    /// valid baseline the outcome of a lost generate reply cannot be
+    /// reconciled, so the attempt is skipped entirely.
     Generation(anyhow::Error),
-    /// `generate` failed with a transport or decode error; the node may or may
-    /// not have produced a block. Caller must reconcile chain state before
-    /// deciding whether the same set may be retried.
-    Unknown(anyhow::Error),
+    /// `generate` was called but its reply was lost or unusable. The node may
+    /// or may not have produced a block. `before` is the chain tip captured
+    /// inside the chain lock immediately before `generate`; compare it against
+    /// the current tip to decide whether to retry the same set.
+    Unknown {
+        error: anyhow::Error,
+        before: ChainCheckpoint,
+    },
     /// A block was produced but a subsequent step (block-metadata fetch or
     /// wallet sync) failed. Do not retry generation with the same transaction set.
     Sync(anyhow::Error),
@@ -548,7 +564,7 @@ pub(crate) async fn interval_mining_loop(state: AppState, block_time: Duration) 
                     "background interval mining failed to generate a block"
                 );
             }
-            Err(BackgroundMineError::Unknown(error)) => {
+            Err(BackgroundMineError::Unknown { error, .. }) => {
                 tracing::warn!(
                     error = %format_args!("{error:#}"),
                     "background interval mining lost a generate reply; outcome unknown"
@@ -586,11 +602,12 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut attempted: Option<Vec<String>> = None;
-    // An Unknown outcome whose result could not yet be determined. The
-    // before-generate checkpoint and the transaction set are kept together so
-    // they can be compared against the current tip on the next tick without
-    // relying on a stale checkpoint from a previous confirmed outcome.
-    let mut unresolved: Option<(Option<ChainCheckpoint>, Vec<String>)> = None;
+    // An Unknown outcome waiting for reconciliation. Holds the pre-generate
+    // chain checkpoint (always valid, captured inside the chain lock) and the
+    // transaction set. On the next tick the current tip is compared against
+    // `before`: if they differ the attempt produced a block and the set is
+    // suppressed; if they match no block was produced and the set is retried.
+    let mut unresolved: Option<(ChainCheckpoint, Vec<String>)> = None;
     loop {
         interval.tick().await;
         if !state.started() {
@@ -601,7 +618,7 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
         if let Some((before, set)) = unresolved.take() {
             match state.0.rpc.checkpoint().await {
                 Ok(current) => {
-                    if before.as_ref().is_some_and(|b| b != &current) {
+                    if before != current {
                         // Chain advanced from the pre-generate baseline: the
                         // attempt produced a block. Suppress retry for this set.
                         attempted = Some(set);
@@ -609,24 +626,12 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
                             "background mempool mining reconciled a lost generate \
                              reply as produced; suppressing retry"
                         );
-                    } else if before.is_some() {
-                        // before == current: tip unchanged since before generate.
-                        // No block was produced; safe to retry.
+                    } else {
+                        // Tip unchanged since before generate: no block was
+                        // produced; safe to retry.
                         tracing::warn!(
                             "background mempool mining reconciled a lost generate \
                              reply as not produced; retrying"
-                        );
-                    } else {
-                        // The pre-generate checkpoint read failed (before is None),
-                        // so we have no baseline to compare. Capture the current
-                        // tip as a reference and defer one more tick; if the chain
-                        // has advanced by then we treat it as produced, otherwise
-                        // we retry.
-                        unresolved = Some((Some(current), set));
-                        tracing::warn!(
-                            "background mempool mining cannot reconcile a lost \
-                             generate reply without a pre-generate baseline; \
-                             deferring with current tip as reference"
                         );
                     }
                 }
@@ -663,10 +668,9 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
         if state.0.mining.is_active().await {
             continue;
         }
-        // Capture the chain tip immediately before generating so an Unknown
-        // outcome can be compared against it on the next tick, rather than
-        // against a stale tip retained from an earlier confirmed mine.
-        let before = state.0.rpc.checkpoint().await.ok();
+        // mine_and_sync_background acquires the chain lock, reads the pre-
+        // generate checkpoint inside that lock, and embeds it in any Unknown
+        // outcome. The checkpoint is always valid when Unknown is returned.
         match state.mine_and_sync_background().await {
             Ok(()) => {
                 // Block produced and synced; record the set so an unchanged
@@ -674,18 +678,18 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
                 attempted = Some(set);
             }
             Err(BackgroundMineError::Generation(error)) => {
-                // No block was produced; do not record the set so the same
+                // No block was produced (checkpoint unavailable or explicit
+                // node rejection); do not record the set so the same
                 // transactions are retried on the next poll.
                 tracing::warn!(
                     error = %format_args!("{error:#}"),
                     "background mempool mining failed to generate a block"
                 );
             }
-            Err(BackgroundMineError::Unknown(error)) => {
-                // Transport or decode failure: the node may have produced a
-                // block. Defer reconciliation to the next tick so the chain
-                // tip has time to stabilize before we compare it against the
-                // pre-generate snapshot.
+            Err(BackgroundMineError::Unknown { error, before }) => {
+                // Generate reply was lost; the node may have produced a block.
+                // Store the pre-generate checkpoint alongside the set and
+                // defer reconciliation to the next tick.
                 unresolved = Some((before, set));
                 tracing::warn!(
                     error = %format_args!("{error:#}"),

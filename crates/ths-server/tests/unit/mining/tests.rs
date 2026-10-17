@@ -581,6 +581,22 @@ fn mempool_mining_ignores_an_empty_set() {
 
 // A 64-character hex string used as a stand-in block hash in mock RPCs below.
 const FAKE_HASH: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+// Genesis hash returned by getblockchaininfo in tests that need a valid
+// pre-generate checkpoint but do not exercise chain-tip comparisons.
+const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+fn genesis_checkpoint_response(id: &Value) -> Value {
+    json!({
+        "result": {
+            "chain": "regtest",
+            "blocks": 0u64,
+            "bestblockhash": GENESIS_HASH,
+            "verificationprogress": 1.0
+        },
+        "error": null,
+        "id": id
+    })
+}
 
 async fn rpc_server(handler: impl Fn(Value) -> Value + Send + Sync + Clone + 'static) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -604,9 +620,12 @@ async fn rpc_server(handler: impl Fn(Value) -> Value + Send + Sync + Clone + 'st
 
 #[tokio::test]
 async fn mine_and_sync_background_returns_generation_error_on_rpc_failure() {
-    let url = rpc_server(
-        |req| json!({"result":null,"error":{"code":-1,"message":"no peers"},"id":req["id"]}),
-    )
+    // An explicit JSON-RPC error from the node proves the request was rejected
+    // before execution; generate returning such an error must be Generation.
+    let url = rpc_server(|req| match req["method"].as_str() {
+        Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
+        _ => json!({"result":null,"error":{"code":-1,"message":"no peers"},"id":req["id"]}),
+    })
     .await;
     let (mut state, _dir) = state_with_local_wallet();
     Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
@@ -621,9 +640,8 @@ async fn mine_and_sync_background_returns_sync_error_when_block_fetch_fails() {
     // generate succeeds; getblock fails — a block was produced even though we
     // cannot read its height, so the error must be Sync, not Generation.
     let url = rpc_server(|req| match req["method"].as_str() {
-        Some("generate") => {
-            json!({"result":[FAKE_HASH],"error":null,"id":req["id"]})
-        }
+        Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
+        Some("generate") => json!({"result":[FAKE_HASH],"error":null,"id":req["id"]}),
         _ => json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]}),
     })
     .await;
@@ -640,6 +658,7 @@ async fn mine_and_sync_background_returns_sync_error_when_wallet_sync_fails() {
     // generate and getblock both succeed; synchronize_wallet fails because
     // there is no running lightwalletd — the error must still be Sync.
     let url = rpc_server(|req| match req["method"].as_str() {
+        Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
         Some("generate") => json!({"result":[FAKE_HASH],"error":null,"id":req["id"]}),
         Some("getblock") => {
             json!({"result":{"height":1,"hash":FAKE_HASH},"error":null,"id":req["id"]})
@@ -663,6 +682,7 @@ async fn mempool_loop_retries_same_set_after_generation_failure() {
     let url = rpc_server({
         let tx = tx.clone();
         move |req| match req["method"].as_str() {
+            Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
             Some("getrawmempool") => {
                 json!({"result":["tx1"],"error":null,"id":req["id"]})
             }
@@ -697,6 +717,7 @@ async fn mempool_loop_records_attempted_after_block_produced_with_sync_failure()
     let url = rpc_server({
         let tx = tx.clone();
         move |req| match req["method"].as_str() {
+            Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
             Some("getrawmempool") => {
                 json!({"result":["tx1"],"error":null,"id":req["id"]})
             }
@@ -742,7 +763,14 @@ async fn mine_and_sync_background_returns_unknown_on_malformed_response() {
             listener,
             Router::new().route(
                 "/",
-                post(|| async { (StatusCode::OK, "not-a-valid-rpc-response") }),
+                post(|Json(req): Json<Value>| async move {
+                    match req["method"].as_str() {
+                        Some("getblockchaininfo") => {
+                            Json(genesis_checkpoint_response(&req["id"])).into_response()
+                        }
+                        _ => (StatusCode::OK, "not-a-valid-rpc-response").into_response(),
+                    }
+                }),
             ),
         )
         .await
@@ -752,7 +780,7 @@ async fn mine_and_sync_background_returns_unknown_on_malformed_response() {
     Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
     assert!(matches!(
         state.mine_and_sync_background().await,
-        Err(BackgroundMineError::Unknown(_))
+        Err(BackgroundMineError::Unknown { .. })
     ));
 }
 
@@ -864,7 +892,14 @@ async fn mine_and_sync_background_returns_unknown_on_gateway_timeout() {
             listener,
             Router::new().route(
                 "/",
-                post(|| async { (StatusCode::GATEWAY_TIMEOUT, "").into_response() }),
+                post(|Json(req): Json<Value>| async move {
+                    match req["method"].as_str() {
+                        Some("getblockchaininfo") => {
+                            Json(genesis_checkpoint_response(&req["id"])).into_response()
+                        }
+                        _ => (StatusCode::GATEWAY_TIMEOUT, "").into_response(),
+                    }
+                }),
             ),
         )
         .await
@@ -875,7 +910,7 @@ async fn mine_and_sync_background_returns_unknown_on_gateway_timeout() {
     assert!(
         matches!(
             state.mine_and_sync_background().await,
-            Err(BackgroundMineError::Unknown(_))
+            Err(BackgroundMineError::Unknown { .. })
         ),
         "HTTP 504 must be Unknown, not Generation"
     );
@@ -886,6 +921,7 @@ async fn mine_and_sync_background_returns_unknown_on_empty_hash_result() {
     // A success response carrying no hash does not prove no block was produced;
     // the node may have generated before returning the unusable acknowledgment.
     let url = rpc_server(|req| match req["method"].as_str() {
+        Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
         Some("generate") => json!({"result":[],"error":null,"id":req["id"]}),
         _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
     })
@@ -895,7 +931,7 @@ async fn mine_and_sync_background_returns_unknown_on_empty_hash_result() {
     assert!(
         matches!(
             state.mine_and_sync_background().await,
-            Err(BackgroundMineError::Unknown(_))
+            Err(BackgroundMineError::Unknown { .. })
         ),
         "empty hash result must be Unknown, not Generation"
     );
@@ -1072,7 +1108,14 @@ async fn mine_and_sync_background_returns_unknown_on_bad_gateway() {
             listener,
             Router::new().route(
                 "/",
-                post(|| async { (StatusCode::BAD_GATEWAY, "").into_response() }),
+                post(|Json(req): Json<Value>| async move {
+                    match req["method"].as_str() {
+                        Some("getblockchaininfo") => {
+                            Json(genesis_checkpoint_response(&req["id"])).into_response()
+                        }
+                        _ => (StatusCode::BAD_GATEWAY, "").into_response(),
+                    }
+                }),
             ),
         )
         .await
@@ -1083,101 +1126,54 @@ async fn mine_and_sync_background_returns_unknown_on_bad_gateway() {
     assert!(
         matches!(
             state.mine_and_sync_background().await,
-            Err(BackgroundMineError::Unknown(_))
+            Err(BackgroundMineError::Unknown { .. })
         ),
         "HTTP 502 must be Unknown, not Generation"
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn mempool_loop_defers_when_pre_generate_checkpoint_fails_then_retries() {
-    // When the pre-generate checkpoint read fails (before = None), generate
-    // fires, and the reply is lost, the loop must not authorize a retry until
-    // it has established a baseline and confirmed no chain movement.
-    //
-    // Sequence: checkpoint call #0 fails (before = None), generate → Unknown,
-    // checkpoint call #1 returns H0 (first reconciliation: defer, set
-    // unresolved with before = H0), checkpoint call #2 returns H0 (second
-    // reconciliation: before == current → not produced → retry), tick fires
-    // generate a second time.
+async fn mempool_loop_skips_and_retries_when_pre_generate_checkpoint_fails() {
+    // When the pre-generate checkpoint read fails, mine_and_sync_background
+    // returns Generation without calling generate. The loop treats Generation as
+    // retry-safe: the transaction set is not recorded as attempted and generate
+    // fires normally on the very next tick after the checkpoint is restored.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let checkpoint_calls = Arc::new(AtomicUsize::new(0));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move {
-        axum::serve(
-            listener,
-            Router::new().route(
-                "/",
-                post(move |Json(req): Json<Value>| {
-                    let tx = tx.clone();
-                    let checkpoint_calls = checkpoint_calls.clone();
-                    async move {
-                        match req["method"].as_str() {
-                            Some("getrawmempool") => {
-                                Json(json!({"result":["tx1"],"error":null,"id":req["id"]}))
-                                    .into_response()
-                            }
-                            Some("generate") => {
-                                let _ = tx.send(());
-                                (StatusCode::OK, "not-a-valid-rpc-response").into_response()
-                            }
-                            Some("getblockchaininfo") => {
-                                let n = checkpoint_calls.fetch_add(1, Ordering::SeqCst);
-                                if n == 0 {
-                                    // Before-generate: fail so before = None.
-                                    Json(json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]})).into_response()
-                                } else {
-                                    // Reconciliation ticks: stable genesis tip.
-                                    Json(json!({
-                                        "result": {
-                                            "chain": "regtest",
-                                            "blocks": 0,
-                                            "bestblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
-                                            "verificationprogress": 1.0
-                                        },
-                                        "error": null,
-                                        "id": req["id"]
-                                    }))
-                                    .into_response()
-                                }
-                            }
-                            _ => Json(json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]})).into_response(),
-                        }
-                    }
-                }),
-            ),
-        )
-        .await
-        .unwrap();
-    });
+    let url = rpc_server({
+        let tx = tx.clone();
+        let checkpoint_calls = checkpoint_calls.clone();
+        move |req| match req["method"].as_str() {
+            Some("getrawmempool") => json!({"result":["tx1"],"error":null,"id":req["id"]}),
+            Some("generate") => {
+                let _ = tx.send(());
+                json!({"result":null,"error":{"code":-1,"message":"fail"},"id":req["id"]})
+            }
+            Some("getblockchaininfo") => {
+                let n = checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Tick 0: checkpoint unavailable → Generation, generate skipped.
+                    json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]})
+                } else {
+                    genesis_checkpoint_response(&req["id"])
+                }
+            }
+            _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
+        }
+    })
+    .await;
 
     let (mut state, _dir) = state_with_local_wallet();
     Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
     state.mark_started();
     tokio::spawn(mempool_mining_loop(state));
 
-    // Tick 0: before=None (checkpoint fails), generate → Unknown →
-    // unresolved = {None, ["tx1"]}.
-    rx.recv().await.expect("first generate call at t=0");
-
-    // Tick 2: reconcile — current=H0, before=None → defer with baseline=H0.
-    tokio::time::advance(Duration::from_secs(2)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-
-    // Tick 4: reconcile — current=H0 == before(H0) → not produced → retry.
-    tokio::time::advance(Duration::from_secs(2)).await;
-    for _ in 0..20 {
-        tokio::task::yield_now().await;
-    }
-
-    // Tick 6: mining fires second generate.
+    // Tick 0: checkpoint fails → Generation → generate NOT called, set not recorded.
+    // Advance to tick 2: checkpoint succeeds → generate fires.
     tokio::time::advance(Duration::from_secs(2)).await;
     rx.recv()
         .await
-        .expect("second generate call proves the set is retried after two-tick deferral");
+        .expect("generate fires on the tick after checkpoint failure");
 }
 
 #[tokio::test(start_paused = true)]
@@ -1188,6 +1184,7 @@ async fn interval_loop_waits_for_chain_operation_before_generating() {
     let url = rpc_server({
         let tx = tx.clone();
         move |req| match req["method"].as_str() {
+            Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
             Some("generate") => {
                 let _ = tx.send(());
                 json!({"result":null,"error":{"code":-1,"message":"fail"},"id":req["id"]})
@@ -1232,6 +1229,7 @@ async fn mempool_loop_waits_for_chain_operation_before_generating() {
     let url = rpc_server({
         let tx = tx.clone();
         move |req| match req["method"].as_str() {
+            Some("getblockchaininfo") => genesis_checkpoint_response(&req["id"]),
             Some("getrawmempool") => {
                 json!({"result":["tx1"],"error":null,"id":req["id"]})
             }
@@ -1267,4 +1265,72 @@ async fn mempool_loop_waits_for_chain_operation_before_generating() {
     rx.recv()
         .await
         .expect("generate must fire after the chain operation lock is released");
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_skips_generation_when_checkpoint_fails() {
+    // When the pre-generate checkpoint read fails, mine_and_sync_background must
+    // return Generation without calling generate. Without a valid baseline the
+    // outcome of a lost reply cannot be reconciled, so it is safer to skip.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let url = rpc_server({
+        let tx = tx.clone();
+        move |req| match req["method"].as_str() {
+            Some("generate") => {
+                // Should never be reached.
+                let _ = tx.send(());
+                json!({"result":[FAKE_HASH],"error":null,"id":req["id"]})
+            }
+            // getblockchaininfo (and everything else) returns an RPC error so
+            // the checkpoint call fails.
+            _ => json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]}),
+        }
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(matches!(
+        state.mine_and_sync_background().await,
+        Err(BackgroundMineError::Generation(_))
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "generate must not be called when the pre-generate checkpoint fails"
+    );
+}
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_unknown_on_service_unavailable() {
+    // HTTP 503 (Service Unavailable) can be returned by Envoy after it resets an
+    // upstream connection; the request may have been forwarded and executed. It
+    // must not be treated as a pre-execution rejection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(|Json(req): Json<Value>| async move {
+                    match req["method"].as_str() {
+                        Some("getblockchaininfo") => {
+                            Json(genesis_checkpoint_response(&req["id"])).into_response()
+                        }
+                        _ => (StatusCode::SERVICE_UNAVAILABLE, "").into_response(),
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(
+        matches!(
+            state.mine_and_sync_background().await,
+            Err(BackgroundMineError::Unknown { .. })
+        ),
+        "HTTP 503 must be Unknown, not Generation"
+    );
 }
