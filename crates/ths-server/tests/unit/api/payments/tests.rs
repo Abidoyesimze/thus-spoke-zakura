@@ -477,6 +477,121 @@ fn memos_must_not_end_with_nul() {
 
 const REPLAY_KEY: &str = "existing-idempotency-key";
 
+#[tokio::test]
+async fn payment_admission_rejects_transparent_dust_before_claiming() {
+    for source in ["ironwood", "transparent"] {
+        for destination in ["transparent", "ironwood"] {
+            for amount in [10, 53, 54] {
+                let (state, _dir) = offline_state();
+                let account = state.0.store.account(2).unwrap();
+                let treasury = state.0.store.account(TREASURY_ACCOUNT_ID).unwrap();
+                let address = |account: &crate::db::Account| {
+                    if destination == "transparent" {
+                        account.transparent_address.clone()
+                    } else {
+                        account.unified_address.clone()
+                    }
+                };
+                let cases = [
+                    (
+                        "/api/v1/send",
+                        json!({"from_account": 1, "to_account": 2, "source_pool": source,
+                            "destination_pool": destination, "amount_zatoshi": amount,
+                            "idempotency_key": "dust-send-account"}),
+                    ),
+                    (
+                        "/api/v1/send",
+                        json!({"from_account": 1, "to_address": address(&treasury),
+                            "source_pool": source, "destination_pool": destination,
+                            "amount_zatoshi": amount, "idempotency_key": "dust-send-address"}),
+                    ),
+                    (
+                        "/api/v1/faucet",
+                        json!({"account_id": 2, "pool": destination, "amount_zatoshi": amount,
+                            "idempotency_key": "dust-account-faucet"}),
+                    ),
+                    (
+                        "/api/v1/faucet/address",
+                        json!({"address": address(&account), "amount_zatoshi": amount,
+                            "idempotency_key": "dust-internal-faucet"}),
+                    ),
+                    (
+                        "/api/v1/faucet/address",
+                        json!({"address": address(&treasury), "amount_zatoshi": amount,
+                            "idempotency_key": "dust-external-faucet"}),
+                    ),
+                ];
+                for (uri, body) in cases {
+                    let key = body["idempotency_key"].as_str().unwrap();
+                    let (status, response) = api_request(&state, "POST", uri, body.clone()).await;
+                    let rejected = destination == "transparent" && amount < 54;
+                    assert_eq!(
+                        status,
+                        if rejected {
+                            StatusCode::BAD_REQUEST
+                        } else {
+                            StatusCode::ACCEPTED
+                        },
+                        "{uri}: {source} -> {destination}, {amount}: {response}"
+                    );
+                    let activity = state.0.store.activity_for_key(key).unwrap();
+                    let external = state.0.store.address_faucet_for_key(key).unwrap();
+                    if rejected {
+                        assert_eq!(
+                            response["error"]["message"],
+                            "transparent outputs must be at least 54 zatoshi"
+                        );
+                        assert!(activity.is_none() && external.is_none());
+                    } else {
+                        assert_eq!(response["status"], "preparing");
+                        assert_eq!(response["txid"], "");
+                        assert!(activity.is_some() ^ external.is_some());
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_faucet_rejects_dust_for_unified_transparent_fallbacks() {
+    // Regtest UAs containing unknown typecode 4 ([1; 32]) and P2PKH/P2SH ([2; 20]).
+    let addresses = [
+        "uregtest1zclnxv0zjpp8sljklmdlnfg8v0tlskqzvd53y7ywm4clm3zrdj5nasgynnwtyenxgvn9eunzz06qp27gxczny2jjswtjdq2vy6hfh5s4efzlxd0mmedqm5xj0z",
+        "uregtest18g4234glzemc98nhmnz6lxvacy70fx6960rycsh0mm2mu6v8shfxzqqxlaq95d4l0c0fsrtj5v9r8c0cz3w034lw3z4pwlyvz6pkx5fgfx2vrwwufmhqydmu6z",
+    ];
+    for address in addresses {
+        let (state, _dir) = offline_state();
+        let Address::Unified(decoded) = require_faucet_address(address).unwrap() else {
+            panic!("fixture must be a unified address");
+        };
+        assert!(decoded.has_transparent() && !decoded.has_orchard() && !decoded.has_sapling());
+        for amount in [53, 54] {
+            let body = json!({"address": address, "amount_zatoshi": amount,
+                "idempotency_key": "dust-unified-fallback"});
+            let (status, response) =
+                api_request(&state, "POST", "/api/v1/faucet/address", body).await;
+            let saved = state
+                .0
+                .store
+                .address_faucet_for_key("dust-unified-fallback")
+                .unwrap();
+            if amount == 53 {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+                assert_eq!(
+                    response["error"]["message"],
+                    "transparent outputs must be at least 54 zatoshi"
+                );
+                assert!(saved.is_none());
+            } else {
+                assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+                assert_eq!(saved.unwrap().amount_zatoshi, 54);
+            }
+            assert!(state.0.store.activities(100).unwrap().is_empty());
+        }
+    }
+}
+
 /// A state with a real store and offline wallet whose node RPC refuses
 /// connections, so any synchronization or network access surfaces as a
 /// 500 rather than the 400 or replay these tests expect.

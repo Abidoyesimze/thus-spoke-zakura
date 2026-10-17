@@ -76,7 +76,7 @@ export function App() {
             <span className="text-ink-muted">
               The last known balances remain available. Synchronization will retry automatically
               {status.wallet_sync.last_success_at
-                ? `; last successful update was ${new Date(status.wallet_sync.last_success_at * 1000).toLocaleTimeString()}`
+                ? `; last successful update was ${new Date(status.wallet_sync.last_success_at * 1000).toLocaleString()}`
                 : ''}
               .
             </span>
