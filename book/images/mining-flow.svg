@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="44 0 912 420" width="912" height="420" role="img" aria-label="The dashboard starts a keyed mining job and receives its accepted status; the CLI waits for that server-owned job. Mining advances acknowledged progress, then wallet synchronization completes or fails. Client disconnection does not cancel admitted work, and an uncertain RPC may have generated extra blocks.">
+<style>
+svg {
+  --bg: #fdfaf8;
+  --ink: #2c2430;
+  --muted: #7a6a7a;
+  --rule: #e0d3da;
+  --surface: #ffffff;
+  --zone: #f7f0f3;
+  --accent: #b24a6e;
+  --accent-soft: #fceef3;
+}
+@media (prefers-color-scheme: dark) {
+  svg {
+    --bg: #1b171f;
+    --ink: #efe8f0;
+    --muted: #a695a6;
+    --rule: #3d3442;
+    --surface: #252030;
+    --zone: #201b27;
+    --accent: #e79ab7;
+    --accent-soft: #3a2331;
+  }
+}
+text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+       "Helvetica Neue", Arial, sans-serif; fill: var(--ink); }
+.t { font-size: 16px; font-weight: 600; }
+.k { font-size: 11px; font-weight: 600; letter-spacing: .1em; fill: var(--muted); }
+.l { font-size: 14px; }
+.s { font-size: 12px; fill: var(--muted); }
+.a { font-size: 13px; font-weight: 600; fill: var(--accent); }
+.card { fill: var(--surface); stroke: var(--rule); stroke-width: 1; }
+.card-a { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1; }
+.zone { fill: var(--zone); stroke: none; }
+.note { fill: none; stroke: var(--rule); stroke-width: 1; stroke-dasharray: 3 3; }
+.flow { stroke: var(--accent); stroke-width: 2; fill: none; }
+.thin { stroke: var(--rule); stroke-width: 1.5; fill: none; }
+.lead { stroke: var(--rule); stroke-width: 1; fill: none; stroke-dasharray: 2 4; }
+</style>
+<defs><marker id="ar-a" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="8" markerHeight="7" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--accent)"/></marker><marker id="ar-n" viewBox="0 0 10 8" refX="9" refY="4" markerWidth="7" markerHeight="6" orient="auto"><path d="M0 0 L10 4 L0 8 z" fill="var(--rule)"/></marker></defs>
+<text class="t" x="48" y="46">An admitted mining job belongs to the server</text>
+<rect class="card" x="48.0" y="86" width="436.0" height="64" rx="8"/>
+<text class="l" x="266.0" y="115.0" text-anchor="middle">Dashboard: keyed POST</text>
+<text class="s" x="266.0" y="133.0" text-anchor="middle">202 returns job; read status to follow</text>
+<rect class="card" x="516.0" y="86" width="436.0" height="64" rx="8"/>
+<text class="l" x="734.0" y="115.0" text-anchor="middle">CLI: POST /mine</text>
+<text class="s" x="734.0" y="133.0" text-anchor="middle">waits for job + synchronization</text>
+<path class="flow" d="M266.0 150 L266.0 190 L189.33333333333334 190 L189.33333333333334 224" marker-end="url(#ar-a)"/>
+<path class="flow" d="M734.0 150 L734.0 190 L189.33333333333334 190 L189.33333333333334 224" marker-end="url(#ar-a)"/>
+<text class="s" x="500" y="178" text-anchor="middle">one active manual job, including synchronization</text>
+<rect class="card-a" x="48.0" y="232" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="189.33333333333334" y="261.0" text-anchor="middle">mining</text>
+<text class="s" x="189.33333333333334" y="279.0" text-anchor="middle">count acknowledged job hashes</text>
+<rect class="card" x="358.6666666666667" y="232" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="500.0" y="261.0" text-anchor="middle">syncing</text>
+<text class="s" x="500.0" y="279.0" text-anchor="middle">index, scan, reconcile</text>
+<rect class="card" x="669.3333333333334" y="232" width="282.6666666666667" height="64" rx="8"/>
+<text class="l" x="810.6666666666667" y="261.0" text-anchor="middle">completed</text>
+<text class="s" x="810.6666666666667" y="279.0" text-anchor="middle">synchronization succeeded</text>
+<path class="flow" d="M330.6666666666667 264 L350.6666666666667 264" marker-end="url(#ar-a)"/>
+<path class="flow" d="M641.3333333333334 264 L661.3333333333334 264" marker-end="url(#ar-a)"/>
+<rect class="note" x="240" y="332" width="520" height="54" rx="8"/>
+<text class="l" x="500.0" y="356.0" text-anchor="middle">failed is not a rollback</text>
+<text class="s" x="500.0" y="374.0" text-anchor="middle">uncertain RPC: lower bound; sync failure: full count</text>
+<path class="lead" d="M189.33333333333334 296 L189.33333333333334 316 L500 316 L500 332"/>
+<path class="lead" d="M500.0 296 L500.0 316 L500 316 L500 332"/>
+<text class="s" x="500" y="408" text-anchor="middle">client loss does not cancel admitted work; job history lasts only for this server process</text>
+</svg>
