@@ -110,11 +110,17 @@ fn payment_uri(store: &Store, uri: &str) -> ApiResult<PaymentUri> {
         Ok(Some(Memo::Text(text))) => Some(String::from(&*text)),
         _ => return Err(ApiError::bad_request("only text memos are supported")),
     };
+    // ZIP-321 treats an explicit zero as a requested amount. Send cannot pay
+    // it, while an omitted amount stays unset so the sender can supply one.
+    let amount_zatoshi = payment.amount().map(u64::from);
+    if amount_zatoshi == Some(0) {
+        return Err(ApiError::bad_request("amount must be greater than zero"));
+    }
     Ok(PaymentUri {
         to_account: development_account_for(store, &address)?,
         address,
         destination_pool,
-        amount_zatoshi: payment.amount().map(u64::from),
+        amount_zatoshi,
         memo,
     })
 }
