@@ -142,7 +142,11 @@ fn unlabeled_network_is_adopted_when_its_containers_are_owned() {
     docker.inspect(
         "network",
         "ths-alpha",
-        r#"[{"Id":"old-network","Labels":{},"Containers":{"owned-container":{"Name":"ths-alpha-app"}}}]"#,
+        r#"[{"Id":"old-network","Labels":{}}]"#,
+    );
+    docker.extra_output.insert(
+        "container ls -a --no-trunc --filter network=ths-alpha --format {{.ID}}".to_owned(),
+        "owned-container".to_owned(),
     );
 
     runtime
@@ -179,7 +183,11 @@ fn unlabeled_network_with_a_foreign_container_is_refused() {
     docker.inspect(
         "network",
         "ths-alpha",
-        r#"[{"Id":"old-network","Labels":{},"Containers":{"owned-container":{"Name":"ths-alpha-app"},"foreign-container":{"Name":"other-app"}}}]"#,
+        r#"[{"Id":"old-network","Labels":{}}]"#,
+    );
+    docker.extra_output.insert(
+        "container ls -a --no-trunc --filter network=ths-alpha --format {{.ID}}".to_owned(),
+        "owned-container\nforeign-container".to_owned(),
     );
 
     let error = runtime

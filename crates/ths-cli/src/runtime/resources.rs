@@ -83,7 +83,7 @@ pub(super) fn owned_resource(
     match inspected_resource_identity(kind, target, name, &details) {
         Ok(id) => Ok(Some(id)),
         Err(error) if kind == "network" => {
-            match unlabeled_network_identity(docker, name, &details)? {
+            match unlabeled_network_identity(docker, target, name, &details)? {
                 Some(id) => Ok(Some(id)),
                 None => Err(error),
             }
@@ -93,10 +93,12 @@ pub(super) fn owned_resource(
 }
 
 /// Releases up to v0.3.0 created the instance network without a label. Such a network still
-/// belongs to this instance when every container attached to it carries the instance label;
-/// an unlabeled network with no attached containers, or with a foreign one, stays refused.
+/// belongs to this instance when every container attached to it, running or stopped, carries
+/// the instance label; an unlabeled network with no attached containers, or with a foreign
+/// one, stays refused.
 fn unlabeled_network_identity(
     docker: &impl DockerResourceCommands,
+    target: &str,
     name: &InstanceName,
     details: &str,
 ) -> Result<Option<String>> {
@@ -109,13 +111,25 @@ fn unlabeled_network_identity(
     if !network["Labels"][INSTANCE_LABEL].is_null() {
         return Ok(None);
     }
-    let Some(attached) = network["Containers"].as_object() else {
-        return Ok(None);
-    };
+    let attached = docker.output(&[
+        "container",
+        "ls",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        &format!("network={target}"),
+        "--format",
+        "{{.ID}}",
+    ])?;
+    let attached: Vec<&str> = attached
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
     if attached.is_empty() {
         return Ok(None);
     }
-    for id in attached.keys() {
+    for id in attached {
         let container = docker.output(&["container", "inspect", id])?;
         if inspected_resource_identity("container", id, name, &container).is_err() {
             return Ok(None);
