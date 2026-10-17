@@ -1060,3 +1060,211 @@ async fn mempool_loop_defers_reconciliation_when_checkpoint_temporarily_unavaila
         .await
         .expect("second generate call proves the set is retried after deferred reconciliation");
 }
+
+#[tokio::test]
+async fn mine_and_sync_background_returns_unknown_on_bad_gateway() {
+    // HTTP 502 can come after a proxy forwarded the request and failed to read
+    // the upstream response; it must not be treated as a pre-execution rejection.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(|| async { (StatusCode::BAD_GATEWAY, "").into_response() }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    assert!(
+        matches!(
+            state.mine_and_sync_background().await,
+            Err(BackgroundMineError::Unknown(_))
+        ),
+        "HTTP 502 must be Unknown, not Generation"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_defers_when_pre_generate_checkpoint_fails_then_retries() {
+    // When the pre-generate checkpoint read fails (before = None), generate
+    // fires, and the reply is lost, the loop must not authorize a retry until
+    // it has established a baseline and confirmed no chain movement.
+    //
+    // Sequence: checkpoint call #0 fails (before = None), generate → Unknown,
+    // checkpoint call #1 returns H0 (first reconciliation: defer, set
+    // unresolved with before = H0), checkpoint call #2 returns H0 (second
+    // reconciliation: before == current → not produced → retry), tick fires
+    // generate a second time.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let checkpoint_calls = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/",
+                post(move |Json(req): Json<Value>| {
+                    let tx = tx.clone();
+                    let checkpoint_calls = checkpoint_calls.clone();
+                    async move {
+                        match req["method"].as_str() {
+                            Some("getrawmempool") => {
+                                Json(json!({"result":["tx1"],"error":null,"id":req["id"]}))
+                                    .into_response()
+                            }
+                            Some("generate") => {
+                                let _ = tx.send(());
+                                (StatusCode::OK, "not-a-valid-rpc-response").into_response()
+                            }
+                            Some("getblockchaininfo") => {
+                                let n = checkpoint_calls.fetch_add(1, Ordering::SeqCst);
+                                if n == 0 {
+                                    // Before-generate: fail so before = None.
+                                    Json(json!({"result":null,"error":{"code":-1,"message":"unavailable"},"id":req["id"]})).into_response()
+                                } else {
+                                    // Reconciliation ticks: stable genesis tip.
+                                    Json(json!({
+                                        "result": {
+                                            "chain": "regtest",
+                                            "blocks": 0,
+                                            "bestblockhash": "0000000000000000000000000000000000000000000000000000000000000000",
+                                            "verificationprogress": 1.0
+                                        },
+                                        "error": null,
+                                        "id": req["id"]
+                                    }))
+                                    .into_response()
+                                }
+                            }
+                            _ => Json(json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]})).into_response(),
+                        }
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+    tokio::spawn(mempool_mining_loop(state));
+
+    // Tick 0: before=None (checkpoint fails), generate → Unknown →
+    // unresolved = {None, ["tx1"]}.
+    rx.recv().await.expect("first generate call at t=0");
+
+    // Tick 2: reconcile — current=H0, before=None → defer with baseline=H0.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tick 4: reconcile — current=H0 == before(H0) → not produced → retry.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    // Tick 6: mining fires second generate.
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv()
+        .await
+        .expect("second generate call proves the set is retried after two-tick deferral");
+}
+
+#[tokio::test(start_paused = true)]
+async fn interval_loop_waits_for_chain_operation_before_generating() {
+    // interval_mining_loop must not mine while a chain operation (e.g. a reorg)
+    // holds the chain_operations write lock.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let url = rpc_server({
+        let tx = tx.clone();
+        move |req| match req["method"].as_str() {
+            Some("generate") => {
+                let _ = tx.send(());
+                json!({"result":null,"error":{"code":-1,"message":"fail"},"id":req["id"]})
+            }
+            _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
+        }
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+
+    // Clone the lock handle before moving state so we can hold the write lock
+    // without borrowing from the moved value.
+    let chain_ops = Arc::clone(&state.0.mining.chain_operations);
+    let chain = chain_ops.write().await;
+    tokio::spawn(interval_mining_loop(state, Duration::from_secs(2)));
+
+    // Advance past the interval; generate must not fire while lock is held.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "generate must not fire while chain operation holds the lock"
+    );
+
+    // Release the lock; the next interval tick must call generate.
+    drop(chain);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv()
+        .await
+        .expect("generate must fire after the chain operation lock is released");
+}
+
+#[tokio::test(start_paused = true)]
+async fn mempool_loop_waits_for_chain_operation_before_generating() {
+    // mempool_mining_loop must not mine while a chain operation holds the
+    // chain_operations write lock.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let url = rpc_server({
+        let tx = tx.clone();
+        move |req| match req["method"].as_str() {
+            Some("getrawmempool") => {
+                json!({"result":["tx1"],"error":null,"id":req["id"]})
+            }
+            Some("generate") => {
+                let _ = tx.send(());
+                json!({"result":null,"error":{"code":-1,"message":"fail"},"id":req["id"]})
+            }
+            _ => json!({"result":null,"error":{"code":-1,"message":"unexpected"},"id":req["id"]}),
+        }
+    })
+    .await;
+    let (mut state, _dir) = state_with_local_wallet();
+    Arc::get_mut(&mut state.0).unwrap().rpc = NodeRpc::new(url);
+    state.mark_started();
+
+    let chain_ops = Arc::clone(&state.0.mining.chain_operations);
+    let chain = chain_ops.write().await;
+    tokio::spawn(mempool_mining_loop(state));
+
+    // Advance past the mempool poll interval; generate must not fire.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "generate must not fire while chain operation holds the lock"
+    );
+
+    // Release the lock; the next tick must call generate.
+    drop(chain);
+    tokio::time::advance(Duration::from_secs(2)).await;
+    rx.recv()
+        .await
+        .expect("generate must fire after the chain operation lock is released");
+}
