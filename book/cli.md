@@ -177,7 +177,10 @@ uses plaintext HTTP on loopback.
 ### `ths rpc [--raw] [--yes] <METHOD> [PARAMS...]`
 
 Calls one method on the named instance's Zakura JSON-RPC endpoint and prints
-the result. The endpoint is the loopback URL stored for that instance.
+the result. The endpoint is the loopback URL stored for that instance. The
+call is sent only when the Zakura container recorded for the instance is still
+that container, is owned by the instance, and still publishes that URL. A
+container that only reuses the name is refused.
 
 ```console
 ths rpc getblockcount
