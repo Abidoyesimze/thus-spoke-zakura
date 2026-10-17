@@ -64,7 +64,10 @@ pub fn run(requested: Option<&str>, check: bool, json: bool) -> Result<ExitCode>
     let install_dir = launcher
         .parent()
         .context("the running launcher has no parent directory")?;
-    run_installer(INSTALLER, &target, install_dir)?;
+    run_installer(INSTALLER, &target, install_dir, json)?;
+    if json {
+        print_report(&target, &target, Status::UpToDate, true)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -205,12 +208,17 @@ fn print_report(current: &Version, available: &Version, status: Status, json: bo
     Ok(())
 }
 
-fn run_installer(script: &str, version: &Version, install_dir: &Path) -> Result<()> {
+fn run_installer(script: &str, version: &Version, install_dir: &Path, json: bool) -> Result<()> {
     let mut child = Command::new("sh")
         .arg("-s")
         .env("THS_VERSION", version.to_string())
         .env("THS_INSTALL_DIR", install_dir)
         .stdin(Stdio::piped())
+        .stdout(if json {
+            Stdio::from(std::io::stderr())
+        } else {
+            Stdio::inherit()
+        })
         .spawn()
         .context("starting the embedded installer")?;
     child
