@@ -456,23 +456,29 @@ impl AppState {
     ///
     /// Returns `Err(BackgroundMineError::Generation(_))` when there is
     /// positive evidence that the request was rejected before execution (an
-    /// explicit RPC error, or a proxy status that cannot follow forwarding),
+    /// explicit RPC error, or HTTP 429/503 which cannot follow forwarding),
     /// `Err(BackgroundMineError::Unknown(_))` when the outcome is uncertain
-    /// (transport or decode failure, or HTTP 504 which can follow forwarding),
-    /// and `Err(BackgroundMineError::Sync(_))` when a block was produced but a
-    /// subsequent step failed (do not retry generation with the same set).
+    /// (transport or decode failure, or HTTP 502/504 which can follow
+    /// forwarding), and `Err(BackgroundMineError::Sync(_))` when a block was
+    /// produced but a subsequent step failed (do not retry with the same set).
     pub(crate) async fn mine_and_sync_background(&self) -> Result<(), BackgroundMineError> {
+        // Hold the chain operations read lock across generation and sync so that
+        // reorg/rollback (which takes the write lock) cannot interleave with us.
+        let _chain = self.0.mining.chain_operations.read().await;
         let mut hashes = match self.0.rpc.generate(1).await {
             Ok(hashes) => hashes,
             Err(error) => {
-                // An explicit RPC error is a pre-execution rejection: no block
-                // was produced. RpcUnavailable is a pre-execution rejection
-                // unless HTTP 504, which can time out after the node has
-                // already forwarded and executed the request.
+                // An explicit RPC error or a proxy status that cannot follow
+                // forwarding is a known pre-execution rejection. 429 Too Many
+                // Requests and 503 Service Unavailable indicate the upstream
+                // was not reached. 502 Bad Gateway, like 504 Gateway Timeout,
+                // can come after the proxy forwarded the request (e.g. the
+                // upstream responded but the proxy failed reading it), so both
+                // are uncertain.
                 let is_known_rejection = error.downcast_ref::<RpcError>().is_some()
                     || error
                         .downcast_ref::<RpcUnavailable>()
-                        .is_some_and(|u| u.0.as_u16() != 504);
+                        .is_some_and(|u| matches!(u.0.as_u16(), 429 | 503));
                 return Err(if is_known_rejection {
                     BackgroundMineError::Generation(error)
                 } else {
@@ -596,18 +602,31 @@ pub(crate) async fn mempool_mining_loop(state: AppState) {
             match state.0.rpc.checkpoint().await {
                 Ok(current) => {
                     if before.as_ref().is_some_and(|b| b != &current) {
-                        // Chain advanced during the generate window; treat the
-                        // attempt as having produced a block.
+                        // Chain advanced from the pre-generate baseline: the
+                        // attempt produced a block. Suppress retry for this set.
                         attempted = Some(set);
                         tracing::warn!(
                             "background mempool mining reconciled a lost generate \
                              reply as produced; suppressing retry"
                         );
-                    } else {
-                        // Tip unchanged (or no baseline): no block produced.
+                    } else if before.is_some() {
+                        // before == current: tip unchanged since before generate.
+                        // No block was produced; safe to retry.
                         tracing::warn!(
                             "background mempool mining reconciled a lost generate \
                              reply as not produced; retrying"
+                        );
+                    } else {
+                        // The pre-generate checkpoint read failed (before is None),
+                        // so we have no baseline to compare. Capture the current
+                        // tip as a reference and defer one more tick; if the chain
+                        // has advanced by then we treat it as produced, otherwise
+                        // we retry.
+                        unresolved = Some((Some(current), set));
+                        tracing::warn!(
+                            "background mempool mining cannot reconcile a lost \
+                             generate reply without a pre-generate baseline; \
+                             deferring with current tip as reference"
                         );
                     }
                 }
