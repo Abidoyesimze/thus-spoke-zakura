@@ -365,6 +365,10 @@ async fn external_ironwood_memo_is_recovered_by_receiving_wallet_sync() -> Resul
             .context("confirmed external payment has no txid")?
             .to_owned();
 
+        // Compact-block scanning records the incoming note before transaction
+        // enhancement decrypts its memo, so the row can briefly appear with
+        // no memos. Keep polling until enhancement has caught up.
+        let mut observed_memos = None;
         loop {
             let activity: serde_json::Value = request_json(
                 &client,
@@ -378,16 +382,19 @@ async fn external_ironwood_memo_is_recovered_by_receiving_wallet_sync() -> Resul
                 .as_array()
                 .and_then(|rows| rows.iter().find(|row| row["txid"] == txid))
             {
-                anyhow::ensure!(
-                    incoming["memos"] == json!([memo]),
-                    "receiving wallet sync did not recover the external memo"
-                );
-                break;
+                if incoming["memos"] == json!([memo]) {
+                    break;
+                }
+                observed_memos = Some(incoming["memos"].clone());
             }
-            anyhow::ensure!(
-                Instant::now() < payment_deadline,
-                "receiving wallet did not index the external payment"
-            );
+            if Instant::now() >= payment_deadline {
+                match observed_memos {
+                    Some(memos) => anyhow::bail!(
+                        "receiving wallet sync did not recover the external memo; last saw {memos}"
+                    ),
+                    None => anyhow::bail!("receiving wallet did not index the external payment"),
+                }
+            }
             tokio::time::sleep(RECOVERY_POLL_INTERVAL).await;
         }
         Ok(())
@@ -694,4 +701,10 @@ async fn restart_recovers_claim_before_preparation_without_payment_post() -> Res
 #[ignore = "requires Docker and prepared regtest images"]
 async fn insufficient_send_stays_failed_after_restart_and_later_funding() -> Result<()> {
     recovery::insufficient_send_stays_failed_after_restart_and_later_funding().await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Docker and prepared regtest images"]
+async fn dependent_payments_resume_in_admission_order_after_restart() -> Result<()> {
+    recovery::dependent_payments_resume_in_admission_order_after_restart().await
 }

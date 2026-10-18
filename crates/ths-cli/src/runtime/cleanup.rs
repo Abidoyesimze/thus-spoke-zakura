@@ -97,7 +97,7 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Uncertain,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished: context.helpers_finished(),
                     environment_found: recorded,
                 });
@@ -186,7 +186,20 @@ impl Runtime {
                             name: target.to_owned(),
                             identity: Some(id.clone()),
                         };
-                        match inspected_resource_identity(kind, target, name, &details) {
+                        let identity =
+                            match inspected_resource_identity(kind, target, name, &details) {
+                                Err(error) if kind == "network" => {
+                                    match recorded_unlabeled_network_identity(
+                                        docker, &id, name, &details,
+                                    ) {
+                                        Ok(Some(observed)) => Ok(observed),
+                                        Ok(None) => Err(error),
+                                        Err(listing) => Err(listing),
+                                    }
+                                }
+                                identity => identity,
+                            };
+                        match identity {
                             Ok(observed) if recovery::identity_matches(&recorded, &observed) => {
                                 targets.push((kind.to_owned(), id, target.to_owned()));
                                 return Ok(());
@@ -463,7 +476,7 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Incomplete,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished,
                     environment_found,
                 });
@@ -485,7 +498,7 @@ impl Runtime {
         Ok(CleanupReport {
             outcome,
             failures,
-            recovery_path: Some(recovery_path),
+            recovery_path: recovery_path.is_file().then_some(recovery_path),
             helpers_finished,
             environment_found,
         })
