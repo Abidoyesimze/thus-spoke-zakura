@@ -493,6 +493,37 @@ fn status_rejects_an_unknown_environment_without_a_raw_docker_error() {
 }
 
 #[test]
+fn status_rejects_an_unrecorded_environment_with_only_a_foreign_container() {
+    let fixture = Fixture::new();
+    let containers = fixture.directory.path().join("state/container");
+    fs::create_dir_all(&containers).unwrap();
+    fs::write(containers.join("ths-ghost-app"), "").unwrap();
+
+    let output = fixture
+        .command()
+        .args(["--name", "ghost", "status"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("environment ghost is not running"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no such object"), "{stderr}");
+
+    let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
+    assert!(
+        !commands
+            .lines()
+            .any(|command| command.starts_with("inspect --format")),
+        "{commands}"
+    );
+}
+
+#[test]
 fn cleanup_commands_reject_an_unknown_environment() {
     let fixture = Fixture::new();
     for arguments in [

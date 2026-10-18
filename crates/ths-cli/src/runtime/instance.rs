@@ -135,10 +135,10 @@ fn inspect_unrecorded_instance(
         .into_iter()
         .map(|service| container_status(docker, name, service))
         .collect::<Result<Vec<_>>>()?;
-    if containers
+    let has_owned_service = containers
         .iter()
-        .all(|container| container.state == "missing")
-    {
+        .any(|container| !matches!(container.state.as_str(), "missing" | "foreign"));
+    if !has_owned_service {
         bail!("environment {name} is not running; start it with `ths --name {name}`");
     }
     Ok(Instance {
