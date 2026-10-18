@@ -4,6 +4,9 @@ impl Runtime {
     pub fn stop(&self, name: &InstanceName) -> Result<()> {
         let report = self.verified_cleanup(name)?;
         if report.verified() {
+            if !report.environment_found {
+                bail!("environment {name} does not exist");
+            }
             println!("Stopped and deleted {name} and all of its development data.");
             Ok(())
         } else {
@@ -17,6 +20,9 @@ impl Runtime {
         }
         let report = self.verified_cleanup(name)?;
         if report.verified() {
+            if !report.environment_found {
+                bail!("environment {name} does not exist");
+            }
             println!("Deleted {name}; its Docker volumes cannot be recovered.");
             Ok(())
         } else {
@@ -25,12 +31,13 @@ impl Runtime {
     }
 
     pub(super) fn verified_cleanup(&self, name: &InstanceName) -> Result<CleanupReport> {
-        let _lock = self.lock_instance(name)?;
         let policy = LifecyclePolicy::default();
-        let context = LifecycleContext::new(policy);
-        let deadline = Deadline::after(policy.cleanup);
-        let docker = lifecycle_docker(&context, deadline, Cancellation::Ignore);
-        self.cleanup_core(name, &docker, false, deadline, &context)
+        self.verified_cleanup_with(name, &policy, || {
+            let context = LifecycleContext::new(policy);
+            let deadline = Deadline::after(policy.cleanup);
+            let docker = lifecycle_docker(&context, deadline, Cancellation::Ignore);
+            self.cleanup_core(name, &docker, false, deadline, &context)
+        })
     }
 
     #[cfg(test)]
@@ -76,6 +83,7 @@ impl Runtime {
         context: &LifecycleContext,
     ) -> Result<CleanupReport> {
         let recovery_path = self.recovery_path(name);
+        let recorded = self.instance_dir(name).exists();
         let loaded = match recovery::RecoveryJournal::load(recovery_path.clone(), name) {
             Ok(journal) => journal,
             Err(error) => {
@@ -89,11 +97,13 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Uncertain,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished: context.helpers_finished(),
+                    environment_found: recorded,
                 });
             }
         };
+        let mut environment_found = recorded || loaded.is_some();
         let mut journal = loaded;
         let kept = journal
             .as_ref()
@@ -230,7 +240,10 @@ impl Runtime {
             let result = owned_resource(docker, kind, target, name)
                 .with_context(|| format!("{kind} {target}"));
             match result {
-                Ok(Some(id)) => targets.push((kind.to_owned(), id, target.to_owned())),
+                Ok(Some(id)) => {
+                    environment_found = true;
+                    targets.push((kind.to_owned(), id, target.to_owned()));
+                }
                 Ok(None) => {}
                 Err(error) if partial => failures.push(format!("{error:#}")),
                 Err(error) => return Err(error),
@@ -450,8 +463,9 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Incomplete,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished,
+                    environment_found,
                 });
             }
             return Ok(CleanupReport {
@@ -459,6 +473,7 @@ impl Runtime {
                 failures,
                 recovery_path: None,
                 helpers_finished,
+                environment_found,
             });
         }
         if let Some(existing) = &mut journal
@@ -470,8 +485,9 @@ impl Runtime {
         Ok(CleanupReport {
             outcome,
             failures,
-            recovery_path: Some(recovery_path),
+            recovery_path: recovery_path.is_file().then_some(recovery_path),
             helpers_finished,
+            environment_found,
         })
     }
 }
@@ -489,6 +505,7 @@ pub(super) struct CleanupReport {
     pub(super) failures: Vec<String>,
     pub(super) recovery_path: Option<PathBuf>,
     pub(super) helpers_finished: bool,
+    pub(super) environment_found: bool,
 }
 
 impl CleanupReport {

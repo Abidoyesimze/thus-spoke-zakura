@@ -20,6 +20,7 @@ use zcash_client_backend::{
         Account as _, AccountBirthday, CoinbaseFilter, InputSource, MaxSpendMode, TargetValue,
         WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{BlockSource, ChainState, CommitmentTreeRoot, error, scan_cached_blocks},
+        enhance_pir::{EnhancePirRead, EnhancementMode, TransactionEnhancementWork},
         error::Error as WalletError,
         scanning::ScanRange,
         wallet::{
@@ -72,11 +73,13 @@ use zcash_script::script;
 
 use crate::{network::regtest_network, rpc::ChainCheckpoint};
 
+mod history;
 mod journal;
 mod payments;
 mod recovery;
 mod submission;
 
+pub(crate) use history::CanonicalActivity;
 pub use journal::PreparedPayment;
 use journal::{PreparedPaymentsMigration, prepared_payment};
 pub use payments::{PaymentError, SendQuote};
@@ -138,6 +141,7 @@ pub struct RealWallet {
     db: Arc<Mutex<Db>>,
     account_ids: Vec<AccountUuid>,
     lightwalletd: String,
+    wallet_path: std::path::PathBuf,
 }
 
 struct MemoryBlockCache(BTreeMap<u32, CompactBlock>);
@@ -179,11 +183,12 @@ impl RealWallet {
         let secret = SecretVec::new(seed);
         let wallet_path = data_dir.join("wallet.db");
         let mut db = WalletDb::for_path(
-            wallet_path,
+            &wallet_path,
             regtest_network(),
             SystemClock,
             UnwrapErr(SysRng),
-        )?;
+        )?
+        .with_enhancement_mode(EnhancementMode::Standard);
         WalletMigrator::new()
             .with_seed(SecretVec::new(secret.expose_secret().clone()))
             .with_external_migrations(vec![
@@ -232,11 +237,18 @@ impl RealWallet {
             db: Arc::new(Mutex::new(db)),
             account_ids,
             lightwalletd,
+            wallet_path,
         })
     }
 
     pub(crate) fn lightwalletd(&self) -> &str {
         &self.lightwalletd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lightwalletd(mut self, endpoint: String) -> Self {
+        self.lightwalletd = endpoint;
+        self
     }
 
     async fn with_db<T, F>(&self, operation: F) -> Result<T>
@@ -467,31 +479,94 @@ impl RealWallet {
     }
 
     pub async fn apply_balances(&self, accounts: &mut [Account]) -> Result<()> {
-        let Some(summary) = self
-            .with_db(|db| Ok(db.get_wallet_summary(ConfirmationsPolicy::MIN)?))
+        let account_ids = self.account_ids.clone();
+        let Some(balances) = self
+            .with_db(move |db| {
+                db.transactionally_with_extension::<_, _, anyhow::Error>(|wallet, ext| {
+                    let Some(scanned) = wallet.block_fully_scanned()? else {
+                        return Ok(None);
+                    };
+                    // SDK totals retain unmined credits and input reservations after a rewind.
+                    // Publish canonical holdings without deleting those pending transactions.
+                    let balances = account_ids
+                        .iter()
+                        .map(|id| {
+                            ext.query_row(
+                                "SELECT
+                                    COALESCE(SUM(CASE WHEN r.pool = 0 THEN r.value ELSE 0 END), 0),
+                                    COALESCE(SUM(CASE WHEN r.pool = 4 THEN r.value ELSE 0 END), 0)
+                                 FROM v_received_outputs r
+                                 JOIN accounts a ON a.id = r.account_id
+                                 JOIN transactions received ON received.id_tx = r.transaction_id
+                                 WHERE a.uuid = ?1 AND received.mined_height <= ?2
+                                   AND NOT EXISTS (
+                                       SELECT 1 FROM v_received_output_spends s
+                                       JOIN transactions spent ON spent.id_tx = s.transaction_id
+                                       WHERE s.pool = r.pool
+                                         AND s.received_output_id = r.id_within_pool_table
+                                         AND spent.mined_height <= ?2
+                                   )",
+                                rusqlite::params![
+                                    id.expose_uuid(),
+                                    u32::from(scanned.block_height())
+                                ],
+                                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+                            )
+                        })
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    Ok(Some(balances))
+                })
+            })
             .await?
         else {
             return Ok(());
         };
-        for (account, wallet_id) in accounts.iter_mut().zip(&self.account_ids) {
-            if let Some(balance) = summary.account_balances().get(wallet_id) {
-                account.transparent_zatoshi = u64::from(balance.unshielded_balance().total());
-                account.ironwood_zatoshi = u64::from(balance.ironwood_balance().total());
-            }
+        for (account, (transparent, ironwood)) in accounts.iter_mut().zip(balances) {
+            account.transparent_zatoshi = transparent;
+            account.ironwood_zatoshi = ironwood;
         }
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn enhance_transaction(&self, raw_hex: &str, height: u32) -> Result<()> {
-        let raw_hex = raw_hex.to_owned();
+    pub(crate) async fn public_transaction_enhancements(&self, limit: usize) -> Result<Vec<TxId>> {
+        self.with_db(move |db| {
+            Ok(db
+                .transaction_enhancement_work()?
+                .into_iter()
+                .filter_map(|work| match work {
+                    TransactionEnhancementWork::Public(request) => Some(request.txid()),
+                    TransactionEnhancementWork::Private(_) => None,
+                })
+                .take(limit)
+                .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn enhance_transaction(
+        &self,
+        expected_txid: TxId,
+        raw: Vec<u8>,
+        height: u32,
+    ) -> Result<()> {
         self.with_db(move |db| {
             let params = regtest_network();
             let height = BlockHeight::from_u32(height);
-            let raw = hex::decode(raw_hex).context("invalid transaction hex from Zakura")?;
             let tx = Transaction::read(&raw[..], BranchId::for_height(&params, height))
-                .context("parsing transaction from Zakura")?;
+                .context("parsing transaction from lightwalletd")?;
+            anyhow::ensure!(
+                tx.txid() == expected_txid,
+                "lightwalletd returned a different transaction than requested"
+            );
             decrypt_and_store_transaction(&params, db, &tx, Some(height))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn transaction_enhancement_not_found(&self, txid: TxId) -> Result<()> {
+        self.with_db(move |db| {
+            db.notify_transaction_enhancement_not_found(txid)?;
             Ok(())
         })
         .await

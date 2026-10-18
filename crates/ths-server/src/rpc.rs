@@ -128,6 +128,10 @@ impl NodeRpc {
         self.call_within(GENERATE_TIMEOUT, "generate", json!([blocks]))
             .await
     }
+    pub(crate) async fn invalidate_block(&self, hash: &str) -> Result<()> {
+        self.call::<Value>("invalidateblock", json!([hash])).await?;
+        Ok(())
+    }
     pub async fn block(&self, id: &str) -> Result<Value> {
         self.call("getblock", json!([id, 2])).await
     }
@@ -142,6 +146,10 @@ impl NodeRpc {
     }
     pub async fn transaction(&self, txid: &str) -> Result<Value> {
         self.call("getrawtransaction", json!([txid, 1])).await
+    }
+    pub(crate) async fn transaction_within(&self, txid: &str, timeout: Duration) -> Result<Value> {
+        self.call_within(timeout, "getrawtransaction", json!([txid, 1]))
+            .await
     }
     pub async fn lookup_transaction(&self, txid: &str) -> Result<Option<Value>> {
         match self.transaction(txid).await {
