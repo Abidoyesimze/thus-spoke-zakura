@@ -17,7 +17,7 @@ use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 pub(crate) async fn health(State(state): State<AppState>) -> Response {
@@ -194,6 +194,9 @@ pub(crate) struct ActivityEntry {
     source_pools: Vec<String>,
     destination_pools: Vec<String>,
     amount_zatoshi: u64,
+    received_zatoshi: Option<u64>,
+    spent_zatoshi: Option<u64>,
+    net_zatoshi: Option<i64>,
     txid: String,
     block_hash: Option<String>,
     mined_height: Option<u32>,
@@ -254,6 +257,9 @@ impl ActivityEntry {
             source_pools: vec![activity.source_pool],
             destination_pools: vec![activity.destination_pool],
             amount_zatoshi: activity.amount_zatoshi,
+            received_zatoshi: None,
+            spent_zatoshi: None,
+            net_zatoshi: None,
             txid: activity.txid,
             block_hash: activity.block_hash,
             mined_height: None,
@@ -290,6 +296,9 @@ impl ActivityEntry {
             source_pools: activity.source_pools,
             destination_pools: activity.destination_pools,
             amount_zatoshi: activity.amount_zatoshi,
+            received_zatoshi: Some(activity.received_zatoshi),
+            spent_zatoshi: Some(activity.spent_zatoshi),
+            net_zatoshi: Some(activity.net_zatoshi),
             txid: activity.txid,
             block_hash: activity.block_hash,
             mined_height: activity.mined_height,
@@ -414,9 +423,19 @@ async fn enrich_external_source_pools_within(
     }
 }
 
+#[cfg(test)]
 fn unified_activity(
     journal: Vec<Activity>,
     canonical: Vec<CanonicalActivity>,
+    limit: u32,
+) -> Vec<ActivityEntry> {
+    unified_activity_with_prepared(journal, canonical, &HashMap::new(), limit)
+}
+
+fn unified_activity_with_prepared(
+    journal: Vec<Activity>,
+    canonical: Vec<CanonicalActivity>,
+    prepared_txids: &HashMap<String, String>,
     limit: u32,
 ) -> Vec<ActivityEntry> {
     let mut transaction_ids = HashSet::new();
@@ -426,7 +445,10 @@ fn unified_activity(
         .map(Some)
         .collect::<Vec<_>>();
     let mut activity = Vec::new();
-    for journal in journal {
+    for mut journal in journal {
+        if let Some(prepared_txid) = prepared_txids.get(&journal.id) {
+            journal.txid.clone_from(prepared_txid);
+        }
         let matched = (!journal.txid.is_empty()).then(|| {
             canonical.iter().position(|candidate| {
                 candidate
@@ -448,20 +470,28 @@ fn unified_activity(
             .flatten()
             .map(ActivityEntry::canonical),
     );
-    activity.sort_by(
-        |left, right| match (left.mined_height, right.mined_height) {
-            // Unmined journal entries are active work, so keep them ahead of
-            // confirmed chain history and order them by their local timestamp.
-            (None, Some(_)) => std::cmp::Ordering::Less,
-            (Some(_), None) => std::cmp::Ordering::Greater,
-            (None, None) => right.created_at.cmp(&left.created_at),
-            // Block position is the canonical order. Regtest block timestamps are
-            // deterministic and begin in 2011, so they must not order activity.
-            (Some(left_height), Some(right_height)) => right_height
-                .cmp(&left_height)
-                .then_with(|| right.tx_index.cmp(&left.tx_index)),
-        },
-    );
+    activity.sort_by(|left, right| {
+        let group = |entry: &ActivityEntry| match (entry.mined_height, entry.status.as_str()) {
+            (None, "confirmed") => 2,
+            (None, _) => 0,
+            (Some(_), _) => 1,
+        };
+        match group(left).cmp(&group(right)) {
+            std::cmp::Ordering::Equal => match (left.mined_height, right.mined_height) {
+                // Block position is the canonical order. Regtest block timestamps are
+                // deterministic and begin in 2011, so they must not order activity.
+                (Some(left_height), Some(right_height)) => right_height
+                    .cmp(&left_height)
+                    .then_with(|| right.tx_index.cmp(&left.tx_index)),
+                // Local timestamps order unresolved work and confirmed journal
+                // fallbacks separately. A confirmed fallback has no canonical height
+                // only because it fell outside the bounded wallet-history window; it
+                // must not be mistaken for pending work.
+                _ => right.created_at.cmp(&left.created_at),
+            },
+            order => order,
+        }
+    });
     activity.truncate(limit.min(100) as usize);
     activity
 }
@@ -484,7 +514,15 @@ pub(crate) async fn activity(
     }
     let limit = page.limit.unwrap_or(30).min(100);
     let journal = state.0.store.activities(100)?;
-    let mut canonical = state.0.wallet.canonical_activity(100).await?;
+    let journal_ids = journal.iter().map(|entry| entry.id.clone()).collect();
+    let (mut canonical, prepared_txids) =
+        state.0.wallet.canonical_activity(100, journal_ids).await?;
     enrich_external_source_pools(&state, &mut canonical).await;
-    Ok(Json(unified_activity(journal, canonical, limit)).into_response())
+    Ok(Json(unified_activity_with_prepared(
+        journal,
+        canonical,
+        &prepared_txids,
+        limit,
+    ))
+    .into_response())
 }

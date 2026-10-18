@@ -143,6 +143,50 @@ describe('ActivityList incoming transactions', () => {
   });
 });
 
+describe('ActivityList multi-pool transactions', () => {
+  it('uses the known pool arrays when no singular pool is available', () => {
+    const txid = 'bd'.repeat(32);
+    renderWithProviders(
+      <MemoryRouter>
+        <ActivityList
+          activity={{
+            isPending: false,
+            isError: false,
+            error: null,
+            data: [
+              {
+                id: 'wallet-multi-pool',
+                kind: 'transaction',
+                direction: 'internal',
+                from_account: 1,
+                to_account: 2,
+                to_address: null,
+                source_pool: null,
+                destination_pool: null,
+                source_pools: ['ironwood'],
+                destination_pools: ['ironwood', 'transparent'],
+                amount_zatoshi: 100_000_000n,
+                txid,
+                block_hash: 'cd'.repeat(32),
+                mined_height: 121,
+                status: 'confirmed',
+                last_error: null,
+                created_at: null,
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    const row = screen.getByRole('link', { name: 'Account 1 → Account 2' }).closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText('ironwood')).toBeInTheDocument();
+    expect(within(row!).getByText('ironwood, transparent')).toBeInTheDocument();
+    expect(within(row!).queryByText('unknown')).not.toBeInTheDocument();
+  });
+});
+
 describe('ActivityList error state', () => {
   it("preserves an ApiError's own message", () => {
     renderError(new ApiError(404, 'activity not found'));

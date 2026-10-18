@@ -22,15 +22,23 @@ const COLUMNS: Column[] = [
 ];
 
 /** Shielded funds read in accent; public funds read in neutral ink. */
-function PoolLabel({ pool }: { pool: Activity['source_pool'] }) {
+function PoolLabel({
+  pool,
+  pools,
+}: {
+  pool: Activity['source_pool'];
+  pools: Activity['source_pools'];
+}) {
+  const knownPools = pool ? [pool] : pools;
+  const label = knownPools?.length ? knownPools.join(', ') : 'unknown';
   return (
     <span
       className={cn(
         'text-[11px] font-bold tracking-[0.04em] uppercase',
-        pool === 'ironwood' ? 'text-accent' : 'text-ink-muted',
+        knownPools?.includes('ironwood') ? 'text-accent' : 'text-ink-muted',
       )}
     >
-      {pool ?? 'unknown'}
+      {label}
     </span>
   );
 }
@@ -103,9 +111,9 @@ function ActivityRow({ activity, index }: { activity: Activity; index: number })
         </td>
 
         <td className="max-sm:hidden">
-          <PoolLabel pool={activity.source_pool} />
+          <PoolLabel pool={activity.source_pool} pools={activity.source_pools} />
           <span className="text-ink-muted px-1.5">→</span>
-          <PoolLabel pool={activity.destination_pool} />
+          <PoolLabel pool={activity.destination_pool} pools={activity.destination_pools} />
         </td>
 
         <td className="min-w-0">

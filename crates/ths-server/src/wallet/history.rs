@@ -1,8 +1,8 @@
-use super::RealWallet;
+use super::{RealWallet, journal::prepared_payment_txids};
 use crate::db::{TREASURY_ACCOUNT_ID, USER_ACCOUNT_COUNT};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use uuid::Uuid;
 use zcash_protocol::{
     TxId,
@@ -20,6 +20,9 @@ pub(crate) struct CanonicalActivity {
     pub(crate) source_pools: Vec<String>,
     pub(crate) destination_pools: Vec<String>,
     pub(crate) amount_zatoshi: u64,
+    pub(crate) received_zatoshi: u64,
+    pub(crate) spent_zatoshi: u64,
+    pub(crate) net_zatoshi: i64,
     pub(crate) txid: String,
     pub(crate) block_hash: Option<String>,
     pub(crate) mined_height: Option<u32>,
@@ -50,7 +53,7 @@ fn pool_name(code: i64) -> Option<String> {
 }
 
 fn text_memo(bytes: Option<Vec<u8>>) -> Option<String> {
-    let bytes: [u8; 512] = bytes?.try_into().ok()?;
+    let bytes = bytes?;
     match Memo::try_from(MemoBytes::from_bytes(&bytes).ok()?).ok()? {
         Memo::Text(text) => Some(String::from(&*text)),
         Memo::Empty | Memo::Arbitrary(_) | Memo::Future(_) => None,
@@ -188,6 +191,34 @@ fn source_pools_for(db: &Connection, txid: &[u8; 32], account_ids: &[Uuid]) -> R
     Ok(pools.into_iter().filter_map(pool_name).collect())
 }
 
+fn value_effects_for(
+    db: &Connection,
+    txid: &[u8; 32],
+    account_ids: &[Uuid],
+) -> Result<(u64, u64, i64)> {
+    let (received, spent, net): (i64, i64, i64) = db.query_row(
+        "SELECT COALESCE(SUM(total_received),0),
+                COALESCE(SUM(total_spent),0),
+                COALESCE(SUM(account_balance_delta),0)
+         FROM v_transactions
+         WHERE txid=?1 AND account_uuid IN (?2,?3,?4,?5,?6)",
+        params![
+            txid,
+            account_ids[0],
+            account_ids[1],
+            account_ids[2],
+            account_ids[3],
+            account_ids[4],
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok((
+        u64::try_from(received).context("wallet received value was negative")?,
+        u64::try_from(spent).context("wallet spent value was negative")?,
+        net,
+    ))
+}
+
 fn read_canonical_activity(
     db: &Connection,
     account_ids: &[Uuid],
@@ -225,6 +256,8 @@ fn read_canonical_activity(
         let created_at: Option<String> = row.get(4)?;
         let summary = summarize_outputs(&outputs_for(db, &txid_bytes, account_ids)?)?;
         let source_pools = source_pools_for(db, &txid_bytes, account_ids)?;
+        let (received_zatoshi, spent_zatoshi, net_zatoshi) =
+            value_effects_for(db, &txid_bytes, account_ids)?;
         let confirmations = mined_height
             .zip(tip)
             .map(|(height, tip)| tip.saturating_sub(height).saturating_add(1))
@@ -239,6 +272,9 @@ fn read_canonical_activity(
             source_pools,
             destination_pools: summary.destination_pools,
             amount_zatoshi: summary.amount_zatoshi,
+            received_zatoshi,
+            spent_zatoshi,
+            net_zatoshi,
             txid: TxId::from_bytes(txid_bytes).to_string(),
             block_hash,
             mined_height,
@@ -252,19 +288,27 @@ fn read_canonical_activity(
 }
 
 impl RealWallet {
-    pub(crate) async fn canonical_activity(&self, limit: u32) -> Result<Vec<CanonicalActivity>> {
+    pub(crate) async fn canonical_activity(
+        &self,
+        limit: u32,
+        journal_ids: Vec<String>,
+    ) -> Result<(Vec<CanonicalActivity>, HashMap<String, String>)> {
         let path = self.wallet_path.clone();
         let account_ids = self
             .account_ids
             .iter()
             .map(|id| id.expose_uuid())
             .collect::<Vec<_>>();
-        self.with_db(move |_| {
+        self.with_db(move |wallet| {
+            let prepared_txids = prepared_payment_txids(wallet, &journal_ids)?;
             let db = Connection::open_with_flags(
                 path,
                 OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )?;
-            read_canonical_activity(&db, &account_ids, limit)
+            Ok((
+                read_canonical_activity(&db, &account_ids, limit)?,
+                prepared_txids,
+            ))
         })
         .await
     }
@@ -318,5 +362,10 @@ mod tests {
         assert_eq!(summary.to_accounts, [2]);
         assert_eq!(summary.recipient_addresses, ["uregtest1account2"]);
         assert_eq!(summary.amount_zatoshi, 100_000_000);
+    }
+
+    #[test]
+    fn text_memo_decodes_the_sdks_unpadded_storage_representation() {
+        assert_eq!(text_memo(Some(b"hello".to_vec())).as_deref(), Some("hello"));
     }
 }

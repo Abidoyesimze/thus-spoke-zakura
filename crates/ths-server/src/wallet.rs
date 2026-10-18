@@ -20,6 +20,7 @@ use zcash_client_backend::{
         Account as _, AccountBirthday, CoinbaseFilter, InputSource, MaxSpendMode, TargetValue,
         WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{BlockSource, ChainState, CommitmentTreeRoot, error, scan_cached_blocks},
+        enhance_pir::{EnhancePirRead, EnhancementMode, TransactionEnhancementWork},
         error::Error as WalletError,
         scanning::ScanRange,
         wallet::{
@@ -186,7 +187,8 @@ impl RealWallet {
             regtest_network(),
             SystemClock,
             UnwrapErr(SysRng),
-        )?;
+        )?
+        .with_enhancement_mode(EnhancementMode::Standard);
         WalletMigrator::new()
             .with_seed(SecretVec::new(secret.expose_secret().clone()))
             .with_external_migrations(vec![
@@ -520,16 +522,45 @@ impl RealWallet {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn enhance_transaction(&self, raw_hex: &str, height: u32) -> Result<()> {
-        let raw_hex = raw_hex.to_owned();
+    pub(crate) async fn public_transaction_enhancements(&self, limit: usize) -> Result<Vec<TxId>> {
+        self.with_db(move |db| {
+            Ok(db
+                .transaction_enhancement_work()?
+                .into_iter()
+                .filter_map(|work| match work {
+                    TransactionEnhancementWork::Public(request) => Some(request.txid()),
+                    TransactionEnhancementWork::Private(_) => None,
+                })
+                .take(limit)
+                .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn enhance_transaction(
+        &self,
+        expected_txid: TxId,
+        raw: Vec<u8>,
+        height: u32,
+    ) -> Result<()> {
         self.with_db(move |db| {
             let params = regtest_network();
             let height = BlockHeight::from_u32(height);
-            let raw = hex::decode(raw_hex).context("invalid transaction hex from Zakura")?;
             let tx = Transaction::read(&raw[..], BranchId::for_height(&params, height))
-                .context("parsing transaction from Zakura")?;
+                .context("parsing transaction from lightwalletd")?;
+            anyhow::ensure!(
+                tx.txid() == expected_txid,
+                "lightwalletd returned a different transaction than requested"
+            );
             decrypt_and_store_transaction(&params, db, &tx, Some(height))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn transaction_enhancement_not_found(&self, txid: TxId) -> Result<()> {
+        self.with_db(move |db| {
+            db.notify_transaction_enhancement_not_found(txid)?;
             Ok(())
         })
         .await

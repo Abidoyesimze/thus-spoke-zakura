@@ -112,6 +112,58 @@ describe('activitySchema', () => {
     expect(activity.recipient_addresses).toEqual(['uregtest1external1', 'uregtest1external2']);
   });
 
+  it('preserves every known source and destination pool', () => {
+    const activity = activitySchema.parse({
+      id: 'wallet:multi-pool',
+      kind: 'transaction',
+      direction: 'internal',
+      from_account: 1,
+      to_account: 2,
+      to_address: null,
+      source_pool: null,
+      destination_pool: null,
+      source_pools: ['ironwood', 'transparent'],
+      destination_pools: ['ironwood', 'transparent'],
+      amount_zatoshi: 100_000_000,
+      received_zatoshi: 90_000_000,
+      spent_zatoshi: 200_000_000,
+      net_zatoshi: -110_000_000,
+      txid: 'ab'.repeat(32),
+      block_hash: null,
+      status: 'confirmed',
+      last_error: null,
+      created_at: '2026-10-15 12:00:00',
+    });
+
+    expect(activity.source_pools).toEqual(['ironwood', 'transparent']);
+    expect(activity.destination_pools).toEqual(['ironwood', 'transparent']);
+    expect(activity.received_zatoshi).toBe(90_000_000n);
+    expect(activity.spent_zatoshi).toBe(200_000_000n);
+    expect(activity.net_zatoshi).toBe(-110_000_000n);
+  });
+
+  it('uses null value effects when canonical wallet data is unavailable', () => {
+    const activity = activitySchema.parse({
+      id: 'pending-send',
+      kind: 'send',
+      from_account: 1,
+      to_account: 2,
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
+      amount_zatoshi: 100_000_000,
+      received_zatoshi: null,
+      spent_zatoshi: null,
+      net_zatoshi: null,
+      txid: '',
+      status: 'preparing',
+      created_at: '2026-10-15 12:00:00',
+    });
+
+    expect(activity.received_zatoshi).toBeNull();
+    expect(activity.spent_zatoshi).toBeNull();
+    expect(activity.net_zatoshi).toBeNull();
+  });
+
   it('accepts an incoming transaction whose sender creation time is unknown', () => {
     const activity = activitySchema.parse({
       id: 'wallet:incoming',

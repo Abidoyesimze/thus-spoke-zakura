@@ -16,6 +16,11 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
+const signedZatoshi = z
+  .number()
+  .int()
+  .transform((value) => BigInt(value));
+
 export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
@@ -46,7 +51,12 @@ export const activitySchema = z.object({
   recipient_addresses: z.array(z.string()).optional(),
   source_pool: poolSchema.nullable(),
   destination_pool: poolSchema.nullable(),
+  source_pools: z.array(poolSchema).optional(),
+  destination_pools: z.array(poolSchema).optional(),
   amount_zatoshi: zatoshi,
+  received_zatoshi: zatoshi.nullable().optional(),
+  spent_zatoshi: zatoshi.nullable().optional(),
+  net_zatoshi: signedZatoshi.nullable().optional(),
   txid: z.string(),
   block_hash: z.string().nullable().default(null),
   mined_height: z.number().int().nonnegative().nullable().optional(),

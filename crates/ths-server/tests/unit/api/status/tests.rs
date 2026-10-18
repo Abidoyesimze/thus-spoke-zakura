@@ -1,10 +1,25 @@
 use super::*;
 use crate::api::router;
+use crate::network::regtest_network;
 use crate::state::tests::state_with_local_wallet;
+use crate::wallet::PreparedPayment;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use std::collections::HashMap;
 use tower::ServiceExt;
+use transparent::{
+    address::Script,
+    bundle::{Authorized as TransparentAuthorized, Bundle, OutPoint, TxIn, TxOut},
+};
+use zcash_keys::address::Address;
+use zcash_primitives::transaction::{Authorized, Transaction, TransactionData, TxVersion};
+use zcash_protocol::{
+    consensus::{BlockHeight, BranchId},
+    value::Zatoshis,
+};
+use zcash_script::script;
+use zcash_script::script::Evaluable;
 
 fn journal_send(txid: &str) -> Activity {
     Activity {
@@ -35,6 +50,9 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
         source_pools: vec!["ironwood".to_owned()],
         destination_pools: vec!["ironwood".to_owned()],
         amount_zatoshi: 100_000_000,
+        received_zatoshi: 100_000_000,
+        spent_zatoshi: 0,
+        net_zatoshi: 100_000_000,
         txid: txid.to_owned(),
         block_hash: Some("block".to_owned()),
         mined_height: Some(120),
@@ -43,6 +61,36 @@ fn canonical_activity(direction: &'static str, txid: &str) -> CanonicalActivity 
         created_at: Some("2026-10-15 10:00:00".to_owned()),
         memos: Vec::new(),
     }
+}
+
+fn transparent_receive(receiver: &str) -> Transaction {
+    let Address::Transparent(receiver) = Address::decode(&regtest_network(), receiver).unwrap()
+    else {
+        panic!("transparent receiver required")
+    };
+    TransactionData::<Authorized>::from_parts(
+        TxVersion::V5,
+        BranchId::for_height(&regtest_network(), BlockHeight::from_u32(2)),
+        0,
+        BlockHeight::from_u32(200),
+        Some(Bundle {
+            vin: vec![TxIn::from_parts(
+                OutPoint::new([9; 32], 0),
+                Script(script::Code(vec![1, 2])),
+                u32::MAX,
+            )],
+            vout: vec![TxOut::new(
+                Zatoshis::from_u64(100_000_000).unwrap(),
+                Script(script::Code(receiver.script().to_bytes())),
+            )],
+            authorization: TransparentAuthorized,
+        }),
+        None,
+        None,
+        None,
+    )
+    .freeze()
+    .unwrap()
 }
 
 #[test]
@@ -135,8 +183,101 @@ fn external_incoming_and_unresolved_journal_entries_are_both_retained() {
     assert!(activity.iter().any(|entry| {
         entry.id == "send-1"
             && entry.txid.is_empty()
+            && entry.received_zatoshi.is_none()
+            && entry.spent_zatoshi.is_none()
+            && entry.net_zatoshi.is_none()
             && entry.last_error.as_deref() == Some("wallet is syncing")
     }));
+}
+
+#[test]
+fn canonical_activity_exposes_aggregate_wallet_value_effects() {
+    let mut canonical = canonical_activity("outgoing", "value-effects");
+    canonical.received_zatoshi = 90_000_000;
+    canonical.spent_zatoshi = 200_000_000;
+    canonical.net_zatoshi = -110_000_000;
+
+    let activity = unified_activity(Vec::new(), vec![canonical], 30);
+
+    assert_eq!(activity[0].received_zatoshi, Some(90_000_000));
+    assert_eq!(activity[0].spent_zatoshi, Some(200_000_000));
+    assert_eq!(activity[0].net_zatoshi, Some(-110_000_000));
+}
+
+#[test]
+fn persisted_preparation_association_joins_a_stale_journal_snapshot() {
+    let mut stale = journal_send("");
+    stale.status = "preparing".to_owned();
+    stale.block_hash = None;
+    let prepared_txids = HashMap::from([(stale.id.clone(), "prepared-tx".to_owned())]);
+
+    let activity = unified_activity_with_prepared(
+        vec![stale],
+        vec![canonical_activity("internal", "prepared-tx")],
+        &prepared_txids,
+        30,
+    );
+
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].id, "send-1");
+    assert_eq!(activity[0].txid, "prepared-tx");
+    assert_eq!(activity[0].status, "confirmed");
+}
+
+#[tokio::test]
+async fn activity_router_deduplicates_preparation_completed_after_its_journal_snapshot() {
+    let (state, _dir) = state_with_local_wallet();
+    let stale = state
+        .0
+        .store
+        .claim_transfer(
+            1,
+            crate::db::Recipient::Account(2),
+            "ironwood",
+            "transparent",
+            100_000_000,
+            "snapshot-boundary",
+            None,
+        )
+        .unwrap();
+    let transaction = transparent_receive(&state.0.store.account(2).unwrap().transparent_address);
+    let txid = transaction.txid();
+    let mut raw = Vec::new();
+    transaction.write(&mut raw).unwrap();
+    state
+        .0
+        .wallet
+        .enhance_transaction(txid, raw.clone(), 2)
+        .await
+        .unwrap();
+    state
+        .0
+        .wallet
+        .record_prepared_association_for_test(
+            &stale.id,
+            PreparedPayment {
+                txid: txid.to_string(),
+                raw_transaction: raw,
+                expiry_height: 200,
+            },
+        )
+        .await
+        .unwrap();
+
+    let (status, activity) = api_get(&state, "/api/v1/activity?limit=30").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let matching = activity
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["txid"] == txid.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(matching.len(), 1);
+    assert_eq!(matching[0]["id"], stale.id);
+    assert_eq!(matching[0]["received_zatoshi"], 100_000_000);
+    assert_eq!(matching[0]["spent_zatoshi"], 0);
+    assert_eq!(matching[0]["net_zatoshi"], 100_000_000);
 }
 
 #[test]
@@ -227,6 +368,24 @@ fn activity_limit_is_applied_after_journal_and_wallet_history_are_merged() {
         1,
     );
     assert_eq!(activity.len(), 1);
+}
+
+#[test]
+fn confirmed_journal_outside_the_canonical_window_does_not_displace_recent_history() {
+    let canonical = (101..=200)
+        .map(|height| {
+            let mut activity = canonical_activity("incoming", &format!("canonical-{height}"));
+            activity.mined_height = Some(height);
+            activity
+        })
+        .collect::<Vec<_>>();
+    let old_confirmed = journal_send("old-confirmed");
+
+    let activity = unified_activity(vec![old_confirmed], canonical, 1);
+
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].txid, "canonical-200");
+    assert_eq!(activity[0].mined_height, Some(200));
 }
 
 #[tokio::test]
@@ -561,14 +720,14 @@ async fn activity_lookup_by_key_returns_every_state_regardless_of_list_limits() 
     assert_eq!(
         listed,
         [
+            (json!(failed.id), json!("failed"), json!("")),
+            (json!(pending.id), json!("broadcast"), json!("pending-txid")),
+            (json!(preparing.id), json!("preparing"), json!("")),
             (
                 json!(confirmed.id),
                 json!("confirmed"),
                 json!("confirmed-txid")
             ),
-            (json!(failed.id), json!("failed"), json!("")),
-            (json!(pending.id), json!("broadcast"), json!("pending-txid")),
-            (json!(preparing.id), json!("preparing"), json!("")),
         ]
     );
 

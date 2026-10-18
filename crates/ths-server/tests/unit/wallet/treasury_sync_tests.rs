@@ -83,6 +83,22 @@ async fn routine_transparent_queries_exclude_the_treasury() {
 }
 
 #[tokio::test]
+async fn real_wallet_configures_public_transaction_enhancement() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("server.db")).unwrap();
+    store.initialize().unwrap();
+    let wallet = RealWallet::open(dir.path(), &store.seed().unwrap()).unwrap();
+
+    assert!(
+        wallet
+            .public_transaction_enhancements(100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn height_wait_deadline_includes_stalled_lightwalletd_calls() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dir = tempfile::tempdir().unwrap();
