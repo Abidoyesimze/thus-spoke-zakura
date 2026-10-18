@@ -28,6 +28,18 @@ and environment workflows.
   the server observes these payments without automatically rebroadcasting,
   replacing, or mining them.
   [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307)
+- **Activity API migration:** `GET /api/v1/activity` now returns canonical
+  wallet history. Clients must accept the `transaction` kind and `null`
+  `source_pool`, `destination_pool`, and `created_at` values; use
+  `source_pools`, `destination_pools`, `from_accounts`, and `to_accounts` when
+  a transaction affects more than one pool or account.
+  [#361](https://github.com/zcashlabs/thus-spoke-zakura/pull/361)
+- **Status and run scripts:** `ths status` exits nonzero unless the app,
+  Zakura, and lightwalletd are all running, and reports `degraded` or `stopped`
+  environments. `ths run` assigns free loopback ports, so its child must read
+  the exported endpoint variables instead of assuming the default ports.
+  [#376](https://github.com/zcashlabs/thus-spoke-zakura/pull/376),
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
 - **Mining JSON migration:** `ths mine --json` now prints a mining job rather
   than the old `{blocks, hashes}` result. It includes the job ID, requested and
   completed blocks, state, error, and `progress_uncertain`.
@@ -54,12 +66,21 @@ and environment workflows.
   [#110](https://github.com/zcashlabs/thus-spoke-zakura/pull/110),
   [#210](https://github.com/zcashlabs/thus-spoke-zakura/pull/210),
   [#384](https://github.com/zcashlabs/thus-spoke-zakura/pull/384)
-- **Wallet CLI:** `ths wallet balances` lists user-account addresses and
-  balances, `ths wallet activity` prints recent transfers and faucets, and
-  `send`, `shield`, and `unshield` support `--max` using the server-calculated
-  spendable amount. [#188](https://github.com/zcashlabs/thus-spoke-zakura/pull/188),
+- **Canonical wallet history:** The activity API, dashboard, and
+  `ths wallet activity` include incoming, outgoing, and internal transactions
+  once each, alongside pending and failed payments. Entries keep every affected
+  user account, source and destination pools, decoded text memos, and received,
+  spent, and net value effects; treasury outputs stay hidden.
+  [#361](https://github.com/zcashlabs/thus-spoke-zakura/pull/361)
+- **Wallet and explorer CLI:** `ths wallet balances` lists user-account
+  addresses and balances, `ths wallet activity` prints recent wallet history,
+  and `send`, `shield`, and `unshield` support `--max` using the
+  server-calculated spendable amount. `ths tx` and `ths block` print explorer
+  transaction and block data, with the block defaulting to the chain tip.
+  [#188](https://github.com/zcashlabs/thus-spoke-zakura/pull/188),
   [#215](https://github.com/zcashlabs/thus-spoke-zakura/pull/215),
-  [#244](https://github.com/zcashlabs/thus-spoke-zakura/pull/244)
+  [#244](https://github.com/zcashlabs/thus-spoke-zakura/pull/244),
+  [#324](https://github.com/zcashlabs/thus-spoke-zakura/pull/324)
 - **Mining and Regtest:** `ths mine` now follows server-owned mining jobs, so
   an interrupted client can report its job ID instead of starting duplicate
   work. Fresh environments activate NU7 at height 1, including its 25-second
@@ -78,11 +99,13 @@ and environment workflows.
   a child command and cleans it up afterwards. `ths list` reports environment
   and container status, while `ths logs` accepts `--head` and `--tail`.
   `ths endpoints --env` prints shell exports matching the environment variables
-  passed to a `ths run` child.
+  passed to a `ths run` child. Each run gets free loopback ports, so concurrent
+  runs no longer collide with each other or with a default environment.
   [#76](https://github.com/zcashlabs/thus-spoke-zakura/pull/76),
   [#101](https://github.com/zcashlabs/thus-spoke-zakura/pull/101),
   [#141](https://github.com/zcashlabs/thus-spoke-zakura/pull/141),
-  [#311](https://github.com/zcashlabs/thus-spoke-zakura/pull/311)
+  [#311](https://github.com/zcashlabs/thus-spoke-zakura/pull/311),
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
 - **Loopback Host validation:** Local API clients and reverse proxies must send
   a loopback `Host` header. The app rejects non-loopback hosts to prevent DNS
   rebinding against the unauthenticated local API.
@@ -95,10 +118,16 @@ and environment workflows.
   single launcher owns each named environment; competing starts are refused,
   and `stop` and forced `reset` coordinate with that owner. `ths wait` now
   waits through startup rather than reporting a still-starting environment as
-  missing. [#133](https://github.com/zcashlabs/thus-spoke-zakura/pull/133),
+  missing. `stop` and forced `reset` reject names with no environment, and
+  failed cleanup names a recovery file only when one exists. `ths run` removes
+  its lock file during cleanup.
+  [#133](https://github.com/zcashlabs/thus-spoke-zakura/pull/133),
   [#202](https://github.com/zcashlabs/thus-spoke-zakura/pull/202),
   [#276](https://github.com/zcashlabs/thus-spoke-zakura/pull/276),
-  [#277](https://github.com/zcashlabs/thus-spoke-zakura/pull/277)
+  [#277](https://github.com/zcashlabs/thus-spoke-zakura/pull/277),
+  [#376](https://github.com/zcashlabs/thus-spoke-zakura/pull/376),
+  [#279](https://github.com/zcashlabs/thus-spoke-zakura/pull/279),
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
 - **Runtime health and storage:** Health probes check both Zakura and
   lightwalletd on every request. Zakura stores its chain state in the mounted
   chain volume rather than the container filesystem.
@@ -120,10 +149,14 @@ and environment workflows.
 - **Clear API failures:** JSON-body, query, path, and method rejections now use
   the API error envelope, allowing clients to display actionable errors rather
   than generic HTTP-status messages. [#285](https://github.com/zcashlabs/thus-spoke-zakura/pull/285)
-- **Payment validation and startup:** Send fee quotes return HTTP 503 while
+- **Payment ordering, validation, and startup:** Each account's payments are
+  processed in admission order, and a send that lacks funds stays pending while
+  an earlier active payment could still fund it, so a send made right after a
+  faucet no longer fails permanently. Send fee quotes return HTTP 503 while
   the environment is starting or the wallet remains unscanned, instead of an
   unexpected HTTP 500. ZIP-321 parsing rejects explicitly zero payment amounts
   with HTTP 400; omitting the amount still lets the sender supply one.
+  [#392](https://github.com/zcashlabs/thus-spoke-zakura/pull/392),
   [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299),
   [#246](https://github.com/zcashlabs/thus-spoke-zakura/pull/246)
 - **Accurate dashboard state:** The dashboard distinguishes node connectivity
@@ -165,21 +198,24 @@ and environment workflows.
   [#391](https://github.com/zcashlabs/thus-spoke-zakura/pull/391)
 - **Maintainability:** The server, wallet, launcher, and dashboard were split
   into focused application modules with shared lifecycle and validation code.
+  Lifecycle cleanup tests have realistic timing headroom, so parallel test runs
+  no longer fail spuriously.
   [#178](https://github.com/zcashlabs/thus-spoke-zakura/pull/178),
   [#183](https://github.com/zcashlabs/thus-spoke-zakura/pull/183),
   [#186](https://github.com/zcashlabs/thus-spoke-zakura/pull/186),
   [#190](https://github.com/zcashlabs/thus-spoke-zakura/pull/190),
   [#191](https://github.com/zcashlabs/thus-spoke-zakura/pull/191),
   [#192](https://github.com/zcashlabs/thus-spoke-zakura/pull/192),
-  [#238](https://github.com/zcashlabs/thus-spoke-zakura/pull/238)
+  [#238](https://github.com/zcashlabs/thus-spoke-zakura/pull/238),
+  [#322](https://github.com/zcashlabs/thus-spoke-zakura/pull/322)
 
 ### Credits and comparison
 
-- **Contributors:** Thank you to @amiabix, @AnmolBansalDEV, @Annkkitaaa,
-  @guha-rahul, @jonwalch, @kaushikc44, @MayurK-cmd, @megabyte0x,
+- **Contributors:** Thank you to @AkshatGada, @amiabix, @AnmolBansalDEV,
+  @Annkkitaaa, @guha-rahul, @jonwalch, @kaushikc44, @MayurK-cmd, @megabyte0x,
   @nikhilkumar1612, @Not-Sarthak, @od-hunter, @paoValle, @piatoss3612,
-  @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @tanctl, @vkpatva,
-  and @yashgo0018.
+  @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @robertocarlous, @tanctl,
+  @vkpatva, and @yashgo0018.
 - **Full changelog:** [Compare v0.3.0 with v0.4.0](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.3.0...v0.4.0).
 
 ## v0.3.0
