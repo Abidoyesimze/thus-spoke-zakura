@@ -74,7 +74,11 @@ pub(crate) enum Command {
     /// Open the dashboard in the default browser.
     Open,
     /// Print endpoints for developer tooling.
-    Endpoints,
+    Endpoints {
+        /// Print export lines for the variables ths run passes to its child.
+        #[arg(long)]
+        env: bool,
+    },
     /// Mine blocks on a running development environment.
     Mine {
         /// Number of blocks to mine.

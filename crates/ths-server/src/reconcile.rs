@@ -12,7 +12,7 @@ use zcash_client_backend::{
         compact_formats::CompactBlock,
         service::{
             BlockId, BlockRange, ChainSpec, GetAddressUtxosArg, GetSubtreeRootsArg,
-            ShieldedProtocol as ProtoShieldedProtocol,
+            ShieldedProtocol as ProtoShieldedProtocol, TxFilter,
             compact_tx_streamer_client::CompactTxStreamerClient,
         },
     },
@@ -32,6 +32,7 @@ pub(crate) struct ReconciliationDeadline;
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_BATCH_SIZE: u32 = 100;
 const REORG_REPAIR_POLL: Duration = Duration::from_millis(250);
+const ENHANCEMENT_BATCH_SIZE: usize = 100;
 
 pub(crate) async fn find_rewind<F, Fut>(
     wallet: &RealWallet,
@@ -129,6 +130,7 @@ pub async fn sync_wallet(
             Err(error) => return Err(error),
         }
     }
+    enhance_transactions(wallet, &mut client, deadline).await?;
     check_deadline(deadline)
 }
 
@@ -142,6 +144,49 @@ fn repairing_reorg(error: &anyhow::Error) -> bool {
             .downcast_ref::<tonic::Status>()
             .is_some_and(|status| status.code() == tonic::Code::Aborted)
     })
+}
+
+async fn enhance_transactions(
+    wallet: &RealWallet,
+    client: &mut CompactTxStreamerClient<tonic::transport::Channel>,
+    deadline: Instant,
+) -> Result<()> {
+    for txid in wallet
+        .public_transaction_enhancements(ENHANCEMENT_BATCH_SIZE)
+        .await?
+    {
+        let response = within_deadline(
+            deadline,
+            "downloading transaction enhancement",
+            client.get_transaction(TxFilter {
+                block: None,
+                index: 0,
+                hash: txid.as_ref().to_vec(),
+            }),
+        )
+        .await;
+        let raw = match response {
+            Ok(response) => response.into_inner(),
+            Err(error)
+                if error
+                    .downcast_ref::<tonic::Status>()
+                    .is_some_and(|status| status.code() == tonic::Code::NotFound) =>
+            {
+                wallet.transaction_enhancement_not_found(txid).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let height = u32::try_from(raw.height)
+            .context("lightwalletd returned an invalid transaction enhancement height")?;
+        anyhow::ensure!(
+            height > 0,
+            "lightwalletd returned an unmined transaction enhancement"
+        );
+        check_deadline(deadline)?;
+        wallet.enhance_transaction(txid, raw.data, height).await?;
+    }
+    Ok(())
 }
 
 async fn rewind_wallet(
