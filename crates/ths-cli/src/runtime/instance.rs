@@ -458,7 +458,7 @@ impl Runtime {
                 remove_if_present(&self.session_path(name))?;
                 let _lock = self.lock_instance(name)?;
                 let mut report = cleanup()?;
-                report.environment_found |= claimed.is_some() || requested.is_some();
+                report.environment_found |= requested.is_some();
                 return Ok(report);
             }
             let session = self.read_session(name)?;

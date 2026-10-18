@@ -243,6 +243,15 @@ fn output_after_shutdown(
     deleted_elsewhere: bool,
 ) -> (bool, String, String, String, u16) {
     let fixture = Fixture::new();
+    output_after_shutdown_with(&fixture, json, fail_init, deleted_elsewhere)
+}
+
+fn output_after_shutdown_with(
+    fixture: &Fixture,
+    json: bool,
+    fail_init: bool,
+    deleted_elsewhere: bool,
+) -> (bool, String, String, String, u16) {
     let mut child = fixture.start(json, fail_init, deleted_elsewhere);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -315,6 +324,40 @@ fn output_after_shutdown(
     )
 }
 
+fn assert_repeated_cleanup_reports_missing(fixture: &Fixture) {
+    let owner = format!("{}.owner", fixture.name);
+    assert!(
+        contains_file_named(fixture.directory.path(), &owner),
+        "startup did not leave the historical owner token"
+    );
+
+    for arguments in [
+        vec!["--name", &fixture.name, "stop"],
+        vec!["--name", &fixture.name, "reset", "--force"],
+    ] {
+        let output = fixture.command().args(arguments).output().unwrap();
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("environment {} does not exist", fixture.name)),
+            "{stderr}"
+        );
+        assert!(!stdout.contains("Deleted"), "{stdout}");
+        assert!(!stdout.contains("Stopped and deleted"), "{stdout}");
+    }
+}
+
+fn contains_file_named(directory: &std::path::Path, name: &str) -> bool {
+    fs::read_dir(directory).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name() == name
+                || (entry.path().is_dir() && contains_file_named(&entry.path(), name))
+        })
+    })
+}
+
 #[test]
 fn json_start_stdout_is_one_document_after_interrupt_and_cleanup() {
     let (success, stdout, stderr, commands, port_offset) =
@@ -356,6 +399,24 @@ fn json_start_failure_keeps_stdout_empty_through_partial_cleanup() {
     assert!(commands.contains("rm -f"));
     assert!(commands.contains("volume rm"));
     assert!(commands.contains("network rm"));
+}
+
+#[test]
+fn repeated_cleanup_after_successful_shutdown_reports_missing() {
+    let fixture = Fixture::new();
+    let (success, _, stderr, _, _) = output_after_shutdown_with(&fixture, false, false, false);
+    assert!(success, "{stderr}");
+
+    assert_repeated_cleanup_reports_missing(&fixture);
+}
+
+#[test]
+fn repeated_cleanup_after_early_startup_failure_reports_missing() {
+    let fixture = Fixture::new();
+    let (success, _, _, _, _) = output_after_shutdown_with(&fixture, false, true, false);
+    assert!(!success);
+
+    assert_repeated_cleanup_reports_missing(&fixture);
 }
 
 #[test]
