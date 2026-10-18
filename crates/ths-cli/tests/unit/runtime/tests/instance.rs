@@ -192,6 +192,41 @@ fn reports_the_conflicting_loopback_port() {
 }
 
 #[test]
+fn endpoint_exports_match_the_variables_run_passes_to_its_child() {
+    let endpoints = endpoints_for(&host_ports(0).unwrap());
+    assert_eq!(
+        endpoint_exports(&name("alpha"), &endpoints),
+        "\
+export THS_INSTANCE=alpha
+export THS_NETWORK=regtest
+export THS_API_URL=http://127.0.0.1:32805
+export THS_ZAKURA_RPC_URL=http://127.0.0.1:18232
+export THS_LIGHTWALLETD_URL=http://127.0.0.1:9067
+export THS_LIGHTWALLETD_TLS=false
+export THS_P2P_ADDR=127.0.0.1:18233"
+    );
+
+    let mut shifted = endpoints_for(&host_ports(10).unwrap());
+    shifted.network = "other".to_owned();
+    shifted.tls = true;
+    let exports = endpoint_exports(&name("beta"), &shifted);
+    for expected in [
+        "export THS_INSTANCE=beta",
+        "export THS_NETWORK=regtest",
+        "export THS_API_URL=http://127.0.0.1:32815",
+        "export THS_ZAKURA_RPC_URL=http://127.0.0.1:18242",
+        "export THS_LIGHTWALLETD_URL=http://127.0.0.1:9077",
+        "export THS_LIGHTWALLETD_TLS=false",
+        "export THS_P2P_ADDR=127.0.0.1:18243",
+    ] {
+        assert!(
+            exports.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+}
+
+#[test]
 fn endpoints_json_includes_regtest_and_plaintext_lightwalletd() {
     let json = serde_json::to_value(endpoints_for(&host_ports(0).unwrap())).unwrap();
     assert_eq!(json["dashboard"], "http://127.0.0.1:32805");
@@ -276,6 +311,26 @@ fn environments_are_classified_by_their_long_running_services() {
         state(["running", "running", "running", "foreign"]),
         "conflict"
     );
+}
+
+#[test]
+fn status_uses_the_environment_state_and_preserves_json_compatibility() {
+    let degraded = environment("default", ["running", "exited", "running", "exited"]);
+    assert!(status_text(&degraded).starts_with("default: degraded\n  Dashboard"));
+
+    let json = serde_json::to_value(StatusOutput::from(&degraded)).unwrap();
+    assert_eq!(json["name"], "default");
+    assert_eq!(json["running"], false);
+    assert_eq!(json["state"], "degraded");
+    assert_eq!(json["endpoints"]["dashboard"], "http://127.0.0.1:8080");
+    assert_eq!(json["containers"][0]["service"], "app");
+    assert_eq!(json["containers"][1]["service"], "zakura");
+    assert_eq!(json["containers"][1]["state"], "exited");
+
+    let running = environment("default", ["running", "running", "running", "exited"]);
+    let json = serde_json::to_value(StatusOutput::from(&running)).unwrap();
+    assert_eq!(json["running"], true);
+    assert_eq!(json["state"], "running");
 }
 
 #[test]

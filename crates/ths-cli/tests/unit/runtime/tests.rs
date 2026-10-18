@@ -213,6 +213,7 @@ fn verified_report() -> CleanupReport {
         failures: Vec::new(),
         recovery_path: None,
         helpers_finished: true,
+        environment_found: true,
     }
 }
 
@@ -286,6 +287,7 @@ impl StartHost for RecordingHost {
                 failures: vec![message.clone()],
                 recovery_path: Some(runtime.recovery_path(name)),
                 helpers_finished: true,
+                environment_found: true,
             });
         }
         Ok(verified_report())

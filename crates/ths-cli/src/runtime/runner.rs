@@ -406,16 +406,10 @@ pub(super) fn run_child(
         .split_first()
         .context("run requires a child command")?;
     let mut process = Command::new(program);
-    process
-        .args(arguments)
-        .current_dir(current_dir)
-        .env("THS_INSTANCE", name.to_string())
-        .env("THS_NETWORK", "regtest")
-        .env("THS_API_URL", &endpoints.dashboard)
-        .env("THS_ZAKURA_RPC_URL", &endpoints.rpc)
-        .env("THS_LIGHTWALLETD_URL", &endpoints.lightwalletd)
-        .env("THS_LIGHTWALLETD_TLS", "false")
-        .env("THS_P2P_ADDR", &endpoints.p2p);
+    process.args(arguments).current_dir(current_dir);
+    for (key, value) in child_environment(name, endpoints) {
+        process.env(key, value);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
