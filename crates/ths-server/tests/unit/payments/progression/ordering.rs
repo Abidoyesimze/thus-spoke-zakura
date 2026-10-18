@@ -168,11 +168,24 @@ async fn only_earlier_matching_unresolved_funding_defers_insufficient_failure() 
         "later",
         "confirmed",
         "failed",
+        "prepared",
+        "broadcast",
+        "unconfirmed-faucet",
+        "unconfirmed-send",
+        "unconfirmed-address",
+        "unconfirmed-change",
+        "unconfirmed-legacy",
     ] {
-        let (state, _dir) = state_with_local_wallet();
+        let funding_kind = match case {
+            "unconfirmed-send" => "incoming-send",
+            "unconfirmed-address" => "incoming-address",
+            "unconfirmed-change" => "transparent-change",
+            _ => case,
+        };
+        let (state, dir) = state_with_local_wallet();
         let later_send =
             (case == "later").then(|| dependent_send(&state.0.store, "matching-send", "ironwood"));
-        let funding = if case == "incoming-send" {
+        let funding = if funding_kind == "incoming-send" {
             state
                 .0
                 .store
@@ -186,7 +199,7 @@ async fn only_earlier_matching_unresolved_funding_defers_insufficient_failure() 
                     None,
                 )
                 .unwrap()
-        } else if case == "incoming-address" {
+        } else if funding_kind == "incoming-address" {
             let address = state.0.store.account(2).unwrap().unified_address;
             state
                 .0
@@ -201,7 +214,7 @@ async fn only_earlier_matching_unresolved_funding_defers_insufficient_failure() 
                     None,
                 )
                 .unwrap()
-        } else if case == "transparent-change" {
+        } else if funding_kind == "transparent-change" {
             state
                 .0
                 .store
@@ -231,17 +244,36 @@ async fn only_earlier_matching_unresolved_funding_defers_insufficient_failure() 
                 )
                 .unwrap()
         };
-        if case == "confirmed" {
+        if matches!(case, "confirmed" | "prepared" | "broadcast")
+            || case.starts_with("unconfirmed-")
+        {
             state
                 .0
                 .store
                 .record_prepared(&funding.id, "funding", b"signed", 140)
                 .unwrap();
-            state
-                .0
-                .store
-                .confirm(&funding.id, "funding", "block")
-                .unwrap();
+            if case == "broadcast" {
+                state
+                    .0
+                    .store
+                    .mark_broadcast(&funding.id, "funding")
+                    .unwrap();
+            } else if case != "prepared" {
+                state
+                    .0
+                    .store
+                    .confirm(&funding.id, "funding", "block")
+                    .unwrap();
+                if case.starts_with("unconfirmed-") {
+                    state.0.store.unconfirm_blocks(&["block".into()]).unwrap();
+                }
+            }
+            if case == "unconfirmed-legacy" {
+                rusqlite::Connection::open(dir.path().join("server.db"))
+                    .unwrap()
+                    .execute("DELETE FROM idempotency WHERE key='funder'", [])
+                    .unwrap();
+            }
         } else if case == "failed" {
             state.0.store.fail(&funding.id, "fixture failure").unwrap();
         }
@@ -256,7 +288,12 @@ async fn only_earlier_matching_unresolved_funding_defers_insufficient_failure() 
         );
         let expected = if matches!(
             case,
-            "incoming-faucet" | "incoming-send" | "incoming-address" | "transparent-change"
+            "incoming-faucet"
+                | "incoming-send"
+                | "incoming-address"
+                | "transparent-change"
+                | "prepared"
+                | "broadcast"
         ) {
             "preparing"
         } else {

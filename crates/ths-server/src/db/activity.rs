@@ -297,6 +297,8 @@ impl Store {
     /// A failed preparation is not terminal while an earlier retained operation
     /// can still provide the source funds. Check and transition under one lock
     /// so recovery cannot change a dependency between the check and the write.
+    /// Deliberately orphaned payments are only observed, not executed, so they
+    /// cannot defer an otherwise unfunded send while waiting for reconfirmation.
     pub(crate) fn fail_unfunded_send(&self, id: &str, error: &str) -> Result<Activity> {
         let db = self.0.lock().unwrap();
         db.execute(
@@ -305,7 +307,7 @@ impl Store {
              AND NOT EXISTS (
                  SELECT 1 FROM activity earlier
                  WHERE earlier.rowid < target.rowid
-                   AND earlier.status NOT IN ('confirmed','failed')
+                   AND earlier.status IN ('preparing','prepared','broadcast')
                    AND (earlier.txid!='' OR EXISTS (SELECT 1 FROM idempotency i WHERE i.activity_id=earlier.id))
                    AND (
                        (earlier.destination_pool=target.source_pool AND (
