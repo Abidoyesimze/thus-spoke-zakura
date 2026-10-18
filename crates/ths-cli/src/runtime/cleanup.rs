@@ -97,7 +97,7 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Uncertain,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished: context.helpers_finished(),
                     environment_found: recorded,
                 });
@@ -463,7 +463,7 @@ impl Runtime {
                 return Ok(CleanupReport {
                     outcome: CleanupOutcome::Incomplete,
                     failures,
-                    recovery_path: Some(recovery_path),
+                    recovery_path: recovery_path.is_file().then_some(recovery_path),
                     helpers_finished,
                     environment_found,
                 });
@@ -485,7 +485,7 @@ impl Runtime {
         Ok(CleanupReport {
             outcome,
             failures,
-            recovery_path: Some(recovery_path),
+            recovery_path: recovery_path.is_file().then_some(recovery_path),
             helpers_finished,
             environment_found,
         })
