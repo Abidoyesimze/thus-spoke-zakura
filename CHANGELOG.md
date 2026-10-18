@@ -22,6 +22,12 @@ and environment workflows.
   Follow its `Location` with GET and inspect the pending, confirmed, or failed
   status. Replaying a terminal request returns its stored outcome with HTTP
   200. [#235](https://github.com/zcashlabs/thus-spoke-zakura/pull/235)
+- **Address faucet idempotency key:** `POST /api/v1/faucet/address` now
+  requires an `idempotency_key` of 8–128 visible ASCII characters in its JSON
+  body and rejects requests without one with HTTP 400. Reuse the key when
+  retrying, and read a stored result with
+  `GET /api/v1/faucet/address?idempotency_key=<key>`.
+  [#151](https://github.com/zcashlabs/thus-spoke-zakura/pull/151)
 - **Payment status after chain changes:** API clients must accept `unconfirmed`
   for payments whose confirming blocks are removed by `ths reorg` or
   `ths rollback`. The original transaction and idempotency key are preserved;
@@ -36,9 +42,12 @@ and environment workflows.
   [#361](https://github.com/zcashlabs/thus-spoke-zakura/pull/361)
 - **Status and run scripts:** `ths status` exits nonzero unless the app,
   Zakura, and lightwalletd are all running, and reports `degraded` or `stopped`
-  environments. `ths run` assigns free loopback ports, so its child must read
-  the exported endpoint variables instead of assuming the default ports.
+  environments. `ths doctor --json` exits nonzero when Docker is unreachable,
+  while still printing its diagnostic object with `ok: false`. `ths run`
+  assigns free loopback ports, so its child must read the exported endpoint
+  variables instead of assuming the default ports.
   [#376](https://github.com/zcashlabs/thus-spoke-zakura/pull/376),
+  [#203](https://github.com/zcashlabs/thus-spoke-zakura/pull/203),
   [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
 - **Mining JSON migration:** `ths mine --json` now prints a mining job rather
   than the old `{blocks, hashes}` result. It includes the job ID, requested and
@@ -161,10 +170,14 @@ and environment workflows.
   faucet no longer fails permanently. Send fee quotes return HTTP 503 while
   the environment is starting or the wallet remains unscanned, instead of an
   unexpected HTTP 500. ZIP-321 parsing rejects explicitly zero payment amounts
-  with HTTP 400; omitting the amount still lets the sender supply one.
+  with HTTP 400; omitting the amount still lets the sender supply one. Send and
+  both faucets reject transparent amounts below the 54-zatoshi dust threshold
+  with HTTP 400, including unified addresses that fall back to a transparent
+  receiver; small shielded amounts remain valid.
   [#392](https://github.com/zcashlabs/thus-spoke-zakura/pull/392),
   [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299),
-  [#246](https://github.com/zcashlabs/thus-spoke-zakura/pull/246)
+  [#246](https://github.com/zcashlabs/thus-spoke-zakura/pull/246),
+  [#280](https://github.com/zcashlabs/thus-spoke-zakura/pull/280)
 - **Accurate dashboard state:** The dashboard distinguishes node connectivity
   from wallet readiness, displays settlement and wallet-freshness information,
   preserves payment drafts and recovery identities, and keeps navigation tied
