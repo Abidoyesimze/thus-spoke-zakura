@@ -91,10 +91,13 @@ and environment workflows.
   while `ths rollback --depth N` removes them without replacements. Use
   `reorg --keep-txs` to attempt reinclusion of dropped transactions. Both
   commands reconcile wallet balances and have matching HTTP APIs. Wallet sync
-  retries transient lightwalletd cache-repair errors. A failed or interrupted
-  request may have changed the chain; inspect its tip before retrying.
+  retries transient lightwalletd cache-repair errors, and mining straight after
+  a rollback or reorg waits for lightwalletd to serve the mined block rather
+  than failing wallet synchronization. A failed or interrupted request may have
+  changed the chain; inspect its tip before retrying.
   [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307),
-  [#388](https://github.com/zcashlabs/thus-spoke-zakura/pull/388)
+  [#388](https://github.com/zcashlabs/thus-spoke-zakura/pull/388),
+  [#397](https://github.com/zcashlabs/thus-spoke-zakura/pull/397)
 - **Environment workflows:** `ths run` starts a fresh settled environment for
   a child command and cleans it up afterwards. `ths list` reports environment
   and container status, while `ths logs` accepts `--head` and `--tail`.
@@ -120,14 +123,17 @@ and environment workflows.
   waits through startup rather than reporting a still-starting environment as
   missing. `stop` and forced `reset` reject names with no environment, and
   failed cleanup names a recovery file only when one exists. `ths run` removes
-  its lock file during cleanup.
+  its lock file during cleanup. Environments started by v0.3.0 can be stopped,
+  restarted, or reset after upgrading: their unlabeled network is adopted when
+  every attached container belongs to the instance.
   [#133](https://github.com/zcashlabs/thus-spoke-zakura/pull/133),
   [#202](https://github.com/zcashlabs/thus-spoke-zakura/pull/202),
   [#276](https://github.com/zcashlabs/thus-spoke-zakura/pull/276),
   [#277](https://github.com/zcashlabs/thus-spoke-zakura/pull/277),
   [#376](https://github.com/zcashlabs/thus-spoke-zakura/pull/376),
   [#279](https://github.com/zcashlabs/thus-spoke-zakura/pull/279),
-  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310),
+  [#401](https://github.com/zcashlabs/thus-spoke-zakura/pull/401)
 - **Runtime health and storage:** Health probes check both Zakura and
   lightwalletd on every request. Zakura stores its chain state in the mounted
   chain volume rather than the container filesystem.
@@ -198,8 +204,8 @@ and environment workflows.
   [#391](https://github.com/zcashlabs/thus-spoke-zakura/pull/391)
 - **Maintainability:** The server, wallet, launcher, and dashboard were split
   into focused application modules with shared lifecycle and validation code.
-  Lifecycle cleanup tests have realistic timing headroom, so parallel test runs
-  no longer fail spuriously.
+  Lifecycle cleanup tests have realistic timing headroom, and the external memo
+  regression waits for transaction enhancement, so neither fails spuriously.
   [#178](https://github.com/zcashlabs/thus-spoke-zakura/pull/178),
   [#183](https://github.com/zcashlabs/thus-spoke-zakura/pull/183),
   [#186](https://github.com/zcashlabs/thus-spoke-zakura/pull/186),
@@ -207,7 +213,8 @@ and environment workflows.
   [#191](https://github.com/zcashlabs/thus-spoke-zakura/pull/191),
   [#192](https://github.com/zcashlabs/thus-spoke-zakura/pull/192),
   [#238](https://github.com/zcashlabs/thus-spoke-zakura/pull/238),
-  [#322](https://github.com/zcashlabs/thus-spoke-zakura/pull/322)
+  [#322](https://github.com/zcashlabs/thus-spoke-zakura/pull/322),
+  [#409](https://github.com/zcashlabs/thus-spoke-zakura/pull/409)
 
 ### Credits and comparison
 
@@ -215,7 +222,7 @@ and environment workflows.
   @Annkkitaaa, @guha-rahul, @jonwalch, @kaushikc44, @MayurK-cmd, @megabyte0x,
   @nikhilkumar1612, @Not-Sarthak, @od-hunter, @paoValle, @piatoss3612,
   @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @robertocarlous, @tanctl,
-  @vkpatva, and @yashgo0018.
+  @vkpatva, @yashgo0018, and @Yonkoo11.
 - **Full changelog:** [Compare v0.3.0 with v0.4.0](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.3.0...v0.4.0).
 
 ## v0.3.0
