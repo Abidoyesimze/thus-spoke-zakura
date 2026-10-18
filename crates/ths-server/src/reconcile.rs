@@ -31,6 +31,7 @@ pub(crate) struct ReconciliationDeadline;
 
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 const SCAN_BATCH_SIZE: u32 = 100;
+const REORG_REPAIR_POLL: Duration = Duration::from_millis(250);
 
 pub(crate) async fn find_rewind<F, Fut>(
     wallet: &RealWallet,
@@ -117,8 +118,30 @@ pub async fn sync_wallet(
         rewind_wallet(wallet, &mut client, &checkpoint, deadline).await?;
     }
     update_subtree_roots(wallet, &mut client, deadline).await?;
-    while sync_pass(wallet, rpc, &mut client, deadline).await? {}
+    loop {
+        match sync_pass(wallet, rpc, &mut client, deadline).await {
+            Ok(true) => {}
+            Ok(false) => break,
+            Err(error) if repairing_reorg(&error) => {
+                check_deadline(deadline)?;
+                tokio::time::sleep(REORG_REPAIR_POLL).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     check_deadline(deadline)
+}
+
+/// lightwalletd aborts `GetBlockRange` while its ingestor replaces the blocks a rollback removed:
+/// until it has re-indexed them its cache still ends in the old chain, and it refuses to stream
+/// those blocks together with the new ones it reads straight from Zakura. The blocks become
+/// readable once the repair finishes, so the scan retries instead of failing the sync.
+fn repairing_reorg(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<tonic::Status>()
+            .is_some_and(|status| status.code() == tonic::Code::Aborted)
+    })
 }
 
 async fn rewind_wallet(
