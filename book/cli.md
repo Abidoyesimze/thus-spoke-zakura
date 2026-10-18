@@ -137,9 +137,14 @@ ths pull
 
 ### `ths status [--json]`
 
-Shows whether the named environment's app container is running and prints its
-endpoints; it is not `/health` or a wallet-settlement check. JSON contains
-`name`, `running`, and `endpoints`.
+Shows the named environment's service state and endpoints. Like `ths list`, it
+checks the app, Zakura, and lightwalletd containers and reports `running`,
+`paused`, `degraded`, `stopped`, `conflict`, or `unknown`; the one-shot `init`
+container does not decide the overall state. It exits nonzero unless the state
+is `running`. It is not `/health` or a wallet-settlement check; use `ths wait`
+when a script needs the node, index, and wallet settled at one tip. JSON keeps
+the existing `name`, `running`, and `endpoints` fields and adds `state` and
+`containers`.
 
 ```console
 ths status
@@ -154,14 +159,18 @@ Opens the running dashboard in your default browser.
 ths open
 ```
 
-### `ths endpoints [--json]`
+### `ths endpoints [--json | --env]`
 
 Prints the dashboard, Zakura RPC, lightwalletd, and P2P endpoints, useful for
-scripts and other developer tooling.
+scripts and other developer tooling. `--env` prints `export` lines for the
+same variables `ths run` passes to its child, so
+`eval "$(ths endpoints --env)"` can set them for an environment that is
+already running. `--env` cannot be combined with `--json`.
 
 ```console
 ths endpoints
 ths endpoints --json
+ths endpoints --env
 ```
 
 JSON output includes `"network": "regtest"` and `"tls": false`; lightwalletd
@@ -173,7 +182,8 @@ Prints or streams logs for a service in the named environment. Defaults to the
 `app` (dashboard/server) service. Without `--tail` or `--head`, it prints
 all available Docker logs. Counts must be positive. `--head` conflicts with
 `--tail` and `--follow`; `--tail` can be combined with `--follow`. Output remains
-log text even with the global `--json` flag.
+log text even with the global `--json` flag. If the reader closes the pipe, the
+command stops without an error.
 
 ```console
 ths logs                       # available logs from the app service
@@ -198,7 +208,9 @@ ths stop
 external deletion and exits; you do not need to interrupt it separately.
 Cleanup errors retain `lifecycle-recovery.json` for this instance. A successful
 message requires verified deletion; neither stop nor reset removes another
-instance's resources.
+instance's resources. If the name has no instance metadata, recovery state, or
+owned Docker resources, both commands report that the environment does not
+exist and exit nonzero.
 
 ### `ths reset --force`
 
@@ -402,7 +414,7 @@ and Send dialogs, from a script or terminal:
 | Subcommand | What it does |
 | --- | --- |
 | `ths wallet balances` | Print each account's balances and addresses |
-| `ths wallet activity` | Print recent sends, shields, unshields, and faucet payments |
+| `ths wallet activity` | Print canonical incoming and outgoing wallet history, plus pending or failed payments |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
@@ -430,12 +442,16 @@ ths wallet balances --json
 
 ### `ths wallet activity [--limit <N>]`
 
-Prints recent activity recorded by the development wallet, newest first. The
-output distinguishes sends, shields, unshields, and faucet payments, and shows
-their status, route, amount, transaction ID and confirmation block (when
-available), creation time, and any retained payment error. External Regtest
-recipients are shown by their full address. Faucet routes are labeled `faucet`;
-the hidden treasury account is never exposed as a user account.
+Prints recent canonical activity for the five development accounts, newest
+first, together with pending or failed payment-journal entries. The output
+includes external incoming payments. Each transaction appears once; internal
+transfers retain both their source and destination accounts. It distinguishes
+receives, sends, shields, unshields, and faucet payments, and shows their
+status, route, amount,
+transaction ID and confirmation block (when available), creation time, and any
+retained payment error. External Regtest recipients are shown by their full
+address. Faucet routes are labeled `faucet`; the hidden treasury account is
+never exposed as a user account.
 
 Without `--limit`, the server's default of 30 entries is used. An explicit
 limit must be between 1 and 100. An environment with no activity prints a
@@ -449,7 +465,15 @@ ths wallet activity --limit 20 --json
 ```
 
 JSON output is the unmodified activity schema returned by
-`GET /api/v1/activity`, including `created_at` and nullable `block_hash`.
+`GET /api/v1/activity`, including transaction direction, pools, decoded text
+memos, mining metadata, `created_at`, and nullable `block_hash`. The
+`from_accounts` and `to_accounts` arrays retain every development account
+affected by a transaction. Their singular counterparts are populated only
+when exactly one account is affected. Outputs to the hidden treasury are not
+included in the displayed amount, recipients, or account lists. Detecting a
+transparent source for an external incoming transaction is best effort and
+uses one short, shared lookup budget, so an unavailable Zakura node does not
+hold up the activity response.
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -693,9 +717,9 @@ account 1 to account 3, all without opening the dashboard.
 | `ths run [--timeout] -- <command>` | Run a child in a fresh settled instance, then clean up |
 | `ths build [--dev]` | Build runtime images from source |
 | `ths pull` | Pull the exact images for this launcher version |
-| `ths status [--json]` | Show app-container running state and endpoints |
+| `ths status [--json]` | Show environment service state and endpoints |
 | `ths open` | Open the running dashboard |
-| `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
+| `ths endpoints [--json \| --env]` | Print endpoints, or `export` lines for the variables `ths run` passes to its child |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths reorg --depth N [--keep-txs]` | Replace recent blocks, optionally attempting transaction reinclusion |
 | `ths rollback --depth N` | Remove recent blocks without replacements |

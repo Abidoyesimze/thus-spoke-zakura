@@ -112,8 +112,9 @@ curl -fsS "$DASHBOARD_URL/api/v1/send" \
   --data '{"from_account":1,"to_account":2,"source_pool":"ironwood","destination_pool":"ironwood","amount_zatoshi":100000000,"idempotency_key":"book-account-1-to-2-v1"}'
 ```
 
-The POST response is one activity object, and the same object is what
-`GET /api/v1/activity` returns in a list. It has thirteen fields:
+The response is one payment-journal activity object. A keyed
+`GET /api/v1/activity?idempotency_key=<key>` returns that same object in a
+one-item list:
 
 | Field | Meaning |
 | --- | --- |
@@ -131,10 +132,37 @@ The POST response is one activity object, and the same object is what
 | `created_at` | When the row was inserted, as `YYYY-MM-DD HH:MM:SS` UTC. |
 | `last_error` | Stored diagnostic, or `null`. |
 
-Read `txid`, `status`, and `block_hash` first; do not infer confirmation
-merely because HTTP returned 200. There is no memo field here. The supplied
-memo is stored with the payment intent to compare replays, but received memos
-are not read back through this API.
+An unkeyed `GET /api/v1/activity` returns unified wallet history. It merges
+these journal records with transactions observed by the wallet and adds chain
+metadata, memos, recipient and pool lists, and `from_accounts` and
+`to_accounts`. The arrays preserve every affected development account;
+`from_account` and `to_account` are only populated when their corresponding
+array contains exactly one account. A transaction appears once even when it
+affects multiple development accounts. Outputs to the hidden treasury account
+are excluded from the user-facing amount, recipients, and account lists.
+
+`amount_zatoshi` remains the value paid to the relevant user or external
+recipient. Canonical wallet entries additionally expose the aggregate effects
+across development accounts 1–5 as `received_zatoshi`, `spent_zatoshi`, and the
+signed `net_zatoshi`. These totals include wallet change and transaction fees,
+but exclude treasury account 6. Journal-only pending or failed entries set all
+three effect fields to `null` because their final wallet effects are not yet
+known.
+
+When a transaction uses more than one pool, `source_pool` or
+`destination_pool` is `null` and the corresponding `source_pools` or
+`destination_pools` array preserves every known pool.
+
+For external incoming transactions, transparent-source detection requires a
+Zakura transaction lookup. These lookups run concurrently within one short,
+shared budget and fail open: if Zakura is slow or unavailable, activity still
+returns and the unknown source pool remains absent.
+
+For the keyed payment-journal object, read `txid`, `status`, and `block_hash`
+first; do not infer confirmation merely because HTTP returned 200. That object
+does not expose a memo field. The supplied memo is stored with the payment
+intent to compare replays. Unkeyed unified history exposes decoded received
+text memos in its `memos` array when transaction enhancement recovers them.
 Keep this key only for this intended payment. If the server has recorded it,
 repeating the **same direct API request** with the same key retrieves or
 finishes that activity.

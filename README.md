@@ -42,8 +42,9 @@ ths wallet send --from 1 --to 2 --amount 1
 Choose the dashboard steps **or** the commands for one payment of each kind.
 Running both makes additional payments. For your own application, run
 `ths endpoints --json` to get this instance's local API, Zakura RPC, and
-lightwalletd addresses. See [Connect your application](book/connect-an-app.md)
-for the request format.
+lightwalletd addresses. `eval "$(ths endpoints --env)"` exports the same
+variables `ths run` passes to its child. See
+[Connect your application](book/connect-an-app.md) for the request format.
 
 To test chain reorganizations, run `ths reorg --depth 3` to replace recent
 blocks or `ths rollback --depth 3` to remove them. See the
@@ -53,7 +54,7 @@ blocks or `ths rollback --depth 3` to remove them. See the
 
 Press Ctrl+C in the terminal running `ths`. It attempts to delete that
 instance's containers, chain, keys, and wallet data. Check the command result:
-if cleanup fails, keep its recovery files and follow the
+if cleanup fails, keep any recovery files that exist and follow the
 [troubleshooting guide](book/troubleshooting.md).
 
 ## Documentation
