@@ -122,3 +122,4 @@ jobs:
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact address_faucet_retry_after_server_restart_pays_each_destination_once
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_send_retry_survives_lost_response_and_restart
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_external_faucet_retry_survives_lost_response_and_restart
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_ironwood_memo_is_recovered_by_receiving_wallet_sync
