@@ -291,6 +291,7 @@ export function PaymentUpdates() {
             onHiddenFocus={() => focusNext(identity)}
             focusRequest={viewedPayment?.key === identity.key ? viewedPayment : null}
             onView={() => viewPayment(identity.key)}
+            onFollowTransaction={closePayments}
             identity={identity}
             restored={isRestored(identity.key)}
             inFlight={operation.isSubmitting(identity)}

@@ -123,6 +123,19 @@ fn separates_building_from_starting() {
     ));
 
     assert!(Cli::try_parse_from(["ths", "start", "--port-offset", "1"]).is_ok());
+
+    let cli = Cli::try_parse_from(["ths", "endpoints"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Endpoints { env: false })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "--name", "alice", "endpoints", "--env"]).unwrap();
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Endpoints { env: true })
+    ));
 }
 
 #[test]

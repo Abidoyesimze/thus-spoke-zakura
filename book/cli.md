@@ -137,9 +137,14 @@ ths pull
 
 ### `ths status [--json]`
 
-Shows whether the named environment's app container is running and prints its
-endpoints; it is not `/health` or a wallet-settlement check. JSON contains
-`name`, `running`, and `endpoints`.
+Shows the named environment's service state and endpoints. Like `ths list`, it
+checks the app, Zakura, and lightwalletd containers and reports `running`,
+`paused`, `degraded`, `stopped`, `conflict`, or `unknown`; the one-shot `init`
+container does not decide the overall state. It exits nonzero unless the state
+is `running`. It is not `/health` or a wallet-settlement check; use `ths wait`
+when a script needs the node, index, and wallet settled at one tip. JSON keeps
+the existing `name`, `running`, and `endpoints` fields and adds `state` and
+`containers`.
 
 ```console
 ths status
@@ -154,14 +159,18 @@ Opens the running dashboard in your default browser.
 ths open
 ```
 
-### `ths endpoints [--json]`
+### `ths endpoints [--json | --env]`
 
 Prints the dashboard, Zakura RPC, lightwalletd, and P2P endpoints, useful for
-scripts and other developer tooling.
+scripts and other developer tooling. `--env` prints `export` lines for the
+same variables `ths run` passes to its child, so
+`eval "$(ths endpoints --env)"` can set them for an environment that is
+already running. `--env` cannot be combined with `--json`.
 
 ```console
 ths endpoints
 ths endpoints --json
+ths endpoints --env
 ```
 
 JSON output includes `"network": "regtest"` and `"tls": false`; lightwalletd
@@ -173,7 +182,8 @@ Prints or streams logs for a service in the named environment. Defaults to the
 `app` (dashboard/server) service. Without `--tail` or `--head`, it prints
 all available Docker logs. Counts must be positive. `--head` conflicts with
 `--tail` and `--follow`; `--tail` can be combined with `--follow`. Output remains
-log text even with the global `--json` flag.
+log text even with the global `--json` flag. If the reader closes the pipe, the
+command stops without an error.
 
 ```console
 ths logs                       # available logs from the app service
@@ -198,7 +208,9 @@ ths stop
 external deletion and exits; you do not need to interrupt it separately.
 Cleanup errors retain `lifecycle-recovery.json` for this instance. A successful
 message requires verified deletion; neither stop nor reset removes another
-instance's resources.
+instance's resources. If the name has no instance metadata, recovery state, or
+owned Docker resources, both commands report that the environment does not
+exist and exit nonzero.
 
 ### `ths reset --force`
 
@@ -706,9 +718,9 @@ account 1 to account 3, all without opening the dashboard.
 | `ths run [--timeout] -- <command>` | Run a child in a fresh settled instance, then clean up |
 | `ths build [--dev]` | Build runtime images from source |
 | `ths pull` | Pull the exact images for this launcher version |
-| `ths status [--json]` | Show app-container running state and endpoints |
+| `ths status [--json]` | Show environment service state and endpoints |
 | `ths open` | Open the running dashboard |
-| `ths endpoints [--json]` | Print endpoints for scripts and developer tools |
+| `ths endpoints [--json \| --env]` | Print endpoints, or `export` lines for the variables `ths run` passes to its child |
 | `ths tx <TXID> [--json]` | Show explorer transaction data |
 | `ths block [ID] [--json]` | Show a block by height or hash, or the chain tip when omitted |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
