@@ -32,7 +32,7 @@ to run in order. For a worked dashboard flow, see [Chapter
   CLI.)
 - Amounts are ZEC decimal strings with up to 8 decimal places, e.g. `1`,
   `0.5`, `2.25000001`. These are disposable Regtest coins with no value.
-- Commands that call the app (`mine`, `reorg`, `rollback`, `faucet`, and `wallet`
+- Commands that call the app (`tx`, `block`, `mine`, `reorg`, `rollback`, `faucet`, and `wallet`
   subcommands) or the node (`rpc`) require a running environment. Start one
   first with `ths` (or `ths --name <NAME>`).
   `stop` and `reset --force` can remove resources left by an interrupted run.
@@ -85,8 +85,9 @@ command in your current directory, then attempts bounded instance cleanup.
 The **120-second** default timeout covers startup and settlement; it does not
 limit child execution. No browser opens. Without `--name`, the name is
 `run-<32 UUID hex digits>`; an explicit name must be fresh. Existing metadata
-or resources cause a collision error rather than reuse. `run` uses the default
-ports and has no `--port-offset`; concurrent runs can therefore collide on ports.
+or resources cause a collision error rather than reuse. Docker assigns free
+loopback ports to each run. Cleanup removes the run's per-instance lock file;
+failures are reported.
 
 ```console
 ths run --timeout 180 -- sh -c 'curl -fsS "$THS_API_URL/api/v1/accounts"'
@@ -140,9 +141,14 @@ ths pull
 
 ### `ths status [--json]`
 
-Shows whether the named environment's app container is running and prints its
-endpoints; it is not `/health` or a wallet-settlement check. JSON contains
-`name`, `running`, and `endpoints`.
+Shows the named environment's service state and endpoints. Like `ths list`, it
+checks the app, Zakura, and lightwalletd containers and reports `running`,
+`paused`, `degraded`, `stopped`, `conflict`, or `unknown`; the one-shot `init`
+container does not decide the overall state. It exits nonzero unless the state
+is `running`. It is not `/health` or a wallet-settlement check; use `ths wait`
+when a script needs the node, index, and wallet settled at one tip. JSON keeps
+the existing `name`, `running`, and `endpoints` fields and adds `state` and
+`containers`.
 
 ```console
 ths status
@@ -236,7 +242,9 @@ ths stop
 external deletion and exits; you do not need to interrupt it separately.
 Cleanup errors retain `lifecycle-recovery.json` for this instance. A successful
 message requires verified deletion; neither stop nor reset removes another
-instance's resources.
+instance's resources. If the name has no instance metadata, recovery state, or
+owned Docker resources, both commands report that the environment does not
+exist and exit nonzero.
 
 ### `ths reset --force`
 
@@ -406,6 +414,19 @@ wallet synchronization deadline, without repeating the chain mutation.
 
 ---
 
+## Explorer: `ths tx <TXID>` / `ths block [ID]`
+
+Read the same transaction or block data as the dashboard explorer. Block IDs
+can be heights or hashes; omitting the ID shows the chain tip.
+Human output lists every returned field; `--json` prints the complete API object.
+Unknown transactions or blocks exit nonzero with the server's 404 message.
+
+```console
+ths tx "$TXID" --json  # Set TXID to a transaction ID first.
+ths block
+ths block 100 --json
+```
+
 ## Funding an address: `ths faucet <ADDRESS> [--amount <ZEC>]`
 
 Sends disposable Regtest ZEC from the treasury directly to any Regtest unified
@@ -440,7 +461,7 @@ and Send dialogs, from a script or terminal:
 | Subcommand | What it does |
 | --- | --- |
 | `ths wallet balances` | Print each account's balances and addresses |
-| `ths wallet activity` | Print recent sends, shields, unshields, and faucet payments |
+| `ths wallet activity` | Print canonical incoming and outgoing wallet history, plus pending or failed payments |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
@@ -468,12 +489,16 @@ ths wallet balances --json
 
 ### `ths wallet activity [--limit <N>]`
 
-Prints recent activity recorded by the development wallet, newest first. The
-output distinguishes sends, shields, unshields, and faucet payments, and shows
-their status, route, amount, transaction ID and confirmation block (when
-available), creation time, and any retained payment error. External Regtest
-recipients are shown by their full address. Faucet routes are labeled `faucet`;
-the hidden treasury account is never exposed as a user account.
+Prints recent canonical activity for the five development accounts, newest
+first, together with pending or failed payment-journal entries. The output
+includes external incoming payments. Each transaction appears once; internal
+transfers retain both their source and destination accounts. It distinguishes
+receives, sends, shields, unshields, and faucet payments, and shows their
+status, route, amount,
+transaction ID and confirmation block (when available), creation time, and any
+retained payment error. External Regtest recipients are shown by their full
+address. Faucet routes are labeled `faucet`; the hidden treasury account is
+never exposed as a user account.
 
 Without `--limit`, the server's default of 30 entries is used. An explicit
 limit must be between 1 and 100. An environment with no activity prints a
@@ -487,7 +512,15 @@ ths wallet activity --limit 20 --json
 ```
 
 JSON output is the unmodified activity schema returned by
-`GET /api/v1/activity`, including `created_at` and nullable `block_hash`.
+`GET /api/v1/activity`, including transaction direction, pools, decoded text
+memos, mining metadata, `created_at`, and nullable `block_hash`. The
+`from_accounts` and `to_accounts` arrays retain every development account
+affected by a transaction. Their singular counterparts are populated only
+when exactly one account is affected. Outputs to the hidden treasury are not
+included in the displayed amount, recipients, or account lists. Detecting a
+transparent source for an external incoming transaction is best effort and
+uses one short, shared lookup budget, so an unavailable Zakura node does not
+hold up the activity response.
 
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
@@ -731,10 +764,12 @@ account 1 to account 3, all without opening the dashboard.
 | `ths run [--timeout] -- <command>` | Run a child in a fresh settled instance, then clean up |
 | `ths build [--dev]` | Build runtime images from source |
 | `ths pull` | Pull the exact images for this launcher version |
-| `ths status [--json]` | Show app-container running state and endpoints |
+| `ths status [--json]` | Show environment service state and endpoints |
 | `ths open` | Open the running dashboard |
 | `ths endpoints [--json \| --env]` | Print endpoints, or `export` lines for the variables `ths run` passes to its child |
 | `ths rpc [--raw] [--yes] <METHOD> [PARAMS...]` | Call the instance's Zakura JSON-RPC and print the result |
+| `ths tx <TXID> [--json]` | Show explorer transaction data |
+| `ths block [ID] [--json]` | Show a block by height or hash, or the chain tip when omitted |
 | `ths mine <N>` | Mine blocks and synchronize the wallet |
 | `ths reorg --depth N [--keep-txs]` | Replace recent blocks, optionally attempting transaction reinclusion |
 | `ths rollback --depth N` | Remove recent blocks without replacements |

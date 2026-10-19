@@ -96,6 +96,16 @@ pub(crate) enum Command {
         #[arg(value_name = "PARAMS", allow_hyphen_values = true)]
         params: Vec<String>,
     },
+    /// Show a transaction from the running environment's explorer.
+    Tx {
+        /// Transaction ID.
+        txid: String,
+    },
+    /// Show a block from the explorer, defaulting to the chain tip.
+    Block {
+        /// Block height or hash.
+        id: Option<String>,
+    },
     /// Mine blocks on a running development environment.
     Mine {
         /// Number of blocks to mine.
