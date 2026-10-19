@@ -116,8 +116,10 @@ jobs:
         run: docker build -f docker/lightwalletd.Dockerfile -t ths-recovery-lightwalletd:local .
       - name: Run live activity recovery regressions
         run: |
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact reorg_and_rollback_preserve_canonical_wallet_and_payment_state
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact broadcast_recovers_after_auto_mine_failure
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact concurrent_identical_sends_have_one_chain_effect
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact address_faucet_retry_after_server_restart_pays_each_destination_once
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_send_retry_survives_lost_response_and_restart
           cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact queued_external_faucet_retry_survives_lost_response_and_restart
+          cargo test --locked --profile dev-runtime -p ths-server --test activity_recovery -- --ignored --exact external_ironwood_memo_is_recovered_by_receiving_wallet_sync

@@ -19,6 +19,7 @@ import { paymentRecipient, type PaymentIdentity } from '@/hooks/payment-identity
 import { errorMessage } from '@/lib/api';
 import { formatZecAmount } from '@/lib/money';
 import { cn } from '@/lib/cn';
+import { absoluteTime } from '@/lib/format';
 
 export function PaymentStatus({
   identity,
@@ -36,6 +37,7 @@ export function PaymentStatus({
   onHiddenFocus,
   focusRequest,
   onView,
+  onFollowTransaction,
 }: {
   identity: PaymentIdentity;
   restored: boolean;
@@ -52,6 +54,7 @@ export function PaymentStatus({
   onHiddenFocus: () => void;
   focusRequest: object | null;
   onView: () => void;
+  onFollowTransaction: () => void;
 }) {
   const status = usePaymentStatus(identity.key, true, 'address' in identity.variables);
   const activity = status.data;
@@ -333,6 +336,21 @@ export function PaymentStatus({
               className="text-accent-strong self-center underline underline-offset-2"
               aria-describedby={titleId}
               to={`/explorer/tx/${activity.txid}`}
+              onClick={(event) => {
+                const { button, altKey, ctrlKey, metaKey, shiftKey, currentTarget } = event;
+                const opensSeparateContext =
+                  currentTarget.target !== '' && currentTarget.target.toLowerCase() !== '_self';
+                if (
+                  button === 0 &&
+                  !altKey &&
+                  !ctrlKey &&
+                  !metaKey &&
+                  !shiftKey &&
+                  !opensSeparateContext
+                ) {
+                  onFollowTransaction();
+                }
+              }}
             >
               View transaction
             </Link>
@@ -389,7 +407,7 @@ export function PaymentStatus({
                 : identity.variables.memo}
           </p>
         )}
-        {activity?.created_at && <p>Created: {activity.created_at}</p>}
+        {activity?.created_at && <p>Created: {absoluteTime(activity.created_at)}</p>}
         {failed && <p>Adding funds won’t restart this payment. Start a new one to try again.</p>}
       </div>
     </article>,

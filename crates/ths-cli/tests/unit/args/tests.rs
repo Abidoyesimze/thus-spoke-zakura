@@ -1,6 +1,51 @@
 use super::*;
 
 #[test]
+fn parses_explorer_commands_with_global_options() {
+    for args in [
+        vec!["ths", "--name", "alice", "--json", "tx", "txid"],
+        vec!["ths", "tx", "txid", "--json", "--name", "alice"],
+    ] {
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.name.unwrap().to_string(), "alice");
+        assert!(matches!(cli.command, Some(Command::Tx { txid }) if txid == "txid"));
+    }
+    let cli = Cli::try_parse_from(["ths", "block"]).unwrap();
+    assert!(matches!(cli.command, Some(Command::Block { id: None })));
+    for id in [
+        "0",
+        "100",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+    ] {
+        let cli = Cli::try_parse_from(["ths", "block", id, "--name", "alice", "--json"]).unwrap();
+        assert!(cli.json);
+        assert_eq!(cli.name.unwrap().to_string(), "alice");
+        assert!(matches!(cli.command, Some(Command::Block { id: Some(value) }) if value == id));
+    }
+    assert!(Cli::try_parse_from(["ths", "tx"]).is_err());
+    assert!(Cli::try_parse_from(["ths", "block", "1", "2"]).is_err());
+}
+
+#[test]
+fn parses_reorg_and_rollback_depths() {
+    for args in [
+        vec!["ths", "reorg", "--depth", "3"],
+        vec!["ths", "reorg", "--depth", "1000", "--keep-txs", "--json"],
+        vec!["ths", "--name", "alice", "rollback", "--depth", "1"],
+    ] {
+        assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+    }
+    for command in ["reorg", "rollback"] {
+        for depth in ["0", "1001", "-1", "1.5"] {
+            assert!(Cli::try_parse_from(["ths", command, "--depth", depth]).is_err());
+        }
+        assert!(Cli::try_parse_from(["ths", command]).is_err());
+    }
+    assert!(Cli::try_parse_from(["ths", "rollback", "--depth", "1", "--keep-txs"]).is_err());
+}
+
+#[test]
 fn separates_building_from_starting() {
     let default = Cli::try_parse_from(["ths"]).unwrap();
     assert!(default.command.is_none());
@@ -78,6 +123,19 @@ fn separates_building_from_starting() {
     ));
 
     assert!(Cli::try_parse_from(["ths", "start", "--port-offset", "1"]).is_ok());
+
+    let cli = Cli::try_parse_from(["ths", "endpoints"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Endpoints { env: false })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "--name", "alice", "endpoints", "--env"]).unwrap();
+    assert_eq!(cli.name.unwrap().to_string(), "alice");
+    assert!(matches!(
+        cli.command,
+        Some(Command::Endpoints { env: true })
+    ));
 }
 
 #[test]

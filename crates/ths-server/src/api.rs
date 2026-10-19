@@ -9,6 +9,7 @@ use axum::{
 };
 use std::path::PathBuf;
 use tower_http::trace::TraceLayer;
+mod chain;
 mod dashboard;
 pub(crate) mod error;
 mod events;
@@ -36,6 +37,8 @@ pub fn router(state: AppState) -> Router {
             get(payments::faucet_address_status).post(payments::faucet_address),
         )
         .route("/api/v1/mine", post(mining::mine))
+        .route("/api/v1/reorg", post(chain::reorg))
+        .route("/api/v1/rollback", post(chain::rollback))
         .route(
             "/api/v1/mining/jobs",
             get(mining::latest_mining_job).post(mining::start_mining_job),

@@ -90,6 +90,10 @@ async fn api_error_logs_skip_expected_failures() {
             anyhow::Error::new(PaymentError::TreasuryExhausted),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+        (
+            anyhow::Error::new(PaymentError::ScanRequired),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
     ] {
         let error = error.context("payment could not complete");
         let (response, logs) = capture_logs(|| ApiError::from(error).into_response());
@@ -178,6 +182,14 @@ async fn request_parsing_errors_use_the_json_error_envelope() {
         (
             post_json("/api/v1/mine", r#"{"blocks":"valid UTF-8"}"#),
             "blocks must be between 1 and 10,000",
+        ),
+        (
+            post_json("/api/v1/reorg", r#"{"depth":"three"}"#),
+            "depth must be a whole number",
+        ),
+        (
+            post_json("/api/v1/rollback", r#"{"depth":"three"}"#),
+            "depth must be a whole number",
         ),
         (
             Request::builder()

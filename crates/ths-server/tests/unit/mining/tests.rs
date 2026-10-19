@@ -58,6 +58,65 @@ impl MiningRuntime for FakeRuntime {
     fn notify(&self, _topic: &'static str) {}
 }
 
+#[tokio::test]
+async fn chain_operation_excludes_new_mining_but_preserves_job_replays() {
+    let runtime = Arc::new(FakeRuntime::blocked());
+    let jobs = Arc::new(MiningCoordinator::new());
+    runtime.release(1);
+    let accepted = jobs
+        .start(runtime.clone(), 1, "before-reorg".into())
+        .await
+        .unwrap();
+    let id = accepted.job.id.clone();
+    terminal(accepted.updates).await;
+    let chain = jobs.chain_operations.write().await;
+    assert_eq!(
+        jobs.start(runtime.clone(), 1, "before-reorg".into())
+            .await
+            .unwrap()
+            .job
+            .id,
+        id
+    );
+    assert!(matches!(
+        jobs.start(runtime.clone(), 1, "during-reorg".into()).await,
+        Err(MiningAdmissionError::ChainBusy)
+    ));
+    assert_eq!(runtime.calls(), 1);
+    drop(chain);
+    runtime.release(1);
+    runtime.sync_permits.add_permits(1);
+    let next = jobs
+        .start(runtime.clone(), 1, "after-reorg".into())
+        .await
+        .unwrap();
+    terminal(next.updates).await;
+    assert_eq!(runtime.calls(), 2);
+}
+
+#[tokio::test]
+async fn mining_holds_chain_exclusion_through_wallet_synchronization() {
+    let runtime = Arc::new(FakeRuntime::blocked());
+    runtime.sync_permits.acquire().await.unwrap().forget();
+    runtime.release(1);
+    let jobs = Arc::new(MiningCoordinator::new());
+    let accepted = jobs
+        .start(runtime.clone(), 1, "sync-exclusion".into())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime.scans.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(jobs.chain_operations.try_write().is_err());
+    runtime.sync_permits.add_permits(1);
+    terminal(accepted.updates).await;
+    let _chain = jobs.chain_operations.write().await;
+}
+
 async fn terminal(mut updates: tokio::sync::watch::Receiver<MiningUpdate>) -> MiningUpdate {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
