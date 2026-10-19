@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { requestSchema, sendSchema } from './schemas';
+import { MINE_MAX_BLOCKS, MINE_MIN_BLOCKS, mineSchema, sendSchema } from './schemas';
 
 const base = {
   from_account: '1',
@@ -141,23 +141,63 @@ describe('sendSchema', () => {
   });
 });
 
-describe('requestSchema', () => {
-  const request = { account_id: '1', amount: '', memo: '' };
+const rangeMessage = `Enter between ${MINE_MIN_BLOCKS} and ${MINE_MAX_BLOCKS.toLocaleString()} blocks.`;
 
-  it('accepts a blank amount and the 21,000,000 ZEC supply', () => {
-    expect(requestSchema.safeParse(request).success).toBe(true);
-    const atSupply = requestSchema.safeParse({ ...request, amount: '21000000' });
-    expect(atSupply.success).toBe(true);
-    if (atSupply.success) expect(atSupply.data.amount).toBe(2_100_000_000_000_000n);
-  });
-
-  it('rejects an amount above the 21,000,000 ZEC supply', () => {
-    const result = requestSchema.safeParse({ ...request, amount: '21000001' });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      expect(result.error.issues.find((issue) => issue.path[0] === 'amount')?.message).toBe(
-        'Amount must not exceed 21,000,000 ZEC.',
-      );
+describe('mineSchema', () => {
+  it.each(['1', '10', '10000', '010', '00010000'])('accepts decimal whole number %s', (blocks) => {
+    const result = mineSchema.safeParse({ blocks });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.blocks).toBe(Number(blocks));
     }
   });
+
+  it.each([
+    '1e4',
+    '1E4',
+    '0x10',
+    '0X10',
+    '0b11',
+    '0B11',
+    '0o10',
+    '10.0',
+    '1.5',
+    '+10',
+    '-1',
+    ' 10',
+    '10 ',
+    '1_000',
+  ])('rejects non-decimal block count %s', (blocks) => {
+    const result = mineSchema.safeParse({ blocks });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toEqual([
+        expect.objectContaining({
+          message: 'Enter a whole number of blocks.',
+          path: ['blocks'],
+        }),
+      ]);
+    }
+  });
+
+  it('rejects an empty block count', () => {
+    const result = mineSchema.safeParse({ blocks: '' });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toBe('Enter a number of blocks.');
+      expect(result.error.issues[0]?.path).toEqual(['blocks']);
+    }
+  });
+
+  it.each(['0', '000', '10001', '9'.repeat(40)])(
+    'rejects out-of-range block count %s',
+    (blocks) => {
+      const result = mineSchema.safeParse({ blocks });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toBe(rangeMessage);
+        expect(result.error.issues[0]?.path).toEqual(['blocks']);
+      }
+    },
+  );
 });

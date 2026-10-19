@@ -80,7 +80,105 @@ pub(super) fn owned_resource(
         );
     }
     let details = docker.output(&[kind, "inspect", target])?;
-    inspected_resource_identity(kind, target, name, &details).map(Some)
+    match inspected_resource_identity(kind, target, name, &details) {
+        Ok(id) => Ok(Some(id)),
+        Err(error) if kind == "network" => {
+            match unlabeled_network_identity(docker, target, name, &details)? {
+                Some(id) => Ok(Some(id)),
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Releases up to v0.3.0 created the instance network without a label. Such a network still
+/// belongs to this instance when every container attached to it, running or stopped, carries
+/// the instance label; an unlabeled network with no attached containers, or with a foreign
+/// one, stays refused.
+fn unlabeled_network_identity(
+    docker: &impl DockerResourceCommands,
+    target: &str,
+    name: &InstanceName,
+    details: &str,
+) -> Result<Option<String>> {
+    let Some(id) = unlabeled_network_id(details) else {
+        return Ok(None);
+    };
+    match network_attachment(docker, target, name)? {
+        Attachment::Owned => Ok(Some(id)),
+        Attachment::Empty | Attachment::Foreign => Ok(None),
+    }
+}
+
+/// An unlabeled network whose ID the recovery journal already holds was adopted by an earlier
+/// cleanup that removed its containers first; the caller matches the recorded ID, so the
+/// attachment check only refuses a foreign container that joined since.
+pub(super) fn recorded_unlabeled_network_identity(
+    docker: &impl DockerResourceCommands,
+    target: &str,
+    name: &InstanceName,
+    details: &str,
+) -> Result<Option<String>> {
+    let Some(id) = unlabeled_network_id(details) else {
+        return Ok(None);
+    };
+    match network_attachment(docker, target, name)? {
+        Attachment::Empty | Attachment::Owned => Ok(Some(id)),
+        Attachment::Foreign => Ok(None),
+    }
+}
+
+fn unlabeled_network_id(details: &str) -> Option<String> {
+    let resources = serde_json::from_str::<serde_json::Value>(details).ok()?;
+    let network = resources.as_array()?.first()?;
+    if !network["Labels"][INSTANCE_LABEL].is_null() {
+        return None;
+    }
+    network["Id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+enum Attachment {
+    Empty,
+    Owned,
+    Foreign,
+}
+
+/// Containers attached to the network, running or stopped: `docker network inspect` lists
+/// only running ones.
+fn network_attachment(
+    docker: &impl DockerResourceCommands,
+    target: &str,
+    name: &InstanceName,
+) -> Result<Attachment> {
+    let attached = docker.output(&[
+        "container",
+        "ls",
+        "-a",
+        "--no-trunc",
+        "--filter",
+        &format!("network={target}"),
+        "--format",
+        "{{.ID}}",
+    ])?;
+    let attached: Vec<&str> = attached
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect();
+    if attached.is_empty() {
+        return Ok(Attachment::Empty);
+    }
+    for id in attached {
+        let container = docker.output(&["container", "inspect", id])?;
+        if inspected_resource_identity("container", id, name, &container).is_err() {
+            return Ok(Attachment::Foreign);
+        }
+    }
+    Ok(Attachment::Owned)
 }
 
 pub(super) fn mutation_failure(
@@ -263,6 +361,8 @@ pub(super) fn ensure_zakura(
             &format!("{prefix}-config:/config:ro"),
             "-e",
             "CONFIG_FILE_PATH=/config/zakurad.toml",
+            "-e",
+            "ZAKURA_STATE__CACHE_DIR=/data",
             ZAKURA_IMAGE,
             "zakurad",
             "start",
@@ -342,6 +442,7 @@ pub(super) fn ensure_app(
     let public_rpc = format!("http://127.0.0.1:{}", ports.rpc);
     let public_lightwalletd = format!("http://127.0.0.1:{}", ports.lightwalletd);
     let public_p2p = format!("127.0.0.1:{}", ports.p2p);
+    let public_dashboard = format!("http://127.0.0.1:{}", ports.dashboard);
     let dashboard_bind = loopback_publish(ports.dashboard, 8080);
     let image = app_image();
     let target = format!("{prefix}-app");
@@ -349,6 +450,7 @@ pub(super) fn ensure_app(
     let public_rpc_env = format!("THS_PUBLIC_ZAKURA_RPC={public_rpc}");
     let public_lightwalletd_env = format!("THS_PUBLIC_LIGHTWALLETD={public_lightwalletd}");
     let public_p2p_env = format!("THS_PUBLIC_P2P={public_p2p}");
+    let public_dashboard_env = format!("THS_PUBLIC_DASHBOARD={public_dashboard}");
     let id = create_container(
         &target,
         name,
@@ -380,6 +482,8 @@ pub(super) fn ensure_app(
             &public_lightwalletd_env,
             "-e",
             &public_p2p_env,
+            "-e",
+            &public_dashboard_env,
             "-v",
             &format!("{prefix}-wallet:/data"),
             &image,
@@ -511,36 +615,40 @@ pub(super) fn start_container(
 }
 
 pub(super) fn inspect_endpoints(prefix: &str) -> Result<Endpoints> {
+    inspect_endpoints_with(
+        &DockerCli,
+        &format!("{prefix}-app"),
+        &format!("{prefix}-zakura"),
+        &format!("{prefix}-lightwalletd"),
+    )
+}
+
+pub(super) fn inspect_endpoints_with(
+    docker: &impl DockerResourceCommands,
+    app: &str,
+    zakura: &str,
+    lightwalletd: &str,
+) -> Result<Endpoints> {
     Ok(Endpoints {
         dashboard: format!(
             "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-app"), "8080/tcp")?
+            published_port_with(docker, app, "8080/tcp")?
         ),
         rpc: format!(
             "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18232/tcp")?
+            published_port_with(docker, zakura, "18232/tcp")?
         ),
         lightwalletd: format!(
             "http://127.0.0.1:{}",
-            published_port(&format!("{prefix}-lightwalletd"), "9067/tcp")?
+            published_port_with(docker, lightwalletd, "9067/tcp")?
         ),
         p2p: format!(
             "127.0.0.1:{}",
-            published_port(&format!("{prefix}-zakura"), "18233/tcp")?
+            published_port_with(docker, zakura, "18233/tcp")?
         ),
         network: default_regtest(),
         tls: false,
     })
-}
-pub(super) fn published_port(container: &str, port: &str) -> Result<u16> {
-    docker_output([
-        "inspect",
-        "--format",
-        &format!("{{{{(index (index .NetworkSettings.Ports \"{port}\") 0).HostPort}}}}"),
-        container,
-    ])?
-    .parse()
-    .context("Docker returned an invalid published port")
 }
 /// Lists only running containers, so a stopped or missing one is `false` rather than an error.
 pub(crate) fn container_running(name: &str) -> Result<bool> {
