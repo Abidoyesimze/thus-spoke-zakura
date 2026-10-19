@@ -212,7 +212,7 @@ impl Drop for Fixture {
 fn respond_ready(mut stream: TcpStream) {
     let mut request = [0; 2048];
     let _ = stream.read(&mut request);
-    let body = r#"{"result":"test-tip"}"#;
+    let body = r#"{"result":"test-tip","node_height":1,"lightwalletd_height":1,"wallet_scanned_height":1,"wallet_sync_state":"ready","settled":true,"settlement_blocker":null}"#;
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -243,6 +243,15 @@ fn output_after_shutdown(
     deleted_elsewhere: bool,
 ) -> (bool, String, String, String, u16) {
     let fixture = Fixture::new();
+    output_after_shutdown_with(&fixture, json, fail_init, deleted_elsewhere)
+}
+
+fn output_after_shutdown_with(
+    fixture: &Fixture,
+    json: bool,
+    fail_init: bool,
+    deleted_elsewhere: bool,
+) -> (bool, String, String, String, u16) {
     let mut child = fixture.start(json, fail_init, deleted_elsewhere);
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -315,6 +324,67 @@ fn output_after_shutdown(
     )
 }
 
+fn assert_repeated_cleanup_reports_missing(fixture: &Fixture) {
+    let owner = format!("{}.owner", fixture.name);
+    assert!(
+        contains_file_named(fixture.directory.path(), &owner),
+        "startup did not leave the historical owner token"
+    );
+
+    for arguments in [
+        vec!["--name", &fixture.name, "stop"],
+        vec!["--name", &fixture.name, "reset", "--force"],
+    ] {
+        let output = fixture.command().args(arguments).output().unwrap();
+
+        assert!(!output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains(&format!("environment {} does not exist", fixture.name)),
+            "{stderr}"
+        );
+        assert!(!stdout.contains("Deleted"), "{stdout}");
+        assert!(!stdout.contains("Stopped and deleted"), "{stdout}");
+    }
+}
+
+fn contains_file_named(directory: &std::path::Path, name: &str) -> bool {
+    fs::read_dir(directory).is_ok_and(|entries| {
+        entries.filter_map(Result::ok).any(|entry| {
+            entry.file_name() == name
+                || (entry.path().is_dir() && contains_file_named(&entry.path(), name))
+        })
+    })
+}
+
+#[test]
+fn run_advertises_allocated_service_ports_to_the_app() {
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command()
+        .args(["--name", &fixture.name, "run", "--", "true"])
+        .spawn()
+        .unwrap();
+    let success = finish(&mut child).success();
+    let output = child.wait_with_output().unwrap();
+    assert!(success, "{}", String::from_utf8_lossy(&output.stderr));
+    let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
+    let app = commands
+        .lines()
+        .find(|line| line.starts_with(&format!("create --name ths-{}-app ", fixture.name)))
+        .unwrap();
+    let port = 18_232 + fixture.port_offset;
+    for expected in [
+        format!("THS_PUBLIC_ZAKURA_RPC=http://127.0.0.1:{port}"),
+        format!("THS_PUBLIC_LIGHTWALLETD=http://127.0.0.1:{port}"),
+        format!("THS_PUBLIC_P2P=127.0.0.1:{port}"),
+    ] {
+        assert!(app.contains(&expected), "missing {expected}: {app}");
+    }
+    assert!(app.contains("-p 127.0.0.1::8080"));
+}
+
 #[test]
 fn json_start_stdout_is_one_document_after_interrupt_and_cleanup() {
     let (success, stdout, stderr, commands, port_offset) =
@@ -359,6 +429,24 @@ fn json_start_failure_keeps_stdout_empty_through_partial_cleanup() {
 }
 
 #[test]
+fn repeated_cleanup_after_successful_shutdown_reports_missing() {
+    let fixture = Fixture::new();
+    let (success, _, stderr, _, _) = output_after_shutdown_with(&fixture, false, false, false);
+    assert!(success, "{stderr}");
+
+    assert_repeated_cleanup_reports_missing(&fixture);
+}
+
+#[test]
+fn repeated_cleanup_after_early_startup_failure_reports_missing() {
+    let fixture = Fixture::new();
+    let (success, _, _, _, _) = output_after_shutdown_with(&fixture, false, true, false);
+    assert!(!success);
+
+    assert_repeated_cleanup_reports_missing(&fixture);
+}
+
+#[test]
 fn human_start_keeps_lifecycle_and_docker_output_on_stdout() {
     let (success, stdout, stderr, _, _) = output_after_shutdown(false, false, false);
     assert!(success, "{stderr}");
@@ -379,6 +467,169 @@ fn human_start_keeps_lifecycle_and_docker_output_on_stdout() {
     assert_eq!(stdout.matches("Docker test-docker").count(), 1);
     assert!(stderr.contains("init diagnostic"));
     assert!(!stderr.contains("Preparing a fresh"));
+}
+
+#[test]
+fn status_matches_list_and_fails_when_a_service_has_stopped() {
+    let fixture = Fixture::new();
+    let mut child = fixture.start(false, false, false);
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (ready_sender, ready_receiver) = mpsc::channel();
+    let stdout_thread = thread::spawn(move || {
+        let mut output = String::new();
+        for line in BufReader::new(stdout).lines() {
+            let line = line.unwrap();
+            if line.contains("is ready") {
+                let _ = ready_sender.send(());
+            }
+            output.push_str(&line);
+            output.push('\n');
+        }
+        output
+    });
+    let stderr_thread = thread::spawn(move || std::io::read_to_string(stderr).unwrap());
+    assert!(
+        ready_receiver.recv_timeout(Duration::from_secs(20)).is_ok(),
+        "launcher did not become ready"
+    );
+
+    let healthy = fixture
+        .command()
+        .args(["--name", &fixture.name, "status"])
+        .output()
+        .unwrap();
+    assert!(healthy.status.success());
+    assert!(
+        String::from_utf8(healthy.stdout)
+            .unwrap()
+            .starts_with(&format!("{}: running\n", fixture.name))
+    );
+
+    let degraded_human = fixture
+        .command()
+        .args(["--name", &fixture.name, "status"])
+        .env("THS_TEST_EXITED_SERVICE", "zakura")
+        .output()
+        .unwrap();
+    assert!(!degraded_human.status.success());
+    assert!(degraded_human.stderr.is_empty());
+    assert!(
+        String::from_utf8(degraded_human.stdout)
+            .unwrap()
+            .starts_with(&format!("{}: degraded\n", fixture.name))
+    );
+
+    let degraded = fixture
+        .command()
+        .args(["--json", "--name", &fixture.name, "status"])
+        .env("THS_TEST_EXITED_SERVICE", "zakura")
+        .output()
+        .unwrap();
+    assert!(!degraded.status.success());
+    assert!(degraded.stderr.is_empty());
+    let degraded: serde_json::Value = serde_json::from_slice(&degraded.stdout).unwrap();
+    assert_eq!(degraded["running"], false);
+    assert_eq!(degraded["state"], "degraded");
+    assert_eq!(degraded["containers"][1]["service"], "zakura");
+    assert_eq!(degraded["containers"][1]["state"], "exited");
+
+    let listed = fixture
+        .command()
+        .args(["--json", "list"])
+        .env("THS_TEST_EXITED_SERVICE", "zakura")
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(degraded["state"], listed[0]["state"]);
+
+    let stopped = fixture
+        .command()
+        .args(["--name", &fixture.name, "stop"])
+        .output()
+        .unwrap();
+    assert!(
+        stopped.status.success(),
+        "ths stop failed: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(finish(&mut child).success());
+    stdout_thread.join().unwrap();
+    let stderr = stderr_thread.join().unwrap();
+    assert!(stderr.contains("init diagnostic"));
+}
+
+#[test]
+fn status_rejects_an_unknown_environment_without_a_raw_docker_error() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .command()
+        .args(["--name", "ghost", "status"])
+        .env("THS_TEST_MISSING_INSPECT", "1")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("environment ghost is not running"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no such object"), "{stderr}");
+}
+
+#[test]
+fn status_rejects_an_unrecorded_environment_with_only_a_foreign_container() {
+    let fixture = Fixture::new();
+    let containers = fixture.directory.path().join("state/container");
+    fs::create_dir_all(&containers).unwrap();
+    fs::write(containers.join("ths-ghost-app"), "").unwrap();
+
+    let output = fixture
+        .command()
+        .args(["--name", "ghost", "status"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("environment ghost is not running"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("no such object"), "{stderr}");
+
+    let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
+    assert!(
+        !commands
+            .lines()
+            .any(|command| command.starts_with("inspect --format")),
+        "{commands}"
+    );
+}
+
+#[test]
+fn cleanup_commands_reject_an_unknown_environment() {
+    let fixture = Fixture::new();
+    for arguments in [
+        vec!["--name", "ghost", "stop"],
+        vec!["--name", "ghost", "reset", "--force"],
+    ] {
+        let output = fixture.command().args(arguments).output().unwrap();
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("environment ghost does not exist"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("Stopped and deleted"), "{stderr}");
+        assert!(!stderr.contains("Deleted ghost"), "{stderr}");
+    }
 }
 
 #[test]
