@@ -4,6 +4,14 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
 
 ## Unreleased
 
+- **Deletion notices survive shutdown polling:** A polling shutdown check could
+  consume a queued "another command deleted this environment" notice and
+  discard it, and `wait_timeout` reported such a notice as an interruption.
+  Deletion is now latched separately from Ctrl+C, so the reason survives any
+  caller that has already read it. No caller can reach this today; it removes a
+  latent hazard for future ones.
+  [#305](https://github.com/zcashlabs/thus-spoke-zakura/issues/305)
+
 ## v0.4.0
 
 ![Thus Spoke Zakura v0.4.0 release artwork](assets/images/release-v0.4.0.png)
