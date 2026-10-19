@@ -15,15 +15,6 @@ use std::{
     time::Duration,
 };
 
-// `ths run` has no port offset, so a fixture that reaches allocation needs the default ports.
-const DEFAULT_PORTS: [u16; 4] = [32_805, 18_232, 18_233, 9_067];
-
-fn default_ports_free() -> bool {
-    DEFAULT_PORTS
-        .iter()
-        .all(|port| TcpListener::bind(("127.0.0.1", *port)).is_ok())
-}
-
 fn install_fixtures(directory: &Path) {
     for (file, script) in [
         ("docker", include_str!("fixtures/docker.sh")),
@@ -96,10 +87,9 @@ fn run_preflight_failure_keeps_stdout_empty() {
 
 #[test]
 fn run_leaves_stdout_to_the_child() {
-    if !default_ports_free() {
-        eprintln!("skipping: the default ths ports are in use on this host");
-        return;
-    }
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
     let directory = tempfile::tempdir().unwrap();
     install_fixtures(directory.path());
     let name = format!("run-{}", uuid::Uuid::new_v4().simple());
@@ -107,7 +97,7 @@ fn run_leaves_stdout_to_the_child() {
     let stop_server = Arc::new(AtomicBool::new(false));
     let server_stop = Arc::clone(&stop_server);
     let server = thread::spawn(move || {
-        // Bind only after init, as the real services would, so startup's port check passes.
+        // Answer readiness probes after init, as the real services would.
         while !server_stop.load(Ordering::Relaxed)
             && !fs::read_to_string(&commands_path)
                 .is_ok_and(|commands| commands.contains("start -a"))
@@ -117,25 +107,16 @@ fn run_leaves_stdout_to_the_child() {
         if server_stop.load(Ordering::Relaxed) {
             return;
         }
-        let listeners = [
-            TcpListener::bind(("127.0.0.1", 18_232)).unwrap(),
-            TcpListener::bind(("127.0.0.1", 32_805)).unwrap(),
-        ];
-        for listener in &listeners {
-            listener.set_nonblocking(true).unwrap();
-        }
         while !server_stop.load(Ordering::Relaxed) {
             let mut accepted = false;
-            for listener in &listeners {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        accepted = true;
-                        stream.set_nonblocking(false).unwrap();
-                        respond(stream);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(error) => panic!("readiness fixture server failed: {error}"),
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accepted = true;
+                    stream.set_nonblocking(false).unwrap();
+                    respond(stream);
                 }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("readiness fixture server failed: {error}"),
             }
             if !accepted {
                 thread::sleep(Duration::from_millis(5));
@@ -144,6 +125,7 @@ fn run_leaves_stdout_to_the_child() {
     });
 
     let output = run_command(directory.path(), &name)
+        .env("THS_TEST_PORT", port.to_string())
         .args(["printf", "CHILD\\n"])
         .output()
         .unwrap();
