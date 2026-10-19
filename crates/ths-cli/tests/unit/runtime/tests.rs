@@ -99,6 +99,16 @@ impl DockerResourceCommands for RecordingDocker {
         };
         match args {
             ["container", "ls", "-a", "--format", "{{.Names}}"] => Ok(listed(&self.containers)),
+            [
+                "container",
+                "ls",
+                "-a",
+                "--no-trunc",
+                "--filter",
+                _,
+                "--format",
+                "{{.ID}}",
+            ] => Ok(String::new()),
             ["volume", "ls", "--format", "{{.Name}}"] => Ok(listed(&self.volumes)),
             ["network", "ls", "--format", "{{.Name}}"] => Ok(listed(&self.networks)),
             [kind, "inspect", target] => {
@@ -153,6 +163,7 @@ struct RecordingHost {
     allocate_delay: Duration,
     ready_delay: Duration,
     run_status: Option<RuntimeStatus>,
+    allocated_offsets: Mutex<Vec<Option<u16>>>,
     while_running: Option<Box<dyn Fn() -> Ended>>,
     real_child: bool,
     stopping_seen: Arc<AtomicBool>,
@@ -175,6 +186,7 @@ impl RecordingHost {
                 allocate_delay: Duration::ZERO,
                 ready_delay: Duration::ZERO,
                 run_status: None,
+                allocated_offsets: Mutex::new(Vec::new()),
                 while_running: None,
                 real_child: false,
                 stopping_seen: Arc::new(AtomicBool::new(false)),
@@ -211,6 +223,7 @@ fn verified_report() -> CleanupReport {
         failures: Vec::new(),
         recovery_path: None,
         helpers_finished: true,
+        environment_found: true,
     }
 }
 
@@ -284,6 +297,7 @@ impl StartHost for RecordingHost {
                 failures: vec![message.clone()],
                 recovery_path: Some(runtime.recovery_path(name)),
                 helpers_finished: true,
+                environment_found: true,
             });
         }
         Ok(verified_report())
@@ -317,11 +331,12 @@ impl StartHost for RecordingHost {
         _runtime: &Runtime,
         name: &InstanceName,
         shutdown: &Shutdown,
-        _port_offset: u16,
+        port_offset: Option<u16>,
         _context: &LifecycleContext,
         _journal: &mut recovery::RecoveryJournal,
     ) -> Result<AllocatedInstance> {
         self.push(&format!("allocate:{name}"));
+        self.allocated_offsets.lock().unwrap().push(port_offset);
         std::thread::sleep(self.allocate_delay);
         shutdown.check()?;
         Ok(AllocatedInstance {
