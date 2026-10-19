@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { accountSchema, miningJobSchema, miningJobResponseSchema, statusSchema } from './schemas';
+import {
+  accountSchema,
+  activitySchema,
+  miningJobSchema,
+  miningJobResponseSchema,
+  statusSchema,
+} from './schemas';
 
 const baseStatus = {
   instance: 'default',
@@ -29,6 +35,17 @@ describe('statusSchema', () => {
   it('remains compatible with servers that predate wallet status', () => {
     expect(statusSchema.parse(baseStatus).wallet_sync).toBeUndefined();
   });
+
+  it('retains settlement status and blocker from the server', () => {
+    const status = statusSchema.parse({
+      ...baseStatus,
+      settled: false,
+      settlement_blocker: 'wallet_behind',
+    });
+
+    expect(status.settled).toBe(false);
+    expect(status.settlement_blocker).toBe('wallet_behind');
+  });
 });
 
 describe('accountSchema', () => {
@@ -54,6 +71,147 @@ describe('accountSchema', () => {
     const account = accountSchema.parse(legacyAccount);
     expect(account.unified_full_viewing_key).toBeUndefined();
     expect(account.transparent_zatoshi).toBe(123n);
+  });
+});
+
+describe('activitySchema', () => {
+  it('rejects unknown activity kinds instead of treating them as sends', () => {
+    const result = activitySchema.safeParse({
+      id: 'wallet:unknown-kind',
+      kind: 'receive',
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
+      amount_zatoshi: 1,
+      txid: 'ab'.repeat(32),
+      status: 'confirmed',
+      created_at: '2026-10-10 00:00:00',
+    });
+
+    expect(result.success).toBe(false);
+  });
+
+  it('preserves every recipient address returned for a transaction', () => {
+    const activity = activitySchema.parse({
+      id: 'wallet:multi-recipient',
+      kind: 'transaction',
+      direction: 'outgoing',
+      from_account: 1,
+      to_account: null,
+      to_address: 'uregtest1external1',
+      recipient_addresses: ['uregtest1external1', 'uregtest1external2'],
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
+      amount_zatoshi: 100_000_000,
+      txid: 'ab'.repeat(32),
+      block_hash: null,
+      status: 'confirmed',
+      last_error: null,
+      created_at: '2026-10-15 12:00:00',
+    });
+
+    expect(activity.recipient_addresses).toEqual(['uregtest1external1', 'uregtest1external2']);
+  });
+
+  it('preserves every known source and destination pool', () => {
+    const activity = activitySchema.parse({
+      id: 'wallet:multi-pool',
+      kind: 'transaction',
+      direction: 'internal',
+      from_account: 1,
+      to_account: 2,
+      to_address: null,
+      source_pool: null,
+      destination_pool: null,
+      source_pools: ['ironwood', 'transparent'],
+      destination_pools: ['ironwood', 'transparent'],
+      amount_zatoshi: 100_000_000,
+      received_zatoshi: 90_000_000,
+      spent_zatoshi: 200_000_000,
+      net_zatoshi: -110_000_000,
+      txid: 'ab'.repeat(32),
+      block_hash: null,
+      status: 'confirmed',
+      last_error: null,
+      created_at: '2026-10-15 12:00:00',
+    });
+
+    expect(activity.source_pools).toEqual(['ironwood', 'transparent']);
+    expect(activity.destination_pools).toEqual(['ironwood', 'transparent']);
+    expect(activity.received_zatoshi).toBe(90_000_000n);
+    expect(activity.spent_zatoshi).toBe(200_000_000n);
+    expect(activity.net_zatoshi).toBe(-110_000_000n);
+  });
+
+  it('uses null value effects when canonical wallet data is unavailable', () => {
+    const activity = activitySchema.parse({
+      id: 'pending-send',
+      kind: 'send',
+      from_account: 1,
+      to_account: 2,
+      source_pool: 'ironwood',
+      destination_pool: 'ironwood',
+      amount_zatoshi: 100_000_000,
+      received_zatoshi: null,
+      spent_zatoshi: null,
+      net_zatoshi: null,
+      txid: '',
+      status: 'preparing',
+      created_at: '2026-10-15 12:00:00',
+    });
+
+    expect(activity.received_zatoshi).toBeNull();
+    expect(activity.spent_zatoshi).toBeNull();
+    expect(activity.net_zatoshi).toBeNull();
+  });
+
+  it('accepts an incoming transaction whose sender creation time is unknown', () => {
+    const activity = activitySchema.parse({
+      id: 'wallet:incoming',
+      kind: 'transaction',
+      direction: 'incoming',
+      from_account: null,
+      to_account: null,
+      from_accounts: [],
+      to_accounts: [2, 3],
+      to_address: null,
+      recipient_addresses: ['uregtest1account2'],
+      source_pool: null,
+      destination_pool: 'ironwood',
+      amount_zatoshi: 10_000_000,
+      txid: 'cd'.repeat(32),
+      block_hash: 'ef'.repeat(32),
+      mined_height: 121,
+      status: 'confirmed',
+      last_error: null,
+      created_at: null,
+    });
+
+    expect(activity.created_at).toBeNull();
+    expect(activity.mined_height).toBe(121);
+    expect(activity.to_accounts).toEqual([2, 3]);
+  });
+
+  it('rejects the hidden treasury account in affected account lists', () => {
+    expect(() =>
+      activitySchema.parse({
+        id: 'wallet:treasury',
+        kind: 'transaction',
+        direction: 'incoming',
+        from_account: null,
+        to_account: null,
+        from_accounts: [],
+        to_accounts: [2, 6],
+        to_address: null,
+        source_pool: null,
+        destination_pool: 'ironwood',
+        amount_zatoshi: 10,
+        txid: 'ab'.repeat(32),
+        block_hash: null,
+        status: 'confirmed',
+        last_error: null,
+        created_at: null,
+      }),
+    ).toThrow();
   });
 });
 

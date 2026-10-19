@@ -29,9 +29,10 @@ ths --name alice endpoints --json
 ths --name alice logs app
 ```
 
-Omit `--name alice` for `default`. `ths status` reports whether the app
-container is running; it does **not** show the node height. The Network
-page and `GET /api/v1/status` show node height and wallet sync status.
+Omit `--name alice` for `default`. `ths status` reports the combined app,
+Zakura, and lightwalletd container state; it does **not** show the node height
+or wallet settlement. Use `ths wait` for settlement. The Network page and
+`GET /api/v1/status` show node height and wallet sync status.
 An instance keeps the same ports across runs; a different instance has
 different ports only because it was started with a different
 `--port-offset`.
@@ -83,8 +84,9 @@ last request succeeded.
 
 No matching record does not prove nothing happened. External faucet records
 remain separate from account activity. Local reads do not progress payments;
-accepted payments, including external faucets, can progress in the background. Check chain state by txid where
-available and balances through the accounts snapshot.
+accepted payments, including external faucets, can progress in the background.
+Check chain state by txid where available and balances through the accounts
+snapshot.
 `confirmed` activity and `status.settled` answer different questions: inclusion
 observed by the server and full node/index/wallet alignment, respectively.
 See [Chapter 6](architecture/operations.md#decide-what-to-do-after-a-lost-response)
@@ -106,8 +108,9 @@ and any remaining `instance.json` at the path reported by the launcher.
 Restore Docker connectivity, then retry `ths --name alice reset --force`
 for that same instance. Do not delete recovery files by hand, retry an
 unknown create, or prune shared Docker resources. Recovery validates recorded
-allocation identities; it does not adopt a same-name replacement or coordinate
-concurrent launcher sessions.
+allocation identities; it does not adopt a same-name replacement or remove
+resources from another instance. If the original container cannot be identified,
+the launcher keeps its recovery state rather than risking another container.
 
 This environment is Regtest only. Its seed is fixed and public, so these
 addresses and keys are known to anyone who has read the project. Never use

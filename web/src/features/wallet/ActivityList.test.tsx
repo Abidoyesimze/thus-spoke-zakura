@@ -58,6 +58,135 @@ describe('ActivityList same-account transfers', () => {
   });
 });
 
+describe('ActivityList incoming transactions', () => {
+  it('renders an external payment to its affected development account', () => {
+    const txid = 'ef'.repeat(32);
+    renderWithProviders(
+      <MemoryRouter>
+        <ActivityList
+          activity={{
+            isPending: false,
+            isError: false,
+            error: null,
+            data: [
+              {
+                id: 'wallet-incoming-2',
+                kind: 'transaction',
+                direction: 'incoming',
+                from_account: null,
+                to_account: 2,
+                to_address: null,
+                source_pool: null,
+                destination_pool: 'ironwood',
+                amount_zatoshi: 100_000_000n,
+                txid,
+                block_hash: 'cd'.repeat(32),
+                mined_height: 121,
+                status: 'confirmed',
+                last_error: null,
+                created_at: null,
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    const link = screen.getByRole('link', { name: 'External → Account 2' });
+    expect(link).toHaveAttribute('href', `/explorer/tx/${txid}`);
+    const row = link.closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText('unknown')).toBeInTheDocument();
+    expect(within(row!).getByText('ironwood')).toBeInTheDocument();
+    expect(within(row!).getByText('Block 121')).toBeInTheDocument();
+  });
+
+  it('renders every affected development account', () => {
+    const txid = 'ac'.repeat(32);
+    renderWithProviders(
+      <MemoryRouter>
+        <ActivityList
+          activity={{
+            isPending: false,
+            isError: false,
+            error: null,
+            data: [
+              {
+                id: 'wallet-incoming-multi',
+                kind: 'transaction',
+                direction: 'incoming',
+                from_account: null,
+                to_account: null,
+                from_accounts: [],
+                to_accounts: [2, 3],
+                to_address: null,
+                source_pool: null,
+                destination_pool: 'ironwood',
+                amount_zatoshi: 300_000_000n,
+                txid,
+                block_hash: 'cd'.repeat(32),
+                mined_height: 121,
+                status: 'confirmed',
+                last_error: null,
+                created_at: null,
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'External → Accounts 2, 3' })).toHaveAttribute(
+      'href',
+      `/explorer/tx/${txid}`,
+    );
+  });
+});
+
+describe('ActivityList multi-pool transactions', () => {
+  it('uses the known pool arrays when no singular pool is available', () => {
+    const txid = 'bd'.repeat(32);
+    renderWithProviders(
+      <MemoryRouter>
+        <ActivityList
+          activity={{
+            isPending: false,
+            isError: false,
+            error: null,
+            data: [
+              {
+                id: 'wallet-multi-pool',
+                kind: 'transaction',
+                direction: 'internal',
+                from_account: 1,
+                to_account: 2,
+                to_address: null,
+                source_pool: null,
+                destination_pool: null,
+                source_pools: ['ironwood'],
+                destination_pools: ['ironwood', 'transparent'],
+                amount_zatoshi: 100_000_000n,
+                txid,
+                block_hash: 'cd'.repeat(32),
+                mined_height: 121,
+                status: 'confirmed',
+                last_error: null,
+                created_at: null,
+              },
+            ],
+          }}
+        />
+      </MemoryRouter>,
+    );
+
+    const row = screen.getByRole('link', { name: 'Account 1 → Account 2' }).closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row!).getByText('ironwood')).toBeInTheDocument();
+    expect(within(row!).getByText('ironwood, transparent')).toBeInTheDocument();
+    expect(within(row!).queryByText('unknown')).not.toBeInTheDocument();
+  });
+});
+
 describe('ActivityList error state', () => {
   it("preserves an ApiError's own message", () => {
     renderError(new ApiError(404, 'activity not found'));
@@ -71,7 +200,7 @@ describe('ActivityList error state', () => {
 });
 
 describe('ActivityList clock', () => {
-  it('updates idle ages without fetching and clears its timer on unmount', () => {
+  it('updates idle ages beside unknown timestamps without fetching and clears its timer on unmount', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-10-15T12:00:00Z'));
     const fetch = vi.spyOn(globalThis, 'fetch');
@@ -99,6 +228,23 @@ describe('ActivityList clock', () => {
                   last_error: null,
                   created_at: '2026-10-15 12:00:00',
                 },
+                ...[121, null].map((height) => ({
+                  id: `unknown-${height}`,
+                  kind: 'transaction' as const,
+                  direction: 'incoming' as const,
+                  from_account: null,
+                  to_account: 2,
+                  to_address: null,
+                  source_pool: null,
+                  destination_pool: 'ironwood' as const,
+                  amount_zatoshi: 100_000n,
+                  txid: '',
+                  block_hash: null,
+                  mined_height: height,
+                  status: 'confirmed' as const,
+                  last_error: null,
+                  created_at: null,
+                })),
               ],
             }}
           />
@@ -107,12 +253,18 @@ describe('ActivityList clock', () => {
       const time = container.querySelector('time')!;
       const title = time.title;
       expect(time).toHaveTextContent('just now');
-      act(() => vi.advanceTimersByTime(10_000));
+      expect(screen.getByText('Block 121')).toBeInTheDocument();
+      expect(screen.getByLabelText('Time unknown')).toBeInTheDocument();
+      expect(container.querySelectorAll('time')).toHaveLength(1);
+      await act(() => vi.advanceTimersByTime(10_000));
       expect(time).toHaveTextContent('10 seconds ago');
-      act(() => vi.advanceTimersByTime(60_000));
+      await act(() => vi.advanceTimersByTime(60_000));
       expect(time).toHaveTextContent('1 minute ago');
       expect(time).toHaveAttribute('datetime', '2026-10-15 12:00:00');
       expect(time.title).toBe(title);
+      expect(screen.getByText('Block 121')).toBeInTheDocument();
+      expect(screen.getByLabelText('Time unknown')).toBeInTheDocument();
+      expect(container.querySelectorAll('time')).toHaveLength(1);
       expect(fetch).not.toHaveBeenCalled();
       unmount();
       // Flush unrelated provider cleanup before checking for a recurring timer.
