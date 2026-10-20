@@ -197,6 +197,45 @@ pub(super) fn mutation_failure(
     }
 }
 
+pub(super) fn process_listing() -> Command {
+    let mut command = Command::new("ps");
+    command.args(["-A", "-o", "args="]).env_remove("COLUMNS");
+    command
+}
+
+pub(super) fn create_running(
+    context: &LifecycleContext,
+    deadline: Deadline,
+    kind: &str,
+    target: &str,
+    name: &InstanceName,
+) -> Result<bool> {
+    let listing = run(
+        &mut process_listing(),
+        deadline.clipped(context.policy.startup_docker),
+        Cancellation::Ignore,
+        OutputMode::Capture,
+        &context.policy,
+        &mut context.helpers.borrow_mut(),
+    )
+    .map_err(|error| anyhow!("{error}"))?;
+    if listing.stdout_truncated {
+        bail!(
+            "the process listing exceeded {} bytes",
+            context.policy.machine_output_limit
+        );
+    }
+    let label = label(name);
+    let create = [kind, "create", "--label", label.as_str(), target];
+    Ok(String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .any(|line| {
+            line.split_whitespace()
+                .collect::<Vec<_>>()
+                .ends_with(&create)
+        }))
+}
+
 pub(super) fn ensure_network_with(
     prefix: &str,
     name: &InstanceName,
@@ -222,7 +261,7 @@ pub(super) fn ensure_network_with(
             Vec::new(),
             recovery::MutationOperation::Create,
         )?;
-        if let Err(error) = docker.run(&["network", "create", "--label", &label(name), prefix]) {
+        if let Err(error) = docker.create(&["network", "create", "--label", &label(name), prefix]) {
             return Err(mutation_failure(journal, index, error, None));
         }
         match owned_resource(docker, "network", prefix, name)? {
@@ -271,7 +310,7 @@ pub(super) fn ensure_volume_with(
             Vec::new(),
             recovery::MutationOperation::Create,
         )?;
-        if let Err(error) = docker.run(&["volume", "create", "--label", &label(name), volume]) {
+        if let Err(error) = docker.create(&["volume", "create", "--label", &label(name), volume]) {
             return Err(mutation_failure(journal, index, error, None));
         }
         match owned_resource(docker, "volume", volume, name)? {
