@@ -343,6 +343,97 @@ fn shutdown_wait_keeps_a_deletion_notice_that_arrived_first() {
     assert!(shutdown.try_interrupted());
 }
 
+/// A polling caller must not swallow a deletion notice. It cannot put the
+/// message back on the channel, so `wait` reads the latched reason instead.
+#[test]
+fn try_interrupted_preserves_a_queued_deletion_notice_for_wait() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+
+    assert!(!shutdown.try_interrupted());
+    assert!(
+        shutdown.deleted_elsewhere(),
+        "the deletion notice was lost to a polling caller"
+    );
+}
+
+/// Polling repeatedly before `wait` must not change the outcome either.
+#[test]
+fn repeated_polling_keeps_a_deletion_notice_for_wait() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+
+    for _ in 0..3 {
+        assert!(shutdown.check().is_ok());
+    }
+    assert!(
+        shutdown.deleted_elsewhere(),
+        "repeated polling dropped the deletion notice"
+    );
+    assert!(!shutdown.try_interrupted());
+}
+
+/// `wait` must still end with the deletion reason after a polling caller has
+/// taken the message. The trailing signal keeps this bounded: a `wait` that
+/// lost the notice would consume it and return the wrong reason rather than
+/// blocking forever, so a regression fails instead of hanging.
+#[test]
+fn wait_reports_a_deletion_that_polling_already_observed() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+    assert!(!shutdown.try_interrupted());
+    sender.send(Ended::Interrupted).unwrap();
+
+    assert_eq!(shutdown.wait().unwrap(), Ended::DeletedElsewhere);
+}
+
+/// `wait_timeout` must not report a deletion as an interruption: that would
+/// latch the interrupted flag and make the two indistinguishable afterwards.
+#[test]
+fn wait_timeout_reports_a_deletion_as_a_deletion() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+
+    let message = shutdown
+        .wait_timeout(Duration::from_secs(2))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !message.contains("interrupted"),
+        "a deletion was reported as an interruption: {message}"
+    );
+    assert!(message.contains("deleted by another command"), "{message}");
+    assert!(
+        !shutdown.try_interrupted(),
+        "a deletion latched the interrupted flag"
+    );
+}
+
+/// A genuine signal must still be reported as an interruption on both paths.
+#[test]
+fn both_polling_paths_still_report_a_genuine_signal_as_interrupted() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::Interrupted).unwrap();
+    let message = shutdown
+        .wait_timeout(Duration::from_secs(2))
+        .unwrap_err()
+        .to_string();
+    assert!(message.to_string().contains("interrupted"), "{message}");
+    assert!(shutdown.try_interrupted());
+}
+
+/// The two reasons must stay independent: a deletion does not mask a later
+/// signal, and neither one is reported as the other.
+#[test]
+fn a_deletion_latch_does_not_mask_a_later_signal() {
+    let (sender, shutdown) = Shutdown::channel();
+    sender.send(Ended::DeletedElsewhere).unwrap();
+    assert!(!shutdown.try_interrupted());
+    sender.send(Ended::Interrupted).unwrap();
+    assert!(shutdown.try_interrupted());
+    assert_eq!(shutdown.wait().unwrap(), Ended::Interrupted);
+}
+
 fn metadata_snapshot(dir: &Path) -> Vec<(OsString, Vec<u8>)> {
     let mut entries = fs::read_dir(dir)
         .unwrap()
