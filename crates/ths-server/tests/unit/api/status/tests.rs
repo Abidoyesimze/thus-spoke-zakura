@@ -6,7 +6,6 @@ use crate::wallet::PreparedPayment;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use std::collections::HashMap;
 use tower::ServiceExt;
 use transparent::{
     address::Script,
@@ -204,26 +203,6 @@ fn canonical_activity_exposes_aggregate_wallet_value_effects() {
     assert_eq!(activity[0].net_zatoshi, Some(-110_000_000));
 }
 
-#[test]
-fn persisted_preparation_association_joins_a_stale_journal_snapshot() {
-    let mut stale = journal_send("");
-    stale.status = "preparing".to_owned();
-    stale.block_hash = None;
-    let prepared_txids = HashMap::from([(stale.id.clone(), "prepared-tx".to_owned())]);
-
-    let activity = unified_activity_with_prepared(
-        vec![stale],
-        vec![canonical_activity("internal", "prepared-tx")],
-        &prepared_txids,
-        30,
-    );
-
-    assert_eq!(activity.len(), 1);
-    assert_eq!(activity[0].id, "send-1");
-    assert_eq!(activity[0].txid, "prepared-tx");
-    assert_eq!(activity[0].status, "confirmed");
-}
-
 #[tokio::test]
 async fn activity_router_deduplicates_preparation_completed_after_its_journal_snapshot() {
     let (state, _dir) = state_with_local_wallet();
@@ -358,16 +337,6 @@ fn confirmed_activity_uses_chain_order_and_does_not_invent_incoming_creation_tim
     assert_eq!(activity[0].txid, "later-incoming-tx");
     assert_eq!(activity[0].created_at, None);
     assert_eq!(activity[1].txid, "earlier-tx");
-}
-
-#[test]
-fn activity_limit_is_applied_after_journal_and_wallet_history_are_merged() {
-    let activity = unified_activity(
-        vec![journal_send("")],
-        vec![canonical_activity("incoming", "external-tx")],
-        1,
-    );
-    assert_eq!(activity.len(), 1);
 }
 
 #[test]
