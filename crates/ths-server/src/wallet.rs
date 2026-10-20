@@ -20,6 +20,7 @@ use zcash_client_backend::{
         Account as _, AccountBirthday, CoinbaseFilter, InputSource, MaxSpendMode, TargetValue,
         WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{BlockSource, ChainState, CommitmentTreeRoot, error, scan_cached_blocks},
+        enhance_pir::{EnhancePirRead, EnhancementMode, TransactionEnhancementWork},
         error::Error as WalletError,
         scanning::ScanRange,
         wallet::{
@@ -38,7 +39,7 @@ use zcash_client_backend::{
     proto::{
         compact_formats::CompactBlock,
         service::{
-            ChainSpec, RawTransaction, SendResponse,
+            BlockId, ChainSpec, RawTransaction, SendResponse,
             compact_tx_streamer_client::CompactTxStreamerClient,
         },
     },
@@ -72,11 +73,13 @@ use zcash_script::script;
 
 use crate::{network::regtest_network, rpc::ChainCheckpoint};
 
+mod history;
 mod journal;
 mod payments;
 mod recovery;
 mod submission;
 
+pub(crate) use history::CanonicalActivity;
 pub use journal::PreparedPayment;
 use journal::{PreparedPaymentsMigration, prepared_payment};
 pub use payments::{PaymentError, SendQuote};
@@ -138,6 +141,7 @@ pub struct RealWallet {
     db: Arc<Mutex<Db>>,
     account_ids: Vec<AccountUuid>,
     lightwalletd: String,
+    wallet_path: std::path::PathBuf,
 }
 
 struct MemoryBlockCache(BTreeMap<u32, CompactBlock>);
@@ -179,11 +183,12 @@ impl RealWallet {
         let secret = SecretVec::new(seed);
         let wallet_path = data_dir.join("wallet.db");
         let mut db = WalletDb::for_path(
-            wallet_path,
+            &wallet_path,
             regtest_network(),
             SystemClock,
             UnwrapErr(SysRng),
-        )?;
+        )?
+        .with_enhancement_mode(EnhancementMode::Standard);
         WalletMigrator::new()
             .with_seed(SecretVec::new(secret.expose_secret().clone()))
             .with_external_migrations(vec![
@@ -232,11 +237,18 @@ impl RealWallet {
             db: Arc::new(Mutex::new(db)),
             account_ids,
             lightwalletd,
+            wallet_path,
         })
     }
 
     pub(crate) fn lightwalletd(&self) -> &str {
         &self.lightwalletd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_lightwalletd(mut self, endpoint: String) -> Self {
+        self.lightwalletd = endpoint;
+        self
     }
 
     async fn with_db<T, F>(&self, operation: F) -> Result<T>
@@ -437,20 +449,56 @@ impl RealWallet {
             .context("reading lightwalletd tip timed out")?
     }
 
-    pub async fn wait_for_height(&self, target: u64, timeout: Duration) -> Result<()> {
-        let mut latest_indexed = None;
+    /// Waits until lightwalletd serves `target` from its block cache. lightwalletd answers
+    /// `GetLatestBlock` straight from Zakura, so a height alone does not prove the indexer caught
+    /// up: right after a rollback its cache still serves the removed block at that height until
+    /// its next poll. `canonical_hash` reads Zakura's hash at a height (`None` once the chain is
+    /// shorter), so the wait ends as soon as a reorg replaces `target` or a rollback removes it
+    /// instead of waiting for a block that will never be indexed.
+    pub async fn wait_for_block<F, Fut>(
+        &self,
+        target: &ChainCheckpoint,
+        timeout: Duration,
+        canonical_hash: F,
+    ) -> Result<()>
+    where
+        F: Fn(u32) -> Fut,
+        Fut: std::future::Future<Output = Result<Option<String>>>,
+    {
+        let height = u32::try_from(target.height)?;
+        let mut served = None;
         let wait = async {
             let mut client = CompactTxStreamerClient::connect(self.lightwalletd.clone()).await?;
             loop {
-                let indexed = client
-                    .get_latest_block(ChainSpec::default())
-                    .await?
-                    .into_inner()
-                    .height;
-                latest_indexed = Some(indexed);
-                if indexed >= target {
+                let request = BlockId {
+                    height: target.height,
+                    hash: Vec::new(),
+                };
+                let indexed = match client.get_block(request).await {
+                    Ok(block) => Some(
+                        BlockHash::try_from_slice(&block.into_inner().hash)
+                            .context("lightwalletd returned an invalid block hash")?
+                            .to_string(),
+                    ),
+                    // Zakura does not have the height yet.
+                    Err(status) if status.code() == tonic::Code::OutOfRange => None,
+                    Err(status) => return Err(status.into()),
+                };
+                if indexed.as_deref() == Some(target.hash.as_str()) {
                     return Ok::<_, anyhow::Error>(());
                 }
+                match canonical_hash(height).await? {
+                    Some(canonical) if canonical == target.hash => {}
+                    Some(canonical) => anyhow::bail!(
+                        "Zakura replaced block {} at height {height} with {canonical} before lightwalletd indexed it",
+                        target.hash
+                    ),
+                    None => anyhow::bail!(
+                        "Zakura rolled back below height {height} before lightwalletd indexed block {}",
+                        target.hash
+                    ),
+                }
+                served = indexed;
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
         };
@@ -458,10 +506,10 @@ impl RealWallet {
             Ok(result) => return result,
             Err(error) => error,
         };
-        let latest_indexed =
-            latest_indexed.map_or_else(|| "unknown".into(), |height| height.to_string());
+        let served = served.unwrap_or_else(|| "none".into());
         Err(error).with_context(|| format!(
-            "lightwalletd did not index Zakura height {target} within {} seconds (latest indexed height: {latest_indexed})",
+            "lightwalletd did not index Zakura block {} at height {height} within {} seconds (block served at that height: {served})",
+            target.hash,
             timeout.as_secs()
         ))
     }
@@ -516,16 +564,45 @@ impl RealWallet {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub async fn enhance_transaction(&self, raw_hex: &str, height: u32) -> Result<()> {
-        let raw_hex = raw_hex.to_owned();
+    pub(crate) async fn public_transaction_enhancements(&self, limit: usize) -> Result<Vec<TxId>> {
+        self.with_db(move |db| {
+            Ok(db
+                .transaction_enhancement_work()?
+                .into_iter()
+                .filter_map(|work| match work {
+                    TransactionEnhancementWork::Public(request) => Some(request.txid()),
+                    TransactionEnhancementWork::Private(_) => None,
+                })
+                .take(limit)
+                .collect())
+        })
+        .await
+    }
+
+    pub(crate) async fn enhance_transaction(
+        &self,
+        expected_txid: TxId,
+        raw: Vec<u8>,
+        height: u32,
+    ) -> Result<()> {
         self.with_db(move |db| {
             let params = regtest_network();
             let height = BlockHeight::from_u32(height);
-            let raw = hex::decode(raw_hex).context("invalid transaction hex from Zakura")?;
             let tx = Transaction::read(&raw[..], BranchId::for_height(&params, height))
-                .context("parsing transaction from Zakura")?;
+                .context("parsing transaction from lightwalletd")?;
+            anyhow::ensure!(
+                tx.txid() == expected_txid,
+                "lightwalletd returned a different transaction than requested"
+            );
             decrypt_and_store_transaction(&params, db, &tx, Some(height))?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn transaction_enhancement_not_found(&self, txid: TxId) -> Result<()> {
+        self.with_db(move |db| {
+            db.notify_transaction_enhancement_not_found(txid)?;
             Ok(())
         })
         .await

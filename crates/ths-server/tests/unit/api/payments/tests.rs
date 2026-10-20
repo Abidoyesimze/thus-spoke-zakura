@@ -1135,6 +1135,50 @@ async fn send_quote_rejects_unknown_pools_as_bad_requests() {
     }
 }
 
+/// While startup is pending the quote is unavailable, like send and faucet,
+/// instead of failing against an unscanned wallet.
+#[tokio::test]
+async fn send_quote_reports_startup_as_unavailable() {
+    let (state, _dir) = crate::state::tests::offline_state();
+    let (status, body) = api_request(
+        &state,
+        "POST",
+        "/api/v1/send/quote",
+        json!({"from_account": 1, "source_pool": "ironwood", "destination_pool": "ironwood"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body,
+        json!({"error": {"message": "the environment is still starting", "status": 503}}),
+    );
+}
+
+/// A started server with an unscanned wallet reports the quote as
+/// unavailable rather than as an unexpected error, for either pool.
+#[tokio::test]
+async fn send_quote_reports_an_unscanned_wallet_as_unavailable() {
+    let (state, _dir) = state_with_local_wallet();
+    for (source_pool, destination_pool) in [("ironwood", "ironwood"), ("transparent", "ironwood")] {
+        let (status, body) = api_request(
+            &state,
+            "POST",
+            "/api/v1/send/quote",
+            json!({"from_account": 1, "source_pool": source_pool, "destination_pool": destination_pool}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{source_pool}->{destination_pool}"
+        );
+        assert_eq!(
+            body["error"]["status"], 503,
+            "{source_pool}->{destination_pool}: {body}"
+        );
+    }
+}
+
 use crate::state::tests::{api_get, api_request};
 #[tokio::test]
 async fn address_faucet_status_reads_internal_and_external_records() {
@@ -1291,6 +1335,28 @@ fn payment_uri_resolves_a_development_account_with_amount_and_memo() {
     assert_eq!(parsed.to_account, Some(2));
     assert_eq!(parsed.amount_zatoshi, Some(150_000_000));
     assert_eq!(parsed.memo.as_deref(), Some("rent for October"));
+}
+
+#[test]
+fn payment_uri_rejects_an_explicit_zero_and_keeps_a_missing_amount() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let address = store.account(2).unwrap().unified_address;
+
+    for amount in ["0", "0.0"] {
+        let error = payment_uri(&store, &format!("zcash:{address}?amount={amount}")).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{amount}");
+        assert_eq!(
+            error.message, "amount must be greater than zero",
+            "{amount}"
+        );
+    }
+
+    let omitted = payment_uri(&store, &format!("zcash:{address}")).unwrap();
+    assert_eq!(omitted.amount_zatoshi, None);
+
+    let positive = payment_uri(&store, &format!("zcash:{address}?amount=1")).unwrap();
+    assert_eq!(positive.amount_zatoshi, Some(100_000_000));
 }
 
 #[test]

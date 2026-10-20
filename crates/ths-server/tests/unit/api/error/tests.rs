@@ -90,6 +90,10 @@ async fn api_error_logs_skip_expected_failures() {
             anyhow::Error::new(PaymentError::TreasuryExhausted),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
+        (
+            anyhow::Error::new(PaymentError::ScanRequired),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
     ] {
         let error = error.context("payment could not complete");
         let (response, logs) = capture_logs(|| ApiError::from(error).into_response());

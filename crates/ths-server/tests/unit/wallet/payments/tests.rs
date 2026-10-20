@@ -125,6 +125,7 @@ async fn canonical_balances_ignore_unmined_effects_without_deleting_them() {
         )),
         account_ids: vec![st.test_account().unwrap().id()],
         lightwalletd: String::new(),
+        wallet_path: path.clone(),
     };
     let store = crate::db::Store::open(dir.path().join("ths.db")).unwrap();
     store.initialize().unwrap();
@@ -306,6 +307,20 @@ fn transparent_quote_reports_zero_max_for_dust() {
     // 2-action grace floor still applies once an input exists.
     assert_eq!(quote.fee_zatoshi, 10_000);
     assert_eq!(quote.max_zatoshi, 0);
+}
+
+#[test]
+fn quote_reports_scan_required_before_any_blocks_are_scanned() {
+    let mut st = test_state();
+    for (source_pool, destination_pool) in [("ironwood", "ironwood"), ("transparent", "ironwood")] {
+        let error = quote(&mut st, source_pool, destination_pool)
+            .err()
+            .expect("quote must fail before any blocks are scanned");
+        assert!(
+            matches!(error.downcast_ref(), Some(PaymentError::ScanRequired)),
+            "{source_pool}->{destination_pool}: {error:#}"
+        );
+    }
 }
 
 #[tokio::test]
