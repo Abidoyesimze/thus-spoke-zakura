@@ -111,6 +111,12 @@ unknown create, or prune shared Docker resources. Recovery validates recorded
 allocation identities; it does not adopt a same-name replacement or remove
 resources from another instance. If the original container cannot be identified,
 the launcher keeps its recovery state rather than risking another container.
+A network or volume create that has begun is never stopped part way: Ctrl+C
+or `stop` waits for it, and one that times out is left running. Cleanup
+settles a create that never recorded its result only after `ps` shows no
+`docker create` for that resource still running. Then a resource with this instance's
+label is removed, a missing one is recorded as absent, and a same-name
+resource of anything else is kept and reported.
 
 This environment is Regtest only. Its seed is fixed and public, so these
 addresses and keys are known to anyone who has read the project. Never use
