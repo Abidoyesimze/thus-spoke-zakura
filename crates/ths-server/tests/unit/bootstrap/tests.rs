@@ -383,7 +383,7 @@ async fn background_task_panic_stops_http_and_cancels_siblings() {
     assert_background_failure_stops_http(true).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn stored_payments_are_served_after_restart_while_dependencies_are_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path().join("ths.db")).unwrap();
@@ -439,6 +439,9 @@ async fn stored_payments_are_served_after_restart_while_dependencies_are_unavail
     };
 
     tokio::time::sleep(Duration::from_secs(122)).await;
+    // Startup retries outlast the former two-minute deadline in virtual time.
+    // Real time resumes so the client's 2 s timeout cannot fire by auto-advance.
+    tokio::time::resume();
     let (status, activity) = get("/api/v1/activity?idempotency_key=restart-failed").await;
     assert_eq!(status, reqwest::StatusCode::OK);
     assert_eq!(activity[0]["id"], failed.id);
