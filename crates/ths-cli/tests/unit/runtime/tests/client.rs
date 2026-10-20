@@ -1594,6 +1594,21 @@ fn refused_send_is_not_polled_and_keeps_its_key() {
 }
 
 #[test]
+fn unresolved_json_adds_the_key_to_the_operation_fields() {
+    let activity: Activity = serde_json::from_str(&activity_json("broadcast", "t", None)).unwrap();
+    let pending = unresolved_json(Some(&activity), "key-1").unwrap();
+    assert_eq!(pending["id"], "op");
+    assert_eq!(pending["status"], "broadcast");
+    assert_eq!(pending["txid"], "t");
+    assert_eq!(pending["idempotency_key"], "key-1");
+    let unknown = unresolved_json::<Activity>(None, "key-2").unwrap();
+    assert_eq!(
+        unknown,
+        serde_json::json!({"status": "unknown", "idempotency_key": "key-2"})
+    );
+}
+
+#[test]
 fn address_faucet_reads_status_by_key_and_keeps_it_while_absent() {
     let (_dir, runtime, alpha) = payment_runtime();
     let intent = "address:utest:100";

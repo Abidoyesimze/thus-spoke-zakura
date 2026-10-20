@@ -34,6 +34,27 @@ fn next_port_offset(offsets: &AtomicU16) -> u16 {
     }
 }
 
+#[test]
+fn fixture_skips_each_occupied_published_port() {
+    let offsets = AtomicU16::new(30_000);
+    for port in [32_805, 18_232, 18_233, 9_067] {
+        let (offset, listener) = loop {
+            let offset = next_port_offset(&offsets);
+            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port + offset)) {
+                break (offset, listener);
+            }
+        };
+        offsets.store(offset, Ordering::Relaxed);
+        let selected = next_port_offset(&offsets);
+        assert_ne!(
+            selected,
+            offset,
+            "fixture selected occupied port {}",
+            listener.local_addr().unwrap()
+        );
+    }
+}
+
 struct Fixture {
     directory: tempfile::TempDir,
     name: String,

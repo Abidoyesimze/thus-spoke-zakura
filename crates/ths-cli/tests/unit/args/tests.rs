@@ -283,6 +283,18 @@ fn memo_values_follow_the_server_contract() {
 }
 
 #[test]
+fn parses_wallet_balances_with_global_json_after_subcommand() {
+    let cli = Cli::try_parse_from(["ths", "wallet", "balances", "--json"]).unwrap();
+    assert!(cli.json);
+    assert!(matches!(
+        cli.command,
+        Some(Command::Wallet {
+            action: WalletCommand::Balances
+        })
+    ));
+}
+
+#[test]
 fn parses_wallet_activity_flags_and_rejects_invalid_limits() {
     let cli = Cli::try_parse_from(["ths", "wallet", "activity"]).unwrap();
     assert!(matches!(

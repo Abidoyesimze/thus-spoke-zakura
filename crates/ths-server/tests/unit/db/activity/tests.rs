@@ -160,6 +160,30 @@ fn unconfirming_both_payment_collections_is_atomic() {
 }
 
 #[test]
+fn records_real_transfer_without_mutating_balances() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let activity = store
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "send",
+            None,
+        )
+        .unwrap();
+    assert_eq!(store.activities(10).unwrap().len(), 1);
+    let activity = store
+        .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
+        .unwrap();
+    let activity = store.mark_broadcast(&activity.id, &activity.txid).unwrap();
+    assert_eq!(activity.txid, "real-txid");
+    assert_eq!(store.account(1).unwrap().transparent_zatoshi, 0);
+}
+
+#[test]
 fn confirm_rejects_an_empty_block_hash() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
@@ -448,6 +472,34 @@ fn prepared_payment_can_be_reset_after_expiry() {
     assert!(retry.txid.is_empty());
     assert!(store.prepared_transaction(&claim.id).is_err());
     assert_eq!(store.activities(10).unwrap(), [retry]);
+}
+
+#[test]
+fn recording_the_same_prepared_transaction_converges() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = store
+        .claim_transfer(
+            1,
+            Recipient::Account(2),
+            "ironwood",
+            "ironwood",
+            12_000,
+            "same",
+            None,
+        )
+        .unwrap();
+    let first = store
+        .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
+        .unwrap();
+
+    let second = store
+        .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
+        .unwrap();
+
+    assert_eq!(second.id, first.id);
+    assert_eq!(second.txid, first.txid);
+    assert_eq!(second.status, "prepared");
 }
 
 #[test]

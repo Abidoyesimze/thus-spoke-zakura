@@ -186,6 +186,27 @@ async fn payment_lifecycle_does_not_discard_after_recording_failure() {
 }
 
 #[tokio::test]
+async fn payment_lifecycle_returns_pending_after_confirmation_failure() {
+    let store = Store::open(":memory:").unwrap();
+    store.initialize().unwrap();
+    let claim = lifecycle_claim(&store, "mining-failure");
+    let prepared = store
+        .record_prepared(&claim.id, "pending-txid", b"signed", 140)
+        .unwrap();
+    let mut runtime = RecordingPaymentLifecycle::new(store, [LifecycleSubmission::Broadcast]);
+    runtime.confirm = false;
+
+    let result = execute_payment(&runtime, prepared, |_, _| {
+        std::future::ready(Ok(prepared_payment_result("unused", 180)))
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(result.status, "broadcast");
+    assert_eq!(result.txid, "pending-txid");
+}
+
+#[tokio::test]
 async fn failed_preparation_preserves_the_claim_and_records_the_error() {
     let (state, _dir) = state_with_local_wallet();
     let claim = state
