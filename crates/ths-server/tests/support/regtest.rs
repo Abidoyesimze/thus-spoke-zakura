@@ -1292,17 +1292,6 @@ impl TerminationSignals {
     }
 }
 
-/// Test-only cancellation seam: it receives a local one-shot signal and takes
-/// the same explicit cleanup path as the live cancellation owner.
-#[cfg(test)]
-async fn shutdown_after_test_cancellation(
-    stack: &mut RegtestStack,
-    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
-) -> Result<()> {
-    let _ = cancellation.await;
-    stack.shutdown().await
-}
-
 fn published_loopback_port(inspect: &DockerInspect, container_port: &str) -> Result<u16> {
     let bindings = inspect
         .network_settings

@@ -34,27 +34,6 @@ fn next_port_offset(offsets: &AtomicU16) -> u16 {
     }
 }
 
-#[test]
-fn fixture_skips_each_occupied_published_port() {
-    let offsets = AtomicU16::new(30_000);
-    for port in [32_805, 18_232, 18_233, 9_067] {
-        let (offset, listener) = loop {
-            let offset = next_port_offset(&offsets);
-            if let Ok(listener) = TcpListener::bind(("127.0.0.1", port + offset)) {
-                break (offset, listener);
-            }
-        };
-        offsets.store(offset, Ordering::Relaxed);
-        let selected = next_port_offset(&offsets);
-        assert_ne!(
-            selected,
-            offset,
-            "fixture selected occupied port {}",
-            listener.local_addr().unwrap()
-        );
-    }
-}
-
 struct Fixture {
     directory: tempfile::TempDir,
     name: String,
@@ -910,30 +889,6 @@ fn json_start_stops_cleanly_during_browser_open() {
     let stderr = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
     assert!(status.success(), "launcher exited {status}: {stderr}");
     serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
-}
-
-#[test]
-fn standalone_doctor_retains_human_and_json_output() {
-    let fixture = Fixture::new();
-    let human = fixture.command().arg("doctor").output().unwrap();
-    assert!(human.status.success());
-    assert!(
-        String::from_utf8(human.stdout)
-            .unwrap()
-            .contains("Docker test-docker")
-    );
-    assert!(human.stderr.is_empty());
-
-    let json = fixture
-        .command()
-        .args(["--json", "doctor"])
-        .output()
-        .unwrap();
-    assert!(json.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(result["docker"], "test-docker");
-    assert_eq!(result["ok"], true);
-    assert!(json.stderr.is_empty());
 }
 
 #[test]

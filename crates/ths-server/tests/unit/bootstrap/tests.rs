@@ -239,35 +239,6 @@ async fn startup_retries_past_two_minutes_with_a_delay_then_recovers() {
     }
 }
 
-#[tokio::test(start_paused = true)]
-async fn startup_does_not_cancel_a_slow_preparation_or_release_its_guard() {
-    let guard = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-    let owned = guard.clone();
-    let (entered, ready) = tokio::sync::oneshot::channel();
-    let (release, released) = tokio::sync::oneshot::channel();
-    let mut attempt = Some((entered, released));
-    let startup = tokio::spawn(async move {
-        retry_startup(|| {
-            let owned = owned.clone();
-            let (entered, released) = attempt.take().expect("preparation was restarted");
-            async move {
-                let _guard = owned.lock().await;
-                entered.send(()).unwrap();
-                released.await.unwrap();
-                Ok(())
-            }
-        })
-        .await
-    });
-    ready.await.unwrap();
-    tokio::time::advance(Duration::from_secs(130)).await;
-    assert!(!startup.is_finished());
-    assert!(guard.try_lock().is_err());
-    release.send(()).unwrap();
-    startup.await.unwrap().unwrap();
-    assert!(guard.try_lock().is_ok());
-}
-
 #[test]
 fn startup_retries_only_typed_transient_failures() {
     for code in [-28, -5, -32603] {

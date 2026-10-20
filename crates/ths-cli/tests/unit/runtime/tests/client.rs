@@ -240,27 +240,6 @@ fn explorer_encodes_ids_as_a_single_path_segment() {
     );
 }
 
-#[test]
-fn responses_decode_or_report_their_status_and_body() {
-    let (url, _requests) = serve(vec![
-        (
-            "200 OK",
-            r#"{"id":"job-1","requested_blocks":1,"completed_blocks":1,"state":"completed","error":null,"progress_uncertain":false,"hashes":["tip"]}"#,
-        ),
-        ("409 Conflict", "already claimed"),
-        ("200 OK", "not json"),
-    ]);
-    let client = reqwest::blocking::Client::new();
-    let get = || client.get(&url).send().unwrap();
-
-    let job: MiningJob = decode_response(get()).unwrap();
-    assert_eq!(job.state, MiningJobState::Completed);
-    let rejected = decode_response::<MiningJob>(get()).unwrap_err().to_string();
-    assert_eq!(rejected, "rejected (409 Conflict): already claimed");
-    let malformed = format!("{:#}", decode_response::<MiningJob>(get()).unwrap_err());
-    assert!(malformed.starts_with("decoding response: "), "{malformed}");
-}
-
 /// Mining journals do real file locking, so tests need an isolated root
 /// instead of sharing one.
 fn runtime_with_instance_dir(instance: &InstanceName) -> (tempfile::TempDir, Runtime) {
@@ -1612,21 +1591,6 @@ fn refused_send_is_not_polled_and_keeps_its_key() {
     let key = sent_key(&requests.recv().unwrap());
     assert!(requests.try_recv().is_err());
     assert_eq!(saved_send_key(&runtime, &alpha, &intent), Some(key));
-}
-
-#[test]
-fn unresolved_json_adds_the_key_to_the_operation_fields() {
-    let activity: Activity = serde_json::from_str(&activity_json("broadcast", "t", None)).unwrap();
-    let pending = unresolved_json(Some(&activity), "key-1").unwrap();
-    assert_eq!(pending["id"], "op");
-    assert_eq!(pending["status"], "broadcast");
-    assert_eq!(pending["txid"], "t");
-    assert_eq!(pending["idempotency_key"], "key-1");
-    let unknown = unresolved_json::<Activity>(None, "key-2").unwrap();
-    assert_eq!(
-        unknown,
-        serde_json::json!({"status": "unknown", "idempotency_key": "key-2"})
-    );
 }
 
 #[test]

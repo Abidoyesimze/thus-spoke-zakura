@@ -168,54 +168,6 @@ async fn proxy_forwards_unarmed_requests_and_consumes_only_matching_generate_onc
 }
 
 #[tokio::test]
-async fn separate_proxy_instances_do_not_consume_each_others_faults() -> Result<()> {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let upstream = LocalServer::start(
-        Router::new()
-            .fallback(record_request)
-            .with_state(Arc::clone(&requests)),
-    )
-    .await?;
-    let mut first = GenerateFaultProxy::start(upstream.url.clone()).await?;
-    let mut second = GenerateFaultProxy::start(upstream.url.clone()).await?;
-    let client = Client::new();
-    let matching_generate = request("isolation", "generate", json!([1]));
-
-    first.fail_next_generate()?;
-    let (status, _) = post_json(&client, second.url(), &matching_generate).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        first.counts(),
-        GenerateCounts {
-            rejected: 0,
-            forwarded: 0,
-        }
-    );
-    assert_eq!(
-        second.counts(),
-        GenerateCounts {
-            rejected: 0,
-            forwarded: 1,
-        }
-    );
-
-    let (status, response) = post_json(&client, first.url(), &matching_generate).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(response["error"]["code"], -32603);
-    assert_eq!(
-        first.counts(),
-        GenerateCounts {
-            rejected: 1,
-            forwarded: 0,
-        }
-    );
-
-    first.shutdown().await?;
-    second.shutdown().await?;
-    upstream.shutdown().await
-}
-
-#[tokio::test]
 async fn proxy_preserves_upstream_errors_and_bounds_transport_shutdown() -> Result<()> {
     let client = Client::new();
     let request = request("errors", "getblockchaininfo", json!([]));

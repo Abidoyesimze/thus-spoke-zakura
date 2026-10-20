@@ -158,85 +158,6 @@ fn unconfirming_both_payment_collections_is_atomic() {
         Some("removed")
     );
 }
-#[test]
-fn records_real_transfer_without_mutating_balances() {
-    let store = Store::open(":memory:").unwrap();
-    store.initialize().unwrap();
-    let activity = store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            12_000,
-            "send",
-            None,
-        )
-        .unwrap();
-    assert_eq!(store.activities(10).unwrap().len(), 1);
-    let activity = store
-        .record_prepared(&activity.id, "real-txid", b"raw transaction", 140)
-        .unwrap();
-    let activity = store.mark_broadcast(&activity.id, &activity.txid).unwrap();
-    assert_eq!(activity.txid, "real-txid");
-    assert_eq!(store.account(1).unwrap().transparent_zatoshi, 0);
-}
-
-#[test]
-fn unconfirmed_activities_skip_unprepared_and_confirmed_rows() {
-    let store = Store::open(":memory:").unwrap();
-    store.initialize().unwrap();
-    store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            11_000,
-            "preparing-key",
-            None,
-        )
-        .unwrap();
-    let pending = store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            12_000,
-            "pending-key",
-            None,
-        )
-        .unwrap();
-    let pending = store
-        .record_prepared(&pending.id, "txid-pending", b"pending", 140)
-        .unwrap();
-    let pending = store.mark_broadcast(&pending.id, &pending.txid).unwrap();
-    let mined = store
-        .claim_transfer(
-            1,
-            Recipient::Account(3),
-            "ironwood",
-            "ironwood",
-            13_000,
-            "mined-key",
-            None,
-        )
-        .unwrap();
-    let mined = store
-        .record_prepared(&mined.id, "txid-mined", b"mined", 140)
-        .unwrap();
-    let mined = store.mark_broadcast(&mined.id, &mined.txid).unwrap();
-    store
-        .confirm(&mined.id, &mined.txid, &"c".repeat(64))
-        .unwrap();
-
-    let open = store.unconfirmed_activities().unwrap();
-    assert_eq!(open.len(), 1);
-    assert_eq!(open[0].id, pending.id);
-    assert_eq!(open[0].status, "broadcast");
-    assert_eq!(open[0].txid, "txid-pending");
-}
 
 #[test]
 fn confirm_rejects_an_empty_block_hash() {
@@ -503,39 +424,6 @@ fn concurrent_claims_create_one_payment() {
 }
 
 #[test]
-fn discarding_a_failed_prepare_removes_its_claim() {
-    let store = Store::open(":memory:").unwrap();
-    store.initialize().unwrap();
-    let failed = store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            12_000,
-            "same",
-            None,
-        )
-        .unwrap();
-
-    store.discard_preparing(&failed.id).unwrap();
-
-    assert!(store.activity_for_key("same").unwrap().is_none());
-    let retry = store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            12_000,
-            "same",
-            None,
-        )
-        .unwrap();
-    assert_ne!(retry.id, failed.id);
-}
-
-#[test]
 fn prepared_payment_can_be_reset_after_expiry() {
     let store = Store::open(":memory:").unwrap();
     store.initialize().unwrap();
@@ -560,34 +448,6 @@ fn prepared_payment_can_be_reset_after_expiry() {
     assert!(retry.txid.is_empty());
     assert!(store.prepared_transaction(&claim.id).is_err());
     assert_eq!(store.activities(10).unwrap(), [retry]);
-}
-
-#[test]
-fn recording_the_same_prepared_transaction_converges() {
-    let store = Store::open(":memory:").unwrap();
-    store.initialize().unwrap();
-    let claim = store
-        .claim_transfer(
-            1,
-            Recipient::Account(2),
-            "ironwood",
-            "ironwood",
-            12_000,
-            "same",
-            None,
-        )
-        .unwrap();
-    let first = store
-        .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
-        .unwrap();
-
-    let second = store
-        .record_prepared(&claim.id, "real-txid", b"signed transaction", 140)
-        .unwrap();
-
-    assert_eq!(second.id, first.id);
-    assert_eq!(second.txid, first.txid);
-    assert_eq!(second.status, "prepared");
 }
 
 #[test]

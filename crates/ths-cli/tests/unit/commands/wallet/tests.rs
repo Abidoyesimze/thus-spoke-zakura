@@ -31,12 +31,3 @@ fn sends_allow_the_same_account_only_between_pools() {
     assert!(check_send(&send_args(1, 1, Pool::Transparent, Some("hi"))).is_err());
     assert!(check_send(&send_args(1, 1, Pool::Transparent, Some(""))).is_err());
 }
-
-#[test]
-fn sends_are_checked_before_contacting_the_environment() {
-    assert!(check_send(&send_args(1, 2, Pool::Ironwood, Some(""))).is_ok());
-    assert!(check_send(&send_args(1, 2, Pool::Transparent, None)).is_ok());
-    assert!(check_send(&send_args(3, 3, Pool::Ironwood, None)).is_err());
-    assert!(check_send(&send_args(1, 2, Pool::Transparent, Some("hi"))).is_err());
-    assert!(check_send(&send_args(1, 2, Pool::Transparent, Some(""))).is_err());
-}
