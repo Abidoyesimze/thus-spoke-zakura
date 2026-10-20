@@ -3,6 +3,9 @@ use super::*;
 pub(super) trait DockerResourceCommands {
     fn output(&self, args: &[&str]) -> Result<String>;
     fn run(&self, args: &[&str]) -> Result<()>;
+    fn create(&self, args: &[&str]) -> Result<()> {
+        self.run(args)
+    }
 }
 
 pub(super) struct DockerCli;
@@ -127,11 +130,7 @@ impl<'a> LifecycleDocker<'a> {
             .unwrap_or_else(|| Deadline::after(self.command_cap))
     }
 
-    pub(super) fn execute(
-        &self,
-        args: &[&str],
-        mode: OutputMode,
-    ) -> Result<CapturedOutput, CommandFailure> {
+    fn command(&self, args: &[&str]) -> Command {
         let mut command = if self.program == "docker" {
             docker_cli()
         } else {
@@ -142,6 +141,15 @@ impl<'a> LifecycleDocker<'a> {
         for (key, value) in &self.env {
             command.env(key, value);
         }
+        command
+    }
+
+    pub(super) fn execute(
+        &self,
+        args: &[&str],
+        mode: OutputMode,
+    ) -> Result<CapturedOutput, CommandFailure> {
+        let mut command = self.command(args);
         let mut helpers = self.context.helpers.borrow_mut();
         // `output()` always calls with `Capture` (reads: inspect, ls); `run()`
         // never does (mutations: rm, volume rm, network rm, volume create).
@@ -197,6 +205,33 @@ impl DockerResourceCommands for LifecycleDocker<'_> {
             OutputMode::Inherit
         };
         self.execute(args, mode)?;
+        Ok(())
+    }
+
+    fn create(&self, args: &[&str]) -> Result<()> {
+        if self.cancellation.requested() {
+            bail!(
+                "docker {} was not started: shutdown was requested",
+                args.join(" ")
+            );
+        }
+        let mut command = self.command(args);
+        command.stdin(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+        let mut helpers = self.context.helpers.borrow_mut();
+        run_leaving_running_on_timeout(
+            &mut command,
+            self.operation_deadline(),
+            Cancellation::Ignore,
+            OutputMode::Capture,
+            &self.context.policy,
+            &mut helpers,
+        )
+        .map_err(|error| anyhow!("{error}"))?;
         Ok(())
     }
 }
