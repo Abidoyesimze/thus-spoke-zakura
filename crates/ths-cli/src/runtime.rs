@@ -20,8 +20,10 @@ use std::{
 
 use crate::lifecycle::{
     Cancellation, CapturedOutput, CommandFailure, CommandFailureKind, Deadline, HelperSet,
-    LifecyclePolicy, OutputMode, run,
+    LifecyclePolicy, OutputMode, run, run_leaving_running_on_timeout,
 };
+#[cfg(test)]
+use crate::lifecycle::{ChildOps, run_observed};
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;

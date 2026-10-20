@@ -4,17 +4,178 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
 
 ## Unreleased
 
-- **Send fee quote during startup:** `POST /api/v1/send/quote` returns 503
-  while the environment is still starting, like `send` and `faucet`, instead
-  of failing with a 500 against the unscanned wallet. An unscanned wallet
-  after startup is also reported as unavailable rather than as an
-  unexpected error.
-  [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299)
+- **Deletion notices survive shutdown polling:** A polling shutdown check could
+  consume a queued "another command deleted this environment" notice and
+  discard it, and `wait_timeout` reported such a notice as an interruption.
+  Deletion is now latched separately from Ctrl+C, so the reason survives any
+  caller that has already read it. No caller can reach this today; it removes a
+  latent hazard for future ones.
+  [#305](https://github.com/zcashlabs/thus-spoke-zakura/issues/305)
 
-- **Explorer search feedback:** Numeric 64-character hashes are searched as hashes,
-  missing hashes are distinguished from service failures, and transparent
-  addresses are no longer mislabeled as P2PKH.
-  [#129](https://github.com/zcashlabs/thus-spoke-zakura/pull/129)
+## v0.4.0
+
+![Thus Spoke Zakura v0.4.0 release artwork](assets/images/release-v0.4.0.png)
+
+This release makes payments durable and recoverable, activates NU7 for fresh
+Regtest environments, and expands the dashboard and CLI for payment, mining,
+and environment workflows.
+
+### Action required
+
+- **Fresh NU7 environment:** New instances activate NU7 at height 1. Existing
+  chains keep their upgrade schedule, so create a fresh named instance to use
+  NU7. [#132](https://github.com/zcashlabs/thus-spoke-zakura/pull/132)
+- **Payment API:** A successful payment POST now means the request was durably
+  accepted, not completed. Follow its `Location` and read `pending`,
+  `confirmed`, or `failed`. After `ths reorg` or `ths rollback`, also accept
+  `unconfirmed`; the payment is kept but not rebroadcast.
+  [#235](https://github.com/zcashlabs/thus-spoke-zakura/pull/235),
+  [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307)
+- **Address faucet key:** `POST /api/v1/faucet/address` requires an
+  `idempotency_key` of 8–128 visible ASCII characters and returns HTTP 400
+  without one. [#151](https://github.com/zcashlabs/thus-spoke-zakura/pull/151)
+- **Activity API:** `GET /api/v1/activity` returns canonical wallet history.
+  Accept the `transaction` kind, `null` `source_pool`, `destination_pool`, and
+  `created_at`, and use the plural pool and account fields for multi-pool or
+  multi-account transactions.
+  [#361](https://github.com/zcashlabs/thus-spoke-zakura/pull/361)
+- **Scripts:** `ths status` exits nonzero unless every service is running, and
+  `ths doctor --json` exits nonzero when Docker is unreachable. `ths run`
+  assigns free ports, so its child must read the exported endpoint variables.
+  `ths mine --json` prints a mining job instead of `{blocks, hashes}`.
+  [#376](https://github.com/zcashlabs/thus-spoke-zakura/pull/376),
+  [#203](https://github.com/zcashlabs/thus-spoke-zakura/pull/203),
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310),
+  [#214](https://github.com/zcashlabs/thus-spoke-zakura/pull/214)
+
+### Highlights
+
+- **Durable payments:** Sends and faucets are stored before execution and
+  progressed by the server. The dashboard and CLI keep idempotency keys and
+  restore outcomes after interruption.
+  [#199](https://github.com/zcashlabs/thus-spoke-zakura/pull/199),
+  [#200](https://github.com/zcashlabs/thus-spoke-zakura/pull/200),
+  [#211](https://github.com/zcashlabs/thus-spoke-zakura/pull/211),
+  [#213](https://github.com/zcashlabs/thus-spoke-zakura/pull/213),
+  [#217](https://github.com/zcashlabs/thus-spoke-zakura/pull/217),
+  [#219](https://github.com/zcashlabs/thus-spoke-zakura/pull/219),
+  [#235](https://github.com/zcashlabs/thus-spoke-zakura/pull/235),
+  [#243](https://github.com/zcashlabs/thus-spoke-zakura/pull/243)
+- **Payment requests and external addresses:** The dashboard creates ZIP-321
+  requests with a QR code and can send or faucet to external Regtest addresses.
+  [#110](https://github.com/zcashlabs/thus-spoke-zakura/pull/110),
+  [#210](https://github.com/zcashlabs/thus-spoke-zakura/pull/210),
+  [#384](https://github.com/zcashlabs/thus-spoke-zakura/pull/384)
+- **Canonical wallet history:** Activity lists each transaction once with every
+  affected account, pool, and memo; treasury outputs stay hidden.
+  [#361](https://github.com/zcashlabs/thus-spoke-zakura/pull/361)
+- **New CLI commands:** `ths wallet balances`, `ths wallet activity`, `ths tx`,
+  `ths block`, and `--max` for `send`, `shield`, and `unshield`.
+  [#188](https://github.com/zcashlabs/thus-spoke-zakura/pull/188),
+  [#215](https://github.com/zcashlabs/thus-spoke-zakura/pull/215),
+  [#244](https://github.com/zcashlabs/thus-spoke-zakura/pull/244),
+  [#324](https://github.com/zcashlabs/thus-spoke-zakura/pull/324)
+- **Reorg and rollback:** `ths reorg --depth N [--keep-txs]` replaces recent
+  blocks and `ths rollback --depth N` removes them. Both have HTTP APIs and
+  reconcile wallet balances.
+  [#307](https://github.com/zcashlabs/thus-spoke-zakura/pull/307),
+  [#388](https://github.com/zcashlabs/thus-spoke-zakura/pull/388),
+  [#397](https://github.com/zcashlabs/thus-spoke-zakura/pull/397)
+- **NU7 and mining jobs:** Fresh environments activate NU7 at height 1. `ths
+  mine` follows server-owned jobs, so an interrupted client does not start
+  duplicate work.
+  [#132](https://github.com/zcashlabs/thus-spoke-zakura/pull/132),
+  [#214](https://github.com/zcashlabs/thus-spoke-zakura/pull/214)
+- **Environment workflows:** `ths run` runs a command against a fresh, isolated
+  environment and cleans it up. `ths list` shows status, `ths logs` accepts
+  `--head` and `--tail`, and `ths endpoints --env` prints shell exports.
+  [#76](https://github.com/zcashlabs/thus-spoke-zakura/pull/76),
+  [#101](https://github.com/zcashlabs/thus-spoke-zakura/pull/101),
+  [#141](https://github.com/zcashlabs/thus-spoke-zakura/pull/141),
+  [#311](https://github.com/zcashlabs/thus-spoke-zakura/pull/311),
+  [#310](https://github.com/zcashlabs/thus-spoke-zakura/pull/310)
+
+### Reliability, security, and usability
+
+- **Lifecycle:** One launcher owns each environment, startup and cleanup are
+  bounded and verified, and `ths wait` waits through startup. Environments
+  started by v0.3.0 can be stopped, restarted, or reset after upgrading.
+  [#133](https://github.com/zcashlabs/thus-spoke-zakura/pull/133),
+  [#202](https://github.com/zcashlabs/thus-spoke-zakura/pull/202),
+  [#276](https://github.com/zcashlabs/thus-spoke-zakura/pull/276),
+  [#277](https://github.com/zcashlabs/thus-spoke-zakura/pull/277),
+  [#279](https://github.com/zcashlabs/thus-spoke-zakura/pull/279),
+  [#401](https://github.com/zcashlabs/thus-spoke-zakura/pull/401)
+- **Security and releases:** The app rejects non-loopback `Host` headers to
+  block DNS rebinding, release workflows handle tags safely, and Linux launchers
+  target an older glibc.
+  [#218](https://github.com/zcashlabs/thus-spoke-zakura/pull/218),
+  [#237](https://github.com/zcashlabs/thus-spoke-zakura/pull/237)
+- **Runtime and launcher:** Health probes check lightwalletd as well as Zakura,
+  and Zakura state lives in the chain volume. `update` and `uninstall` follow
+  symlinks, `update --json` keeps stdout parseable, and `ths logs` exits cleanly
+  on a closed pipe.
+  [#296](https://github.com/zcashlabs/thus-spoke-zakura/pull/296),
+  [#283](https://github.com/zcashlabs/thus-spoke-zakura/pull/283),
+  [#323](https://github.com/zcashlabs/thus-spoke-zakura/pull/323),
+  [#333](https://github.com/zcashlabs/thus-spoke-zakura/pull/333),
+  [#343](https://github.com/zcashlabs/thus-spoke-zakura/pull/343)
+- **API errors and validation:** Malformed requests return the API error
+  envelope. Each account's payments run in admission order, so a send right
+  after a faucet no longer fails. Fee quotes return HTTP 503 before the wallet
+  has scanned. Zero-amount ZIP-321 URIs and transparent amounts below the
+  54-zatoshi dust threshold return HTTP 400.
+  [#285](https://github.com/zcashlabs/thus-spoke-zakura/pull/285),
+  [#392](https://github.com/zcashlabs/thus-spoke-zakura/pull/392),
+  [#299](https://github.com/zcashlabs/thus-spoke-zakura/pull/299),
+  [#246](https://github.com/zcashlabs/thus-spoke-zakura/pull/246),
+  [#280](https://github.com/zcashlabs/thus-spoke-zakura/pull/280)
+- **Dashboard:** Node connectivity is shown separately from wallet readiness,
+  queries refresh when the event stream reconnects, and navigation stays tied to
+  the current action. Payment times are local, Mine stays available on mobile,
+  and block counts accept decimal digits only.
+  [#171](https://github.com/zcashlabs/thus-spoke-zakura/pull/171),
+  [#289](https://github.com/zcashlabs/thus-spoke-zakura/pull/289),
+  [#382](https://github.com/zcashlabs/thus-spoke-zakura/pull/382),
+  [#385](https://github.com/zcashlabs/thus-spoke-zakura/pull/385),
+  [#306](https://github.com/zcashlabs/thus-spoke-zakura/pull/306),
+  [#321](https://github.com/zcashlabs/thus-spoke-zakura/pull/321),
+  [#337](https://github.com/zcashlabs/thus-spoke-zakura/pull/337),
+  [#314](https://github.com/zcashlabs/thus-spoke-zakura/pull/314),
+  [#302](https://github.com/zcashlabs/thus-spoke-zakura/pull/302)
+- **Explorer:** Search handles hashes and transparent addresses, fees appear
+  only when verifiable, and older-block pages label the first block shown.
+  [#129](https://github.com/zcashlabs/thus-spoke-zakura/pull/129),
+  [#383](https://github.com/zcashlabs/thus-spoke-zakura/pull/383),
+  [#336](https://github.com/zcashlabs/thus-spoke-zakura/pull/336)
+
+### Project updates
+
+- **Documentation:** A new book covers setup, accounts, payments, mining,
+  operations, app integration, and troubleshooting.
+  [#122](https://github.com/zcashlabs/thus-spoke-zakura/pull/122),
+  [#390](https://github.com/zcashlabs/thus-spoke-zakura/pull/390),
+  [#391](https://github.com/zcashlabs/thus-spoke-zakura/pull/391)
+- **Maintainability:** The server, wallet, launcher, and dashboard are split
+  into focused modules, and flaky lifecycle and memo tests are fixed.
+  [#178](https://github.com/zcashlabs/thus-spoke-zakura/pull/178),
+  [#183](https://github.com/zcashlabs/thus-spoke-zakura/pull/183),
+  [#186](https://github.com/zcashlabs/thus-spoke-zakura/pull/186),
+  [#190](https://github.com/zcashlabs/thus-spoke-zakura/pull/190),
+  [#191](https://github.com/zcashlabs/thus-spoke-zakura/pull/191),
+  [#192](https://github.com/zcashlabs/thus-spoke-zakura/pull/192),
+  [#238](https://github.com/zcashlabs/thus-spoke-zakura/pull/238),
+  [#322](https://github.com/zcashlabs/thus-spoke-zakura/pull/322),
+  [#409](https://github.com/zcashlabs/thus-spoke-zakura/pull/409)
+
+### Credits and comparison
+
+- **Contributors:** Thank you to @AkshatGada, @amiabix, @AnmolBansalDEV,
+  @Annkkitaaa, @guha-rahul, @jonwalch, @kaushikc44, @MayurK-cmd, @megabyte0x,
+  @nikhilkumar1612, @Not-Sarthak, @od-hunter, @paoValle, @piatoss3612,
+  @PraneshASP, @raizo07, @RajeshRk18, @RealAdii, @robertocarlous, @tanctl,
+  @vkpatva, @yashgo0018, and @Yonkoo11.
+- **Full changelog:** [Compare v0.3.0 with v0.4.0](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.3.0...v0.4.0).
 
 ## v0.3.0
 
