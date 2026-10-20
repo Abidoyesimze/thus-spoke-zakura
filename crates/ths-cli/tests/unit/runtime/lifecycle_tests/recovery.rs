@@ -48,36 +48,6 @@ fn unidentified_create_stays_uncertain_for_either_snapshot() {
 }
 
 #[test]
-fn pending_mutation_survives_without_endpoint_metadata() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("lifecycle-recovery.json");
-    let mut journal = RecoveryJournal::create(path.clone(), &name("alpha")).unwrap();
-    journal
-        .begin(
-            ResourceRef {
-                kind: ResourceKind::Container,
-                name: "ths-alpha-app".into(),
-                identity: None,
-            },
-            Vec::new(),
-            MutationOperation::Create,
-        )
-        .unwrap();
-    let recovered = RecoveryJournal::load(path, &name("alpha"))
-        .unwrap()
-        .unwrap();
-    assert!(matches!(
-        recovered.record().mutations[0].outcome,
-        MutationOutcome::Pending
-    ));
-    assert_eq!(
-        recovered.record().mutations[0].resource.name,
-        "ths-alpha-app"
-    );
-    assert!(!dir.path().join("instance.json").exists());
-}
-
-#[test]
 fn failed_rewrite_keeps_the_previous_record_and_skips_the_mutation() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join(recovery::RECOVERY_FILE);

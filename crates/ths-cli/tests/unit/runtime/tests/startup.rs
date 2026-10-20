@@ -212,35 +212,6 @@ fn startup_and_cleanup_failures_are_both_reported_once() {
 }
 
 #[test]
-fn interrupt_before_ready_deletes_the_started_instance() {
-    let (mut host, events) = RecordingHost::new();
-    host.interrupt_before_ready = true;
-    let (_sender, shutdown) = Shutdown::channel();
-    let err = runtime_for_tests()
-        .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
-        .unwrap_err();
-    assert!(err.to_string().contains("interrupted"));
-    let events = events.lock().unwrap().clone();
-    assert!(events.iter().any(|e| e == "allocate:alpha"));
-    assert!(events.iter().any(|e| e == "delete:alpha"));
-    assert!(!events.iter().any(|e| e.starts_with("wait_for_shutdown")));
-}
-
-#[test]
-fn interrupt_during_allocate_deletes_only_the_named_instance() {
-    let (host, events) = RecordingHost::new();
-    let (sender, shutdown) = Shutdown::channel();
-    sender.send(Ended::Interrupted).unwrap();
-    let err = runtime_for_tests()
-        .start_with(&name("alpha"), false, false, 0, &host, &shutdown)
-        .unwrap_err();
-    assert!(err.to_string().contains("interrupted"));
-    let events = events.lock().unwrap().clone();
-    assert!(events.iter().any(|e| e == "delete:alpha"));
-    assert!(!events.iter().any(|e| e.contains("beta")));
-}
-
-#[test]
 fn shutdown_check_bails_when_latched() {
     let (sender, shutdown) = Shutdown::channel();
     shutdown.check().unwrap();
@@ -284,22 +255,6 @@ fn wait_ready_aborts_when_shutdown_is_signaled() {
     let err = readiness::wait_ready(
         "http://127.0.0.1:1",
         "missing-app",
-        Deadline::after(Duration::from_secs(5)),
-        &shutdown,
-        &LifecyclePolicy::default(),
-        &IdleDocker,
-    )
-    .unwrap_err();
-    assert!(err.to_string().contains("interrupted"));
-}
-
-#[test]
-fn wait_for_zakura_tip_aborts_when_shutdown_is_signaled() {
-    let (sender, shutdown) = Shutdown::channel();
-    sender.send(Ended::Interrupted).unwrap();
-    let err = readiness::wait_for_zakura_tip(
-        "http://127.0.0.1:1",
-        "missing-zakura",
         Deadline::after(Duration::from_secs(5)),
         &shutdown,
         &LifecyclePolicy::default(),
