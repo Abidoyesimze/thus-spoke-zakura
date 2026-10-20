@@ -4,7 +4,6 @@ import {
   api,
   errorMessage,
   idempotencyKey,
-  isPaymentRejection,
   type Activity,
   type MiningJob,
   type PaymentRequest,
@@ -54,6 +53,9 @@ function operationKey<T>(
         key = idempotencyKey();
       }
       storageArea.setItem(itemKey, key);
+      if (storageArea.getItem(itemKey) !== key) {
+        throw new Error('Could not retain the operation key.');
+      }
       return key;
     },
     clear(variables: T) {
@@ -71,7 +73,6 @@ type PaymentCallbacks<T> = {
 };
 type PaymentLifecycle = {
   onRetained: (identity: PaymentIdentity) => void;
-  onRejected: (identity: PaymentIdentity) => void;
   onError: (
     error: Error,
     variables: SendVariables | FaucetVariables,
@@ -87,7 +88,16 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
   const queryClient = useQueryClient();
   const invalidate = useInvalidateWallet();
   const ownedKeys = useRef(new Map<string, string>());
-  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const submissions = useRef(new Set<PaymentSubmission<T>>());
+  const [pendingSubmissions, setPendingSubmissions] = useState<PaymentSubmission<T>[]>([]);
+  const updateSubmissions = () =>
+    setPendingSubmissions([...submissions.current].map((item) => ({ ...item })));
+  const matches = useCallback(
+    (item: PaymentSubmission<T>, identity: PaymentIdentity) =>
+      item.key === identity.key ||
+      (item.key === undefined && paymentName(kind, item.variables) === identity.name),
+    [kind],
+  );
   const clear = useCallback(
     async (identity: PaymentIdentity) => {
       try {
@@ -97,6 +107,25 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
       }
     },
     [invalidate],
+  );
+  const forget = useCallback(
+    (identity: PaymentIdentity, onForgot: () => void) =>
+      clearPayment(
+        identity,
+        ownedKeys.current,
+        () => {
+          const status = queryClient.getQueryState<Activity | null>(
+            queryKeys.payment(identity.key),
+          );
+          return (
+            ![...submissions.current].some((item) => matches(item, identity)) &&
+            status?.status === 'success' &&
+            status.data === null
+          );
+        },
+        onForgot,
+      ),
+    [queryClient, matches],
   );
   // The sender and the status card both learn of a confirmation, in an order
   // that depends on rendering; whichever sees it first announces it.
@@ -112,23 +141,11 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
       const { variables, key } = submission;
       const identity = await retainPayment(kind, variables, ownedKeys.current, key);
       submission.key = identity.key;
-      setPendingKey(identity.key);
+      updateSubmissions();
       // Publish before POST: an immediate terminal response can release storage.
       lifecycle?.onRetained(identity);
-      try {
-        const activity = await post(variables, identity.key);
-        return { activity, key: identity.key };
-      } catch (error) {
-        // An expired wallet journal can preserve the claim even after a
-        // rejected proposal. Release only when a keyed lookup proves it absent;
-        // a lookup failure must leave the identity available for recovery.
-        if (isPaymentRejection(error) && !(await api.payment(identity.key))) {
-          await clearPayment(identity, ownedKeys.current);
-          lifecycle?.onRejected(identity);
-          submission.key = undefined;
-        }
-        throw error;
-      }
+      const activity = await post(variables, identity.key);
+      return { activity, key: identity.key };
     },
     retry: false,
     onError: (error, submission) => lifecycle?.onError(error, submission.variables, submission.key),
@@ -155,15 +172,23 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
       // for node-dependent views while stored payment status is available.
       void invalidate();
     },
+    onSettled: (_result, _error, submission) => {
+      submissions.current.delete(submission);
+      updateSubmissions();
+    },
   });
   const submission = (variables: T, key?: string): PaymentSubmission<T> => {
     try {
       // Capture retained identity at the user action, before a queued lock or
       // terminal status update can release it. This action only replays that key.
-      return {
+      const item = {
         variables,
         key: key ?? retainedPaymentKey(paymentName(kind, variables), ownedKeys.current),
       };
+      // Reserve ownership at the click, before retainPayment can wait for its Web Lock.
+      submissions.current.add(item);
+      updateSubmissions();
+      return item;
     } catch (error) {
       return {
         variables,
@@ -179,21 +204,20 @@ function usePaymentMutation<T extends SendVariables | FaucetVariables>(
       options?.onSuccess?.(result, variables),
   });
   const resume = (identity: PaymentIdentity, options?: PaymentCallbacks<T>) => {
-    setPendingKey(null);
     mutation.mutate(submission(identity.variables as T, identity.key), callbacks(options));
   };
   return {
     ...mutation,
     clear,
+    forget,
     resume,
     claimAnnouncement,
-    pendingKey: mutation.isPending ? pendingKey : null,
+    isSubmitting: (identity: PaymentIdentity) =>
+      pendingSubmissions.some((item) => matches(item, identity)),
     mutate: (variables: T, options?: PaymentCallbacks<T>) => {
-      setPendingKey(null);
       mutation.mutate(submission(variables), callbacks(options));
     },
     mutateAsync: (variables: T) => {
-      setPendingKey(null);
       return mutation.mutateAsync(submission(variables));
     },
   };
@@ -210,7 +234,10 @@ export function useSend(lifecycle?: PaymentLifecycle) {
 export function useFaucet(lifecycle?: PaymentLifecycle) {
   return usePaymentMutation(
     'faucet',
-    (variables: FaucetVariables, key) => api.faucet({ ...variables, idempotency_key: key }),
+    (variables: FaucetVariables, key) =>
+      'address' in variables
+        ? api.faucetAddress({ ...variables, idempotency_key: key })
+        : api.faucet({ ...variables, idempotency_key: key }),
     lifecycle,
   );
 }
@@ -234,19 +261,43 @@ export function usePaymentRequest(): UseMutationResult<
   return useMutation({ mutationFn: (variables) => api.paymentRequest(variables) });
 }
 
-export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
+export function useStartMining(): UseMutationResult<MiningJob, Error, number> & {
+  cleanupError: string | null;
+} {
   const queryClient = useQueryClient();
-  const operation = operationKey('mine', (blocks: number) => String(blocks));
-  return useMutation({
-    mutationFn: (blocks: number) => {
+  const [cleanupError, setCleanupError] = useState<string | null>(null);
+  const mutation = useMutation({
+    mutationFn: async (blocks: number) => {
+      setCleanupError(null);
       const state = queryClient.getQueryData<{ job: MiningJob | null }>(queryKeys.mining)?.job
         ?.state;
-      if (state === 'completed' || state === 'failed') operation.clear(blocks);
-      return api.startMining(blocks, operation.keyFor(blocks));
+      let key: string;
+      let clear: () => void;
+      try {
+        // Storage policy may deny even the getter. Resolve it only on submit,
+        // and retain the retry identity before the server can accept a job.
+        const operation = operationKey('mine', (blocks: number) => String(blocks));
+        if (state === 'completed' || state === 'failed') operation.clear(blocks);
+        key = operation.keyFor(blocks);
+        clear = () => operation.clear(blocks);
+      } catch (cause) {
+        throw new Error(
+          'Browser session storage is unavailable. Allow site storage and retry. No mining request was sent.',
+          { cause },
+        );
+      }
+      const job = await api.startMining(blocks, key);
+      try {
+        // Acceptance is authoritative even if storage cleanup becomes denied.
+        // Use the submitted handle so success never reacquires sessionStorage.
+        clear();
+      } catch (error) {
+        setCleanupError(error instanceof DOMException ? error.message : errorMessage(error));
+      }
+      return job;
     },
     retry: false,
-    onSuccess: async (job, blocks) => {
-      operation.clear(blocks);
+    onSuccess: async (job) => {
       queryClient.setQueryData(queryKeys.mining, { job });
       await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
     },
@@ -254,4 +305,5 @@ export function useStartMining(): UseMutationResult<MiningJob, Error, number> {
       await queryClient.invalidateQueries({ queryKey: queryKeys.mining });
     },
   });
+  return { ...mutation, cleanupError };
 }

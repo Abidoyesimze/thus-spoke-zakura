@@ -16,6 +16,11 @@ const zatoshi = z
   .nonnegative()
   .transform((value) => BigInt(value));
 
+const signedZatoshi = z
+  .number()
+  .int()
+  .transform((value) => BigInt(value));
+
 export const poolSchema = z.enum(['transparent', 'ironwood']);
 export type Pool = z.infer<typeof poolSchema>;
 
@@ -35,21 +40,41 @@ export type PaymentRequest = z.infer<typeof paymentRequestSchema>;
 
 export const activitySchema = z.object({
   id: z.string(),
-  kind: z.enum(['send', 'faucet']).catch('send'),
+  kind: z.enum(['send', 'faucet', 'transaction']),
+  direction: z.enum(['incoming', 'outgoing', 'internal', 'self', 'unknown']).optional(),
   from_account: z.number().int().nullable().default(null),
   /** Null when the recipient is an address outside the development accounts. */
   to_account: z.number().int().nullable().default(null),
+  from_accounts: z.array(z.number().int().min(1).max(5)).optional(),
+  to_accounts: z.array(z.number().int().min(1).max(5)).optional(),
   to_address: z.string().nullable().default(null),
-  source_pool: poolSchema,
-  destination_pool: poolSchema,
+  recipient_addresses: z.array(z.string()).optional(),
+  source_pool: poolSchema.nullable(),
+  destination_pool: poolSchema.nullable(),
+  source_pools: z.array(poolSchema).optional(),
+  destination_pools: z.array(poolSchema).optional(),
   amount_zatoshi: zatoshi,
+  received_zatoshi: zatoshi.nullable().optional(),
+  spent_zatoshi: zatoshi.nullable().optional(),
+  net_zatoshi: signedZatoshi.nullable().optional(),
   txid: z.string(),
   block_hash: z.string().nullable().default(null),
+  mined_height: z.number().int().nonnegative().nullable().optional(),
   status: z.string(),
   last_error: z.string().nullable().default(null),
-  created_at: z.string(),
+  created_at: z.string().nullable(),
 });
 export type Activity = z.infer<typeof activitySchema>;
+
+export const addressFaucetSchema = z.object({
+  address: z.string(),
+  amount_zatoshi: zatoshi,
+  txid: z.string(),
+  block_hash: z.string().nullable(),
+  status: z.string(),
+  last_error: z.string().nullable(),
+});
+export type AddressFaucet = z.infer<typeof addressFaucetSchema>;
 
 /** A single-payment ZIP-321 URI as resolved by the server. */
 export const paymentUriSchema = z.object({
@@ -93,6 +118,8 @@ export const statusSchema = z.object({
   account_count: z.number().int().nonnegative(),
   auto_mine: z.boolean(),
   network: z.string(),
+  settled: z.boolean().optional(),
+  settlement_blocker: z.string().nullable().optional(),
   // Optional so a dashboard built before the server grew this field still loads.
   endpoints: endpointsSchema.optional(),
   // Optional so a newer dashboard remains compatible with an older server.
@@ -162,7 +189,7 @@ export const txInputSchema = z.looseObject({
 
 export const txOutputSchema = z.looseObject({
   n: z.number().int().default(0),
-  valueZat: z.number().int().default(0),
+  valueZat: z.number().int().optional(),
   scriptPubKey: z
     .looseObject({
       addresses: z.array(z.string()).default([]),
@@ -184,12 +211,14 @@ export const transactionSchema = z.looseObject({
   vout: z.array(txOutputSchema).default([]),
   vShieldedSpend: z.array(z.unknown()).default([]),
   vShieldedOutput: z.array(z.unknown()).default([]),
+  vjoinsplit: z.array(z.unknown()).optional(),
   orchard: z
     .looseObject({
       actions: z.array(z.unknown()).default([]),
       /**
        * Net value moving in or out of the Orchard pool. This is public chain
-       * data (ZIP 224), and on an otherwise shielded transfer it is the fee.
+       * data (ZIP 224). It is only the fee when no other pool or transparent
+       * value contributes to the transaction.
        */
       valueBalanceZat: z.number().optional(),
     })
