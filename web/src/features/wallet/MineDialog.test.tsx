@@ -6,6 +6,8 @@ import type { MiningJob } from '@/lib/api';
 import { MineDialog } from './MineDialog';
 import { WalletActionsProvider } from './WalletActions';
 import { useWalletActions } from './wallet-actions-context';
+import { useQueryClient } from '@tanstack/react-query';
+import { queryKeys } from '@/hooks/queries';
 
 const running: MiningJob = {
   id: '00000000-0000-4000-8000-000000000001',
@@ -36,7 +38,67 @@ function OpenMine() {
   return <button onClick={actions.openMine}>Open mine</button>;
 }
 
+function ReplaceJob() {
+  const client = useQueryClient();
+  return (
+    <button
+      onClick={() =>
+        client.setQueryData(queryKeys.mining, {
+          job: { ...running, id: '00000000-0000-4000-8000-000000000002' },
+        })
+      }
+    >
+      Start another job
+    </button>
+  );
+}
+
 describe('MineDialog', () => {
+  it('dismisses a failed job card until another job starts', async () => {
+    mockJob({ ...running, state: 'failed', error: 'Mining failed' });
+    renderWithProviders(
+      <WalletActionsProvider>
+        <ReplaceJob />
+      </WalletActionsProvider>,
+    );
+    const card = await screen.findByRole('region', { name: 'Mining job' });
+    await userEvent.click(within(card).getByRole('button', { name: 'Dismiss mining job' }));
+    expect(screen.queryByRole('region', { name: 'Mining job' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Start another job' }));
+    expect(await screen.findByRole('region', { name: 'Mining job' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss mining job' })).not.toBeInTheDocument();
+  });
+  it.each(['getter', 'read', 'write', 'unretained write'])(
+    'stays closable and sends no mining request when session storage fails on %s',
+    async (failure) => {
+      const fetchSpy = mockJob(null);
+      const onOpenChange = vi.fn();
+      const denied = () => {
+        throw new DOMException('Access denied', 'SecurityError');
+      };
+      if (failure === 'getter') {
+        vi.spyOn(window, 'sessionStorage', 'get').mockImplementation(denied);
+      } else if (failure === 'read') {
+        vi.spyOn(Storage.prototype, 'getItem').mockImplementation(denied);
+      } else {
+        vi.spyOn(Storage.prototype, 'setItem').mockImplementation(
+          failure === 'write' ? denied : () => {},
+        );
+      }
+
+      renderWithProviders(<MineDialog open onOpenChange={onOpenChange} />);
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: 'Mine blocks' })).toBeEnabled(),
+      );
+      await userEvent.click(screen.getByRole('button', { name: 'Mine blocks' }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/browser session storage/i);
+      expect(screen.getByRole('alert')).toHaveTextContent(/no mining request was sent/i);
+      expect(fetchSpy.mock.calls.every(([, init]) => init?.method !== 'POST')).toBe(true);
+      await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    },
+  );
+
   it('restores a running job on a fresh mount without starting mining and polls completion', async () => {
     let job = running;
     const fetchSpy = vi
@@ -136,6 +198,33 @@ describe('MineDialog', () => {
     expect(fetchSpy.mock.calls.filter((call) => call[1]?.method === 'POST')).toHaveLength(1);
     expect(onOpenChange).not.toHaveBeenCalled();
     expect(screen.queryByText('Mined 1 block')).not.toBeInTheDocument();
+  });
+
+  it('shows accepted progress and a separate warning when storage cleanup fails', async () => {
+    let job: MiningJob | null = null;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation((_input, init) => {
+      if (init?.method === 'POST') {
+        vi.spyOn(Storage.prototype, 'removeItem').mockImplementation(() => {
+          throw new DOMException('Access denied', 'SecurityError');
+        });
+        job = { ...running, requested_blocks: 1, completed_blocks: 0 };
+        return Promise.resolve(Response.json(job, { status: 202 }));
+      }
+      return Promise.resolve(Response.json({ job }));
+    });
+    const onOpenChange = vi.fn();
+    renderWithProviders(<MineDialog open onOpenChange={onOpenChange} />);
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Mine blocks' })).toBeEnabled());
+    await userEvent.click(screen.getByRole('button', { name: 'Mine blocks' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      /mining job accepted, but browser storage cleanup failed: Access denied/i,
+    );
+    expect(await screen.findByRole('progressbar')).toHaveAttribute('value', '0');
+    expect(screen.getByRole('button', { name: 'Mining…' })).toBeDisabled();
+    expect(screen.queryByText(/Unable to start mining/)).not.toBeInTheDocument();
+    expect(fetchSpy.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1);
+    await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
   it('reuses the start key after a lost response and dialog remount', async () => {

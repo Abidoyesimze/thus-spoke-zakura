@@ -445,6 +445,8 @@ impl RegtestStack {
                 format!("{}:/config:ro", self.config_dir.display()),
                 "--env".into(),
                 "CONFIG_FILE_PATH=/config/zakurad.toml".into(),
+                "--env".into(),
+                "ZAKURA_STATE__CACHE_DIR=/data".into(),
                 // The private host-mounted config is mode 0700. Keep the
                 // image entrypoint from dropping to its default UID so the
                 // isolated node can read that config while preserving its
@@ -1288,17 +1290,6 @@ impl TerminationSignals {
             }
         }
     }
-}
-
-/// Test-only cancellation seam: it receives a local one-shot signal and takes
-/// the same explicit cleanup path as the live cancellation owner.
-#[cfg(test)]
-async fn shutdown_after_test_cancellation(
-    stack: &mut RegtestStack,
-    cancellation: &mut tokio::sync::oneshot::Receiver<()>,
-) -> Result<()> {
-    let _ = cancellation.await;
-    stack.shutdown().await
 }
 
 fn published_loopback_port(inspect: &DockerInspect, container_port: &str) -> Result<u16> {
