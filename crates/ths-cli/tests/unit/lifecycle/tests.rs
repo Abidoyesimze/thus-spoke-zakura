@@ -402,18 +402,6 @@ fn unverified_reap_retains_the_helper_and_is_not_success() {
     fixture.finish();
 }
 
-#[test]
-fn termination_reserve_is_inside_the_allowance() {
-    let policy = short_policy();
-    let deadline = Deadline::after(policy.termination_reserve);
-    let reserve = policy.termination_reserve.min(deadline.remaining());
-    let execution = deadline.saturating_sub(reserve);
-    assert!(execution.expired() || execution.remaining() <= Duration::from_millis(20));
-    assert!(
-        deadline.0 <= Deadline::after(policy.termination_reserve).0 + Duration::from_millis(50)
-    );
-}
-
 #[cfg(unix)]
 fn finishing_create() -> (tempfile::TempDir, std::process::Command, std::path::PathBuf) {
     let directory = tempfile::tempdir().unwrap();

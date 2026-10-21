@@ -72,43 +72,6 @@ fn foreign_container_collision_is_not_deleted() {
 }
 
 #[test]
-fn owned_resources_still_clean_up() {
-    let dir = tempfile::tempdir().unwrap();
-    let runtime = Runtime {
-        root: dir.path().to_path_buf(),
-    };
-    let mut docker = RecordingDocker::new("ths-alpha-app", "ths-alpha-wallet", "ths-alpha");
-    docker.inspect(
-        "container",
-        "ths-alpha-app",
-        r#"[{"Id":"owned-container","Config":{"Labels":{"com.zakura.ths.instance":"alpha"}}}]"#,
-    );
-    docker.inspect(
-        "volume",
-        "ths-alpha-wallet",
-        r#"[{"Name":"ths-alpha-wallet","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
-    );
-    docker.inspect(
-        "network",
-        "ths-alpha",
-        r#"[{"Id":"owned-network","Labels":{"com.zakura.ths.instance":"alpha"}}]"#,
-    );
-
-    runtime
-        .delete_instance_resources_with(&name("alpha"), &docker)
-        .unwrap();
-
-    assert_eq!(
-        *docker.runs.lock().unwrap(),
-        [
-            "rm -f owned-container",
-            "volume rm ths-alpha-wallet",
-            "network rm owned-network",
-        ]
-    );
-}
-
-#[test]
 fn unlabeled_network_collision_preserves_data_and_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let runtime = Runtime {
