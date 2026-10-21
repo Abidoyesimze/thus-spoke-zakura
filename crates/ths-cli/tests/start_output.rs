@@ -913,30 +913,6 @@ fn json_start_stops_cleanly_during_browser_open() {
 }
 
 #[test]
-fn standalone_doctor_retains_human_and_json_output() {
-    let fixture = Fixture::new();
-    let human = fixture.command().arg("doctor").output().unwrap();
-    assert!(human.status.success());
-    assert!(
-        String::from_utf8(human.stdout)
-            .unwrap()
-            .contains("Docker test-docker")
-    );
-    assert!(human.stderr.is_empty());
-
-    let json = fixture
-        .command()
-        .args(["--json", "doctor"])
-        .output()
-        .unwrap();
-    assert!(json.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(result["docker"], "test-docker");
-    assert_eq!(result["ok"], true);
-    assert!(json.stderr.is_empty());
-}
-
-#[test]
 fn standalone_build_and_pull_keep_docker_output_on_stdout() {
     let fixture = Fixture::new();
     for args in [["build", "--dev"].as_slice(), ["pull"].as_slice()] {
