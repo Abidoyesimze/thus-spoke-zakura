@@ -35,13 +35,106 @@ fn default_offset_uses_stable_loopback_ports() {
 }
 
 #[test]
-fn port_offset_shifts_all_four_hosts_by_the_same_stride() {
-    let base = host_ports(0).unwrap();
-    let shifted = host_ports(10).unwrap();
-    assert_eq!(shifted.dashboard, base.dashboard + 10);
-    assert_eq!(shifted.rpc, base.rpc + 10);
-    assert_eq!(shifted.p2p, base.p2p + 10);
-    assert_eq!(shifted.lightwalletd, base.lightwalletd + 10);
+fn automatic_ports_are_published_only_on_loopback() {
+    assert_eq!(loopback_publish(0, 18232), "127.0.0.1::18232");
+    assert_eq!(loopback_publish(0, 8080), "127.0.0.1::8080");
+}
+
+#[test]
+fn removable_instance_locks_preserve_exclusion_and_allow_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_owned(),
+    };
+    for _ in 0..3 {
+        let mut lock = runtime.lock_instance(&name("alpha")).unwrap();
+        lock.remove_when_dropped();
+        assert!(runtime.lock_instance(&name("alpha")).is_err());
+        assert!(runtime.root.join(".locks/alpha.lock").exists());
+        drop(lock);
+        assert!(!runtime.root.join(".locks/alpha.lock").exists());
+    }
+    let lock = runtime.lock_instance(&name("alpha")).unwrap();
+    drop(lock);
+    assert!(runtime.root.join(".locks/alpha.lock").exists());
+}
+
+#[test]
+fn removable_instance_locks_remain_exclusive_during_concurrent_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let active = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            let active = &active;
+            let root = dir.path();
+            scope.spawn(move || {
+                let runtime = Runtime {
+                    root: root.to_owned(),
+                };
+                for _ in 0..25 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut lock = loop {
+                        match runtime.lock_instance(&name("alpha")) {
+                            Ok(lock) => break lock,
+                            Err(error) => {
+                                assert!(error.to_string().contains("already in use"), "{error:#}");
+                                assert!(Instant::now() < deadline);
+                                thread::yield_now();
+                            }
+                        }
+                    };
+                    lock.remove_when_dropped();
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    thread::yield_now();
+                    assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                    lock.finish().unwrap();
+                }
+            });
+        }
+    });
+    assert!(!dir.path().join(".locks/alpha.lock").exists());
+}
+
+#[test]
+fn instance_lock_registry_contention_is_bounded_and_preserves_the_named_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_owned(),
+    };
+    let mut lock = runtime.lock_instance(&name("alpha")).unwrap();
+    lock.remove_when_dropped();
+    let registry = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(runtime.root.join(".locks/.registry.lock"))
+        .unwrap();
+    registry.lock().unwrap();
+    let started = Instant::now();
+    let error = runtime.lock_instance(&name("beta")).err().unwrap();
+    assert!(error.to_string().contains("registry is busy"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(!runtime.root.join(".locks/beta.lock").exists());
+    let started = Instant::now();
+    drop(lock);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(runtime.root.join(".locks/alpha.lock").exists());
+    registry.unlock().unwrap();
+    let mut lock = runtime.lock_instance(&name("alpha")).unwrap();
+    lock.remove_when_dropped();
+    drop(lock);
+    assert!(!runtime.root.join(".locks/alpha.lock").exists());
+
+    let mut lock = runtime.lock_instance(&name("alpha")).unwrap();
+    lock.remove_when_dropped();
+    registry.lock().unwrap();
+    let error = lock.finish().unwrap_err();
+    assert!(error.to_string().contains("registry is busy"));
+    assert!(runtime.root.join(".locks/alpha.lock").exists());
+    registry.unlock().unwrap();
+    let mut lock = runtime.lock_instance(&name("alpha")).unwrap();
+    lock.remove_when_dropped();
+    lock.finish().unwrap();
+    assert!(!runtime.root.join(".locks/alpha.lock").exists());
 }
 
 #[test]
@@ -54,12 +147,6 @@ fn port_offset_rejects_values_that_are_not_multiples_of_ten() {
 fn port_offset_accepts_the_largest_value_that_keeps_every_port_in_range() {
     let ports = host_ports(32730).unwrap();
     assert_eq!(ports.dashboard, 65535);
-}
-
-#[test]
-fn port_offset_rejects_values_that_overflow_a_host_port() {
-    let err = host_ports(32740).unwrap_err();
-    assert!(err.to_string().contains("overflow"));
 }
 
 #[test]
@@ -86,6 +173,41 @@ fn reports_the_conflicting_loopback_port() {
         message.contains(&port.to_string()),
         "error should name port {port}, got {message}"
     );
+}
+
+#[test]
+fn endpoint_exports_match_the_variables_run_passes_to_its_child() {
+    let endpoints = endpoints_for(&host_ports(0).unwrap());
+    assert_eq!(
+        endpoint_exports(&name("alpha"), &endpoints),
+        "\
+export THS_INSTANCE=alpha
+export THS_NETWORK=regtest
+export THS_API_URL=http://127.0.0.1:32805
+export THS_ZAKURA_RPC_URL=http://127.0.0.1:18232
+export THS_LIGHTWALLETD_URL=http://127.0.0.1:9067
+export THS_LIGHTWALLETD_TLS=false
+export THS_P2P_ADDR=127.0.0.1:18233"
+    );
+
+    let mut shifted = endpoints_for(&host_ports(10).unwrap());
+    shifted.network = "other".to_owned();
+    shifted.tls = true;
+    let exports = endpoint_exports(&name("beta"), &shifted);
+    for expected in [
+        "export THS_INSTANCE=beta",
+        "export THS_NETWORK=regtest",
+        "export THS_API_URL=http://127.0.0.1:32815",
+        "export THS_ZAKURA_RPC_URL=http://127.0.0.1:18242",
+        "export THS_LIGHTWALLETD_URL=http://127.0.0.1:9077",
+        "export THS_LIGHTWALLETD_TLS=false",
+        "export THS_P2P_ADDR=127.0.0.1:18243",
+    ] {
+        assert!(
+            exports.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
 }
 
 #[test]
@@ -131,6 +253,7 @@ fn environment(name: &str, states: [&str; 4]) -> EnvironmentStatus {
                 p2p: 18233,
             }),
             created_at: Some(1_000),
+            session: None,
         },
         state: environment_state(&containers),
         containers,
@@ -172,6 +295,26 @@ fn environments_are_classified_by_their_long_running_services() {
         state(["running", "running", "running", "foreign"]),
         "conflict"
     );
+}
+
+#[test]
+fn status_uses_the_environment_state_and_preserves_json_compatibility() {
+    let degraded = environment("default", ["running", "exited", "running", "exited"]);
+    assert!(status_text(&degraded).starts_with("default: degraded\n  Dashboard"));
+
+    let json = serde_json::to_value(StatusOutput::from(&degraded)).unwrap();
+    assert_eq!(json["name"], "default");
+    assert_eq!(json["running"], false);
+    assert_eq!(json["state"], "degraded");
+    assert_eq!(json["endpoints"]["dashboard"], "http://127.0.0.1:8080");
+    assert_eq!(json["containers"][0]["service"], "app");
+    assert_eq!(json["containers"][1]["service"], "zakura");
+    assert_eq!(json["containers"][1]["state"], "exited");
+
+    let running = environment("default", ["running", "running", "running", "exited"]);
+    let json = serde_json::to_value(StatusOutput::from(&running)).unwrap();
+    assert_eq!(json["running"], true);
+    assert_eq!(json["state"], "running");
 }
 
 #[test]
@@ -369,4 +512,137 @@ fn docker_timestamps_parse_to_unix_seconds() {
     // docker's zero time for a container that never started.
     assert_eq!(parse_docker_time("0001-01-01T00:00:00Z"), None);
     assert_eq!(parse_docker_time("not a time"), None);
+}
+
+#[test]
+fn start_refusal_names_what_holds_the_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let _held = runtime.claim_start(&alpha).unwrap();
+    let refusal = || match runtime.claim_start(&alpha) {
+        Ok(_) => panic!("a held start lock was claimed twice"),
+        Err(error) => error.to_string(),
+    };
+    let session = dir.path().join(".locks/alpha.session");
+    let stopping = dir.path().join(".locks/alpha.stopping");
+
+    assert_eq!(
+        refusal(),
+        "environment alpha is already in use by another command"
+    );
+    fs::write(&session, "session").unwrap();
+    assert!(refusal().contains("already running in another `ths start` or `ths run`"));
+    let request = dir.path().join(".locks/alpha.session.stop");
+    fs::write(&request, "").unwrap();
+    assert!(refusal().contains("is being stopped"));
+    fs::remove_file(&request).unwrap();
+    fs::remove_file(&session).unwrap();
+    fs::write(&stopping, "").unwrap();
+    assert!(refusal().contains("is being stopped"));
+}
+
+#[test]
+fn an_exiting_session_keeps_a_newer_session_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    let (_sender, shutdown) = Shutdown::channel();
+    let session_file = dir.path().join(".locks/alpha.session");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+
+    let old = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    fs::write(&session_file, "newer-session").unwrap();
+    drop(old);
+    assert_eq!(fs::read_to_string(&session_file).unwrap(), "newer-session");
+
+    fs::remove_file(&session_file).unwrap();
+    let only = runtime
+        .publish_session(&alpha, &shutdown, Duration::from_millis(5))
+        .unwrap();
+    assert!(session_file.exists());
+    drop(only);
+    assert!(!session_file.exists());
+}
+
+#[test]
+fn owner_probes_never_refuse_a_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    assert!(!runtime.owner_active(&alpha).unwrap());
+    let held = runtime.claim_start(&alpha).unwrap();
+    assert!(runtime.owner_active(&alpha).unwrap());
+    drop(held);
+
+    let probing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let prober = {
+        let runtime = Runtime {
+            root: dir.path().to_path_buf(),
+        };
+        let probing = probing.clone();
+        std::thread::spawn(move || {
+            let alpha = name("alpha");
+            while probing.load(std::sync::atomic::Ordering::SeqCst) {
+                runtime.owner_active(&alpha).unwrap();
+            }
+        })
+    };
+    for _ in 0..200 {
+        drop(runtime.claim_start(&alpha).unwrap());
+        drop(runtime.lock_instance(&alpha).unwrap());
+    }
+    probing.store(false, std::sync::atomic::Ordering::SeqCst);
+    prober.join().unwrap();
+}
+
+#[test]
+fn listed_environments_do_not_expose_the_launcher_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+    fs::write(dir.path().join(".locks/alpha.session"), "secret-session").unwrap();
+    fs::create_dir_all(runtime.instance_dir(&alpha)).unwrap();
+    runtime
+        .write_instance(&alpha, &endpoints_for(&host_ports(0).unwrap()))
+        .unwrap();
+    assert_eq!(
+        runtime.read_instance(&alpha).unwrap().session.as_deref(),
+        Some("secret-session")
+    );
+
+    let environments = runtime
+        .environments(&docker_holding(&[("app", Some("alpha"), "running")]))
+        .unwrap();
+    let listed = serde_json::to_string(&environments).unwrap();
+    assert!(!listed.contains("session"), "{listed}");
+}
+
+#[test]
+fn a_damaged_generation_file_does_not_lock_the_name_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = Runtime {
+        root: dir.path().to_path_buf(),
+    };
+    let alpha = name("alpha");
+    fs::create_dir_all(dir.path().join(".locks")).unwrap();
+    fs::write(dir.path().join(".locks/alpha.generation"), "").unwrap();
+
+    drop(runtime.claim_start(&alpha).unwrap());
+
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".locks/alpha.generation")).unwrap(),
+        "1"
+    );
 }

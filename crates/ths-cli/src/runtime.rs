@@ -20,8 +20,10 @@ use std::{
 
 use crate::lifecycle::{
     Cancellation, CapturedOutput, CommandFailure, CommandFailureKind, Deadline, HelperSet,
-    LifecyclePolicy, OutputMode, run,
+    LifecyclePolicy, OutputMode, run, run_leaving_running_on_timeout,
 };
+#[cfg(test)]
+use crate::lifecycle::{ChildOps, run_observed};
 
 use anyhow::{Context, Result, anyhow, bail};
 use directories::ProjectDirs;
@@ -58,6 +60,7 @@ use crate::client::{RuntimeStatus, runtime_status};
 pub(crate) use instance::Endpoints;
 pub(crate) use resources::container_running;
 use resources::*;
+mod rpc;
 mod runner;
 use runner::*;
 mod startup;
