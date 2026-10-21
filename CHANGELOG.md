@@ -4,6 +4,12 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
 
 ## Unreleased
 
+- **Wallet quotes from the CLI:** `ths wallet quote --from <N> --source-pool
+  <POOL> --destination-pool <POOL>` prints an account's spendable funds, fee,
+  and maximum send for one pool route without sending, with integer zatoshi
+  fields under `--json`.
+  [#294](https://github.com/zcashlabs/thus-spoke-zakura/issues/294)
+
 ## v0.4.1
 
 This patch release stops the launcher from trusting the compromised eMudhra

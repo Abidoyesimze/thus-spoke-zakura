@@ -181,6 +181,12 @@ pub(crate) enum Command {
     List,
     /// Check local Docker and configuration prerequisites.
     Doctor,
+    /// Print a shell completion script.
+    Completions {
+        /// Shell that will load the script.
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,6 +198,19 @@ pub(crate) enum WalletCommand {
         /// Maximum number of entries to print (1-100).
         #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..=100))]
         limit: Option<u32>,
+    },
+    /// Show an account's spendable funds, fee, and maximum send for one pool
+    /// route, without sending.
+    Quote {
+        /// Account index to quote (1-5).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=5))]
+        from: u8,
+        /// Pool the quoted send would spend from.
+        #[arg(long = "source-pool", value_enum)]
+        source_pool: Pool,
+        /// Pool the quoted send would pay into. The fee depends on it.
+        #[arg(long = "destination-pool", value_enum)]
+        destination_pool: Pool,
     },
     /// Send faucet funds from the treasury to one or more accounts.
     Faucet {
@@ -288,6 +307,24 @@ pub(crate) struct SendArgs {
     /// Text memo for the recipient (up to 512 bytes; ironwood destinations only).
     #[arg(long, value_parser = parse_memo)]
     pub(crate) memo: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[value(rename_all = "lower")]
+pub(crate) enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl CompletionShell {
+    pub(crate) fn generator(self) -> clap_complete::Shell {
+        match self {
+            Self::Bash => clap_complete::Shell::Bash,
+            Self::Zsh => clap_complete::Shell::Zsh,
+            Self::Fish => clap_complete::Shell::Fish,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]

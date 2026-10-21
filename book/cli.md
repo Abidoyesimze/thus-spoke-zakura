@@ -243,8 +243,9 @@ Prints or streams logs for a service in the named environment. Defaults to the
 `app` (dashboard/server) service. Without `--tail` or `--head`, it prints
 all available Docker logs. Counts must be positive. `--head` conflicts with
 `--tail` and `--follow`; `--tail` can be combined with `--follow`. Output remains
-log text even with the global `--json` flag. If the reader closes the pipe, the
-command stops without an error.
+log text even with the global `--json` flag. App lines are plain text, without
+terminal color codes. If the reader closes the pipe, the command stops without an
+error.
 
 ```console
 ths logs                       # available logs from the app service
@@ -489,6 +490,7 @@ and Send dialogs, from a script or terminal:
 | --- | --- |
 | `ths wallet balances` | Print each account's balances and addresses |
 | `ths wallet activity` | Print canonical incoming and outgoing wallet history, plus pending or failed payments |
+| `ths wallet quote` | Show the spendable funds, fee, and maximum send for one account and pool route, without sending |
 | `ths wallet faucet` | Fund one or more accounts from the treasury |
 | `ths wallet send` | Send funds between accounts or pools, with an optional memo, or pay a `zcash:` URI |
 | `ths wallet shield` | Spend transparent funds into the same or another account's Ironwood balance |
@@ -557,6 +559,59 @@ transparent source for an external incoming transaction is best effort and
 uses one short, shared lookup budget, so an unavailable Zakura node does not
 hold up the activity response.
 
+### `ths wallet quote --from <N> --source-pool <POOL> --destination-pool <POOL>`
+
+Shows how much one account could send along one pool route, and the network
+fee for that route, without sending anything. It asks the same dry-run quote
+the dashboard's **Send ZEC** dialog uses for its **Max** button
+(`POST /api/v1/send/quote`); see
+[quoting a send](accounts-and-balances.md#zec-zatoshi-and-spendability).
+
+- `--from <N>` (required): account index, 1–5. The treasury account cannot be
+  quoted.
+- `--source-pool <ironwood|transparent>` (required): pool the send would spend
+  from.
+- `--destination-pool <ironwood|transparent>` (required): pool the send would
+  pay into. Both pools are required because the fee depends on the route.
+
+```console
+ths wallet quote --from 1 --source-pool ironwood --destination-pool ironwood
+ths --name demo --json wallet quote --from 1 --source-pool ironwood --destination-pool transparent
+```
+
+The text output shows ZEC; `--json` keeps the server's integer zatoshi fields
+and adds the route they answer:
+
+```json
+{
+  "from_account": 1,
+  "source_pool": "ironwood",
+  "destination_pool": "transparent",
+  "available_zatoshi": 500000000,
+  "fee_zatoshi": 15000,
+  "max_zatoshi": 499985000
+}
+```
+
+- `available_zatoshi`: funds the quote's proposal could spend from the source
+  pool. This can be lower than the pool's balance in `ths wallet balances`,
+  for example while change is not yet spendable.
+- `fee_zatoshi`: the fee for spending them along this route.
+- `max_zatoshi`: the largest amount `ths wallet send` could send along this
+  route. `--max` on `send`, `shield`, and `unshield` asks for its own quote
+  when it runs, so it can submit a different amount if the wallet has changed.
+
+The quote is a **snapshot** for the selected route, not a reservation: a later
+payment, faucet, or mined block can change it, and it does not simulate one
+particular amount. The fee depends on the destination pool rather than which
+account receives, so the quote applies to a send to any development account
+in that pool. Like `balances`, the command first requires
+`wallet_sync.state: ready`.
+
+The command never submits a payment and never saves an idempotency key. An
+empty pool is a valid answer: `max_zatoshi` is `0` and the command exits 0.
+Invalid arguments, a syncing or failed wallet, and server errors exit nonzero.
+
 ### `ths wallet faucet --accounts <LIST> [--amount <ZEC>] [--pool <POOL>]`
 
 Funds one or more accounts from the treasury faucet in a single command.
@@ -605,7 +660,9 @@ the dashboard's **Send ZEC** dialog and uses the same endpoint
 - `--amount <ZEC>` / `--max` (exactly one required): send an explicit amount,
   or ask `POST /api/v1/send/quote` for the maximum spendable amount after the
   network fee. The CLI submits the server's quoted `max_zatoshi`; it does not
-  calculate the fee itself.
+  calculate the fee itself. Spendable source funds must cover an explicit
+  amount plus the fee; use the quote's `max_zatoshi` as the ceiling, rather
+  than the displayed balance. See [`ths wallet quote`](#ths-wallet-quote---from-n---source-pool-pool---destination-pool-pool).
 - `--source-pool <ironwood|transparent>`: pool to spend from (default
   `ironwood`).
 - `--destination-pool <ironwood|transparent>`: pool the destination account
@@ -790,6 +847,38 @@ account 1 to account 3, all without opening the dashboard.
 
 ---
 
+## `ths completions bash|zsh|fish`
+
+Prints a completion script for bash, zsh, or fish. The script covers every
+`ths` command and flag, including `wallet` subcommands. It does not start an
+environment or contact Docker. Save it where your shell loads completions,
+then open a new terminal.
+
+```console
+# bash (requires the bash-completion package)
+mkdir -p ~/.local/share/bash-completion/completions
+ths completions bash > ~/.local/share/bash-completion/completions/ths
+
+# zsh
+mkdir -p ~/.zsh/completions
+ths completions zsh > ~/.zsh/completions/_ths
+
+# fish
+mkdir -p ~/.config/fish/completions
+ths completions fish > ~/.config/fish/completions/ths.fish
+```
+
+Zsh loads `~/.zsh/completions` only when that directory is on `fpath` before
+`compinit`:
+
+```zsh
+fpath=(~/.zsh/completions $fpath)
+autoload -U compinit
+compinit
+```
+
+---
+
 ## Command summary
 
 | Command | What it does |
@@ -816,6 +905,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths faucet <ADDRESS> [--amount]` | Send disposable ZEC to any Regtest address |
 | `ths wallet balances [--json]` | Print the five accounts' balances and addresses |
 | `ths wallet activity [--limit N] [--json]` | Print recent development-wallet activity |
+| `ths wallet quote --from --source-pool --destination-pool [--json]` | Show an account's maximum send and fee for one pool route without sending |
 | `ths wallet faucet --accounts <LIST> [--amount] [--pool]` | Fund one or more of the five accounts by index |
 | `ths wallet send --from --to (--amount \| --max) [--source-pool] [--destination-pool] [--memo]` | Send between accounts or pools, optionally with an Ironwood memo |
 | `ths wallet send --from --uri [--amount \| --max] [--source-pool]` | Pay a ZIP-321 `zcash:` URI to any Regtest address |
@@ -828,6 +918,7 @@ account 1 to account 3, all without opening the dashboard.
 | `ths doctor` | Check Docker and local configuration |
 | `ths update [--check]` | Check for or install a newer release |
 | `ths uninstall` | Remove the installed launcher executable |
+| `ths completions bash\|zsh\|fish` | Print a shell completion script for every command and flag |
 
 Every command accepts `--name` for isolated environments. For more on running
 them side by side, see [Chapter
