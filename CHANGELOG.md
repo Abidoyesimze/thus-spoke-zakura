@@ -4,13 +4,68 @@ For earlier releases, see [GitHub Releases](https://github.com/zcashlabs/thus-sp
 
 ## Unreleased
 
-- **Deletion notices survive shutdown polling:** A polling shutdown check could
-  consume a queued "another command deleted this environment" notice and
-  discard it, and `wait_timeout` reported such a notice as an interruption.
-  Deletion is now latched separately from Ctrl+C, so the reason survives any
-  caller that has already read it. No caller can reach this today; it removes a
-  latent hazard for future ones.
-  [#305](https://github.com/zcashlabs/thus-spoke-zakura/issues/305)
+## v0.4.1
+
+This patch release stops the launcher from trusting the compromised eMudhra
+certificate authorities. It also fixes Ironwood-only sends, transparent spends
+made by another wallet, CLI payment retries, interrupted startup, and several
+dashboard forms.
+
+### Action required
+
+- **Security update:** Update to v0.4.1. Earlier launchers trust TLS
+  certificates issued through eight compromised eMudhra intermediate CAs when
+  they check GitHub for a new release; v0.4.1 rejects them. The dashboard,
+  APIs, and Regtest services make no internet TLS connections and were not
+  affected. [#423](https://github.com/zcashlabs/thus-spoke-zakura/pull/423)
+- **Before installing or updating:** The installer and `ths update` download
+  releases with your system `curl`, which uses the operating system's trust
+  store rather than the launcher's. Update your OS or `ca-certificates` package
+  first. On macOS, `/usr/bin/curl` still trusted the affected certificates when
+  this release was prepared; the
+  [eMudhra disclosure](https://emudhra.we-have-a-problem.com/) describes a
+  workaround. To check an archive without relying on TLS, run
+  `gh attestation verify <archive> --repo zcashlabs/thus-spoke-zakura`.
+
+### Fixes
+
+- **Wallet:** A fixed-amount send from Ironwood spends only Ironwood notes
+  instead of falling back to Sapling funds. Transparent funds spent by another
+  wallet client for the same account no longer stay in the balance.
+  [#402](https://github.com/zcashlabs/thus-spoke-zakura/pull/402),
+  [#396](https://github.com/zcashlabs/thus-spoke-zakura/pull/396)
+- **CLI payments:** `ths wallet send`, `ths faucet`, and `ths wallet faucet`
+  keep their idempotency keys until the result is printed, so a retry after an
+  output failure resumes the same payment instead of making another.
+  [#395](https://github.com/zcashlabs/thus-spoke-zakura/pull/395)
+- **Startup recovery:** `ths stop` and `ths start` recover an instance whose
+  network or volume create was interrupted.
+  [#419](https://github.com/zcashlabs/thus-spoke-zakura/pull/419)
+- **Dashboard:** Closing Send while its fee quote is pending no longer submits
+  the payment. Send and Request reject amounts above 21,000,000 ZEC, and Mine
+  stays usable when the browser blocks `sessionStorage`. Address pages reject
+  non-integer balances instead of crashing, theme changes in another tab apply
+  immediately, and block transaction columns stay aligned on mobile.
+  [#275](https://github.com/zcashlabs/thus-spoke-zakura/pull/275),
+  [#327](https://github.com/zcashlabs/thus-spoke-zakura/pull/327),
+  [#363](https://github.com/zcashlabs/thus-spoke-zakura/pull/363),
+  [#342](https://github.com/zcashlabs/thus-spoke-zakura/pull/342),
+  [#334](https://github.com/zcashlabs/thus-spoke-zakura/pull/334),
+  [#389](https://github.com/zcashlabs/thus-spoke-zakura/pull/389)
+
+### Project updates
+
+- **Maintainability:** Redundant Rust tests and a 122-second sleep are removed
+  from CI. Shutdown polling no longer discards a notice that another command
+  deleted the environment, a latent hazard with no current caller.
+  [#421](https://github.com/zcashlabs/thus-spoke-zakura/pull/421),
+  [#416](https://github.com/zcashlabs/thus-spoke-zakura/pull/416)
+
+### Credits and comparison
+
+- **Contributors:** Thank you to @AkshatGada, @MayurK-cmd, @megabyte0x,
+  @mexes20, @Not-Sarthak, @RajeshRk18, @Shiva953, @tanctl, and @zeeshan8281.
+- **Full changelog:** [Compare v0.4.0 with v0.4.1](https://github.com/zcashlabs/thus-spoke-zakura/compare/v0.4.0...v0.4.1).
 
 ## v0.4.0
 

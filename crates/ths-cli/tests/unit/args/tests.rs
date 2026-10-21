@@ -382,36 +382,57 @@ fn shield_and_unshield_accept_exactly_one_amount_mode() {
 }
 
 #[test]
-fn completions_accept_only_bash_zsh_and_fish() {
-    for (shell, expected) in [
-        ("bash", CompletionShell::Bash),
-        ("zsh", CompletionShell::Zsh),
-        ("fish", CompletionShell::Fish),
-    ] {
-        let cli = Cli::try_parse_from(["ths", "completions", shell]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Completions { shell }) if shell == expected
-        ));
-    }
-
-    let cli =
-        Cli::try_parse_from(["ths", "--name", "alice", "--json", "completions", "zsh"]).unwrap();
-    assert!(cli.json);
+fn parses_rpc_method_params_and_flags() {
+    let cli = Cli::try_parse_from([
+        "ths",
+        "--name",
+        "alice",
+        "rpc",
+        "--raw",
+        "getblockhash",
+        "0",
+    ])
+    .unwrap();
     assert_eq!(cli.name.unwrap().to_string(), "alice");
+    let Some(Command::Rpc {
+        raw,
+        yes,
+        method,
+        params,
+    }) = cli.command
+    else {
+        panic!("expected rpc");
+    };
+    assert!(raw);
+    assert!(!yes);
+    assert_eq!(method, "getblockhash");
+    assert_eq!(params, ["0"]);
+
+    let cli = Cli::try_parse_from(["ths", "rpc", "getblockcount", "--raw"]).unwrap();
     assert!(matches!(
         cli.command,
-        Some(Command::Completions {
-            shell: CompletionShell::Zsh
+        Some(Command::Rpc {
+            raw: true,
+            yes: false,
+            ..
         })
     ));
 
-    assert!(Cli::try_parse_from(["ths", "completions"]).is_err());
-    assert!(Cli::try_parse_from(["ths", "completions", "zsh", "bash"]).is_err());
-    for shell in ["", " ", "powershell", "elvish", "ZSH", "Bash", "nu"] {
-        assert!(
-            Cli::try_parse_from(["ths", "completions", shell]).is_err(),
-            "accepted shell {shell:?}"
-        );
-    }
+    let cli = Cli::try_parse_from(["ths", "rpc", "--yes", "stop"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::Rpc {
+            raw: false,
+            yes: true,
+            ..
+        })
+    ));
+
+    let cli = Cli::try_parse_from(["ths", "rpc", "getblock", "-1"]).unwrap();
+    let Some(Command::Rpc { params, .. }) = cli.command else {
+        panic!("expected rpc");
+    };
+    assert_eq!(params, ["-1"]);
+
+    assert!(Cli::try_parse_from(["ths", "rpc"]).is_err());
 }

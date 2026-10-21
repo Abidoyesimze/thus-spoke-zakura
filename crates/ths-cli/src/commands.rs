@@ -62,6 +62,12 @@ pub(crate) fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         }
         Command::Open => runtime.open(&name),
         Command::Endpoints { env } => runtime.endpoints(&name, cli.json, env),
+        Command::Rpc {
+            raw,
+            yes,
+            method,
+            params,
+        } => runtime.rpc(&name, &method, &params, raw, yes),
         Command::Tx { txid } => runtime.explorer(&name, "transactions", Some(&txid), cli.json),
         Command::Block { id } => runtime.explorer(&name, "blocks", id.as_deref(), cli.json),
         Command::Mine { blocks } => runtime.mine(&name, blocks, cli.json),
