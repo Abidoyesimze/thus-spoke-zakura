@@ -7,7 +7,6 @@ use crate::wallet::PreparedPayment;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use std::collections::HashMap;
 use tower::ServiceExt;
 use transparent::{
     address::Script,
