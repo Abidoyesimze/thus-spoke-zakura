@@ -6,7 +6,7 @@ use transparent::{
 use zcash_client_backend::{
     data_api::testing::{
         self, AddressType, IronwoodFvk, TestBuilder, orchard::OrchardPoolTester,
-        pool::ShieldedPoolTester,
+        pool::ShieldedPoolTester, sapling::SaplingPoolTester,
     },
     wallet::WalletTransparentOutput,
 };
@@ -21,7 +21,7 @@ use super::*;
 
 type TestState = testing::TestState<BlockCache, TestDb, LocalNetwork>;
 
-/// The SDK's default test network with every upgrade through NU6.3 active from
+/// The SDK's default test network with every upgrade through NU7 active from
 /// Sapling activation, like the local chain, so shielded value lives in Ironwood.
 fn test_state() -> TestState {
     let activation = Some(BlockHeight::from_u32(100_000));
@@ -30,6 +30,7 @@ fn test_state() -> TestState {
         nu6_1: activation,
         nu6_2: activation,
         nu6_3: activation,
+        nu7: activation,
         ..TestBuilder::<(), ()>::DEFAULT_NETWORK
     };
     TestBuilder::new()
@@ -56,6 +57,17 @@ fn fund_ironwood(st: &mut TestState, value: u64) {
     let (height, _, _) = st.generate_next_block(&fvk, AddressType::DefaultExternal, value);
     st.scan_cached_blocks(height, 1);
     assert_eq!(st.get_total_balance(account_id), value);
+    add_empty_blocks(st, 5);
+}
+
+fn fund_sapling(st: &mut TestState, value: u64) {
+    let fvk = SaplingPoolTester::test_account_fvk(st);
+    let (height, _, _) = st.generate_next_block(
+        &fvk,
+        AddressType::DefaultExternal,
+        Zatoshis::const_from_u64(value),
+    );
+    st.scan_cached_blocks(height, 1);
     add_empty_blocks(st, 5);
 }
 
@@ -105,6 +117,196 @@ fn fund_transparent(st: &mut TestState, value: u64) {
     st.wallet_mut()
         .put_received_transparent_utxo(&utxo)
         .unwrap();
+}
+
+#[tokio::test]
+async fn canonical_balances_ignore_unmined_effects_without_deleting_them() {
+    let mut st = test_state();
+    fund_ironwood(&mut st, 100_000_000);
+    fund_transparent(&mut st, 20_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wallet.db");
+    st.wallet()
+        .conn()
+        .execute("VACUUM INTO ?1", [path.to_str().unwrap()])
+        .unwrap();
+    let wallet = RealWallet {
+        db: Arc::new(Mutex::new(
+            WalletDb::for_path(&path, *st.network(), SystemClock, UnwrapErr(SysRng)).unwrap(),
+        )),
+        account_ids: vec![st.test_account().unwrap().id()],
+        lightwalletd: String::new(),
+        wallet_path: path.clone(),
+    };
+    let store = crate::db::Store::open(dir.path().join("ths.db")).unwrap();
+    store.initialize().unwrap();
+    let mut accounts = vec![store.account(1).unwrap()];
+    wallet.apply_balances(&mut accounts).await.unwrap();
+    assert_eq!(accounts[0].transparent_zatoshi, 20_000_000);
+    assert_eq!(accounts[0].ironwood_zatoshi, 100_000_000);
+
+    // Model the rows retained by the SDK after a transaction is orphaned. Pool-local
+    // output ids deliberately overlap, so spending one pool must not spend another.
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let height = u32::from(
+        st.wallet()
+            .block_fully_scanned()
+            .unwrap()
+            .unwrap()
+            .block_height(),
+    );
+    db.execute(
+        "INSERT INTO transactions(txid, min_observed_height, expiry_height)
+         VALUES (zeroblob(32), 0, ?1)",
+        [height + 40],
+    )
+    .unwrap();
+    let tx = db.last_insert_rowid();
+    db.execute(
+        "INSERT INTO ironwood_received_notes(
+            transaction_id, action_index, account_id, diversifier, value, rho, rseed,
+            is_change, note_version)
+         SELECT ?1, 0, account_id, diversifier, 10_000_000, rho, rseed, 1, note_version
+         FROM ironwood_received_notes WHERE id = 1",
+        [tx],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO transparent_received_outputs(
+            transaction_id, output_index, account_id, address, script, value_zat, address_id)
+         SELECT ?1, 0, account_id, address, script, 5_000_000, address_id
+         FROM transparent_received_outputs WHERE id = 1",
+        [tx],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO ironwood_received_note_spends VALUES (1, ?1)",
+        [tx],
+    )
+    .unwrap();
+    for mined in [None, Some(height + 1), Some(height), None] {
+        db.execute(
+            "UPDATE transactions SET mined_height = ?1 WHERE id_tx = ?2",
+            rusqlite::params![mined, tx],
+        )
+        .unwrap();
+        wallet.apply_balances(&mut accounts).await.unwrap();
+        let confirmed = mined == Some(height);
+        assert_eq!(
+            accounts[0].ironwood_zatoshi,
+            if confirmed { 10_000_000 } else { 100_000_000 }
+        );
+        assert_eq!(
+            accounts[0].transparent_zatoshi,
+            if confirmed { 25_000_000 } else { 20_000_000 }
+        );
+    }
+    db.execute(
+        "INSERT INTO transparent_received_output_spends VALUES (1, ?1)",
+        [tx],
+    )
+    .unwrap();
+    for mined in [Some(height), None] {
+        db.execute(
+            "UPDATE transactions SET mined_height = ?1 WHERE id_tx = ?2",
+            rusqlite::params![mined, tx],
+        )
+        .unwrap();
+        wallet.apply_balances(&mut accounts).await.unwrap();
+        assert_eq!(
+            accounts[0].transparent_zatoshi,
+            if mined.is_some() {
+                5_000_000
+            } else {
+                20_000_000
+            }
+        );
+    }
+    let retained: (u32, u32, u32) = db
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM ironwood_received_note_spends),
+                (SELECT COUNT(*) FROM transparent_received_output_spends),
+                (SELECT COUNT(*) FROM v_received_outputs WHERE transaction_id = ?1)",
+            [tx],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(retained, (1, 1, 2));
+}
+
+#[test]
+fn ironwood_send_rejects_sapling_funds_when_ironwood_is_empty_or_insufficient() {
+    for ironwood in [0, 1_000_000] {
+        let mut st = test_state();
+        if ironwood != 0 {
+            fund_ironwood(&mut st, ironwood);
+        }
+        fund_sapling(&mut st, 10_000_000);
+        for destination in ["ironwood", "transparent"] {
+            let quoted = quote(&mut st, "ironwood", destination).unwrap();
+            assert_eq!(quoted.available_zatoshi, ironwood);
+            let recipient = recipient(&st, destination);
+            let account_id = st.test_account().unwrap().id();
+            let params = *st.network();
+            let error = RealWallet::propose_send(
+                st.wallet_mut(),
+                &params,
+                account_id,
+                "ironwood",
+                &recipient,
+                Zatoshis::const_from_u64(5_000_000),
+                None,
+            )
+            .expect_err("Sapling must not cover an Ironwood shortfall");
+            assert!(
+                matches!(error.downcast_ref(), Some(PaymentError::InsufficientFunds { available, .. }) if *available == ironwood),
+                "{ironwood} Ironwood -> {destination}: {error:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ironwood_send_uses_only_ironwood_inputs_with_both_pools_funded() {
+    let mut st = test_state();
+    fund_ironwood(&mut st, 10_000_000);
+    fund_sapling(&mut st, 10_000_000);
+    for destination in ["ironwood", "transparent"] {
+        let recipient = recipient(&st, destination);
+        let account_id = st.test_account().unwrap().id();
+        let params = *st.network();
+        let proposal = RealWallet::propose_send(
+            st.wallet_mut(),
+            &params,
+            account_id,
+            "ironwood",
+            &recipient,
+            Zatoshis::const_from_u64(5_000_000),
+            None,
+        )
+        .unwrap();
+        let notes: Vec<_> = proposal
+            .steps()
+            .iter()
+            .flat_map(|step| {
+                step.shielded_inputs()
+                    .into_iter()
+                    .flat_map(|inputs| inputs.notes())
+            })
+            .collect();
+        assert!(!notes.is_empty());
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.note().pool() == ShieldedPool::Ironwood)
+        );
+        assert!(
+            proposal
+                .steps()
+                .iter()
+                .all(|step| step.transparent_inputs().is_empty())
+        );
+    }
 }
 
 #[test]
@@ -191,6 +393,20 @@ fn transparent_quote_reports_zero_max_for_dust() {
     // 2-action grace floor still applies once an input exists.
     assert_eq!(quote.fee_zatoshi, 10_000);
     assert_eq!(quote.max_zatoshi, 0);
+}
+
+#[test]
+fn quote_reports_scan_required_before_any_blocks_are_scanned() {
+    let mut st = test_state();
+    for (source_pool, destination_pool) in [("ironwood", "ironwood"), ("transparent", "ironwood")] {
+        let error = quote(&mut st, source_pool, destination_pool)
+            .err()
+            .expect("quote must fail before any blocks are scanned");
+        assert!(
+            matches!(error.downcast_ref(), Some(PaymentError::ScanRequired)),
+            "{source_pool}->{destination_pool}: {error:#}"
+        );
+    }
 }
 
 #[tokio::test]
