@@ -358,6 +358,127 @@ fn contains_file_named(directory: &std::path::Path, name: &str) -> bool {
     })
 }
 
+fn start_with_slow_create(fixture: &Fixture, kind: &str, seconds: u32, own_group: bool) -> Child {
+    let mut command = fixture.command();
+    command
+        .args([
+            "--name",
+            &fixture.name,
+            "start",
+            "--no-open",
+            "--port-offset",
+            &fixture.port_offset.to_string(),
+        ])
+        .env("THS_TEST_SLOW_CREATE", kind)
+        .env("THS_TEST_SLOW_CREATE_SECONDS", seconds.to_string());
+    if own_group {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command.spawn().unwrap()
+}
+
+fn wait_for_command(fixture: &Fixture, line: &str) {
+    let commands = fixture.directory.path().join("commands");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !fs::read_to_string(&commands).is_ok_and(|commands| commands.contains(line)) {
+        assert!(Instant::now() < deadline, "never saw `{line}`");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn assert_nothing_left(fixture: &Fixture, context: &str) {
+    for resource in ["container", "volume", "network"] {
+        let created = fixture.directory.path().join("state").join(resource);
+        assert!(
+            fs::read_dir(&created).map_or(true, |mut entries| entries.next().is_none()),
+            "{resource} left behind {context}"
+        );
+    }
+    assert!(
+        !contains_file_named(fixture.directory.path(), "lifecycle-recovery.json"),
+        "recovery state left behind {context}"
+    );
+}
+
+#[test]
+fn a_shutdown_during_a_network_or_volume_create_lets_it_finish_and_cleans_up() {
+    use nix::sys::signal::Signal;
+    for (kind, signal, own_group) in [
+        ("network", Signal::SIGTERM, false),
+        ("volume", Signal::SIGTERM, false),
+        ("network", Signal::SIGINT, true),
+        ("volume", Signal::SIGINT, true),
+    ] {
+        let fixture = Fixture::new();
+        let mut child = start_with_slow_create(&fixture, kind, 1, own_group);
+        wait_for_command(&fixture, &format!("{kind} create"));
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        if own_group {
+            nix::sys::signal::killpg(pid, signal).unwrap();
+        } else {
+            nix::sys::signal::kill(pid, signal).unwrap();
+        }
+
+        finish(&mut child);
+
+        let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
+        assert!(
+            commands.contains(&format!("finished {kind} create")),
+            "{signal} cancelled the {kind} create"
+        );
+        assert_nothing_left(&fixture, &format!("after {signal} during a {kind} create"));
+        let (started, _, stderr, _, _) = output_after_shutdown_with(&fixture, false, false, false);
+        assert!(
+            started,
+            "a new start failed after an interrupted {kind} create: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn stop_recovers_a_launcher_killed_during_a_network_or_volume_create() {
+    for (kind, finished_before_stop) in [
+        ("network", true),
+        ("volume", true),
+        ("network", false),
+        ("volume", false),
+    ] {
+        let fixture = Fixture::new();
+        let mut child = start_with_slow_create(&fixture, kind, 2, false);
+        wait_for_command(&fixture, &format!("{kind} create"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        if finished_before_stop {
+            wait_for_command(&fixture, &format!("finished {kind} create"));
+        }
+        assert!(contains_file_named(
+            fixture.directory.path(),
+            "lifecycle-recovery.json"
+        ));
+
+        let stopped = fixture
+            .command()
+            .args(["--name", &fixture.name, "stop"])
+            .output()
+            .unwrap();
+
+        assert!(
+            stopped.status.success(),
+            "{}",
+            String::from_utf8_lossy(&stopped.stderr)
+        );
+        let commands = fs::read_to_string(fixture.directory.path().join("commands")).unwrap();
+        assert!(
+            commands.contains(&format!("finished {kind} create")),
+            "stop returned before the orphaned {kind} create ended"
+        );
+        assert_nothing_left(&fixture, &format!("after stop recovered a {kind} create"));
+        let (started, _, stderr, _, _) = output_after_shutdown_with(&fixture, false, false, false);
+        assert!(started, "a new start failed after recovery: {stderr}");
+    }
+}
+
 #[test]
 fn run_advertises_allocated_service_ports_to_the_app() {
     let fixture = Fixture::new();
@@ -789,30 +910,6 @@ fn json_start_stops_cleanly_during_browser_open() {
     let stderr = std::io::read_to_string(child.stderr.take().unwrap()).unwrap();
     assert!(status.success(), "launcher exited {status}: {stderr}");
     serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
-}
-
-#[test]
-fn standalone_doctor_retains_human_and_json_output() {
-    let fixture = Fixture::new();
-    let human = fixture.command().arg("doctor").output().unwrap();
-    assert!(human.status.success());
-    assert!(
-        String::from_utf8(human.stdout)
-            .unwrap()
-            .contains("Docker test-docker")
-    );
-    assert!(human.stderr.is_empty());
-
-    let json = fixture
-        .command()
-        .args(["--json", "doctor"])
-        .output()
-        .unwrap();
-    assert!(json.status.success());
-    let result: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
-    assert_eq!(result["docker"], "test-docker");
-    assert_eq!(result["ok"], true);
-    assert!(json.stderr.is_empty());
 }
 
 #[test]

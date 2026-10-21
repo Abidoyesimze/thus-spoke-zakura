@@ -66,6 +66,16 @@ On completion, the CLI reports the confirmed count and mined tip hash; errors
 include the job ID. `--json` includes the legacy `blocks` and `hashes` fields
 alongside the job's ID, state, and progress.
 
+Before starting a job, the dashboard retains its idempotency key in browser
+session storage. If browser policy denies storage access or the key cannot be
+saved, the Mine dialog stays open and shows a storage error; no mining request
+is sent. Allow site storage before retrying. After an uncertain response, keep
+the existing session storage so a retry can reuse the same key.
+
+If storage cleanup fails after the server accepts a job, the dashboard still
+shows the accepted job and follows its progress. The dialog reports cleanup
+failure separately; it does not mean the mining request was rejected.
+
 Read the node and wallet view through the running instance's API:
 
 ```console
@@ -113,9 +123,20 @@ after reconciliation succeeds.
 2. The wallet checks its scanned chain against Zakura and uses
    lightwalletd's compact blocks to catch up. A mismatch can require a
    rewind and rescan.
+   It also imports mined transaction history for public transparent
+   addresses, including transactions created by another wallet using the
+   development accounts. This records spent outputs as well as incoming
+   funds. Each address has durable history progress; existing wallets
+   backfill from their birthday on the first run with this support.
 3. On success, the server refreshes account balances, marks sync `ready`,
    and notifies dashboard query hooks. On failure it reports `error`;
    the last known balances can remain visible and may be stale.
+
+Transparent history must catch up through the scanned checkpoint before
+that snapshot is published. Interrupted history requests retain their last
+complete progress and retry; a reorganization rewinds history progress
+with the wallet. This does not add external transactions to the
+request-based Recent activity feed.
 
 This is why the Network page, Explorer, Recent activity, and Wallet page can
 show different stages of one event. They are observations of different
